@@ -1,0 +1,260 @@
+# Agent Pool TUI
+
+Multi-agent pool system wrapped in an async Textual TUI. No CrewAI — a native
+deterministic orchestrator (`SPEC → BUILD → VERIFY`) over a dual-API LangChain
+pool. Fully **portable**: auto-detects a local `llama.cpp` worker and falls back
+to a cloud model when it is down.
+
+## Principles
+
+- **SPEC** — a Pydantic `SpecContract` (goal, non-negotiables, measurable
+  acceptance criteria, small tasks) is co-designed with you and frozen **before**
+  any code is generated.
+- **VERIFY** — two independent levers:
+  1. an external **oracle** (`py_compile` + optional `ruff`);
+  2. a **cross-model critic** (a different model family that must emit
+     falsifiable objections, never praise), plus a mandatory fix loop.
+- **ENVIRONMENT** — persistent `.env` config, deterministic context guard
+  (local worker never receives >`LOCAL_SAFE_TOKENS` tokens; large contexts go
+  through Gemini), thread-safe callback layer (no `print()`).
+
+## Install (portable)
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # then edit: add your keys
+```
+
+Requires Python 3.10+ (tested on 3.14). `crewai` is **not** used, so there is no
+`Python <3.14` constraint.
+
+## Run
+
+```bash
+crew-tui        # launcher instalado em ~/.local/bin (usa o venv automaticamente)
+# ou manualmente:
+cd ~/ai-stack/crew-tui && source .venv/bin/activate && python main.py
+```
+
+Type an instruction and press Enter. The flow:
+
+1. **PLAN** — the architect proposes a short, human-readable plan (goal, ordered
+   steps, how it will be verified) plus **2-5 open questions**. Answer them one
+   per submission; the plan is refined and remaining questions shrink. Nothing
+   is built yet. Type **`go`** when you are happy (Enter alone does *not* start).
+2. **BUILD** — each small task is delegated to the matching team/model.
+3. **VERIFY** — oracle + critic (+ visual/test oracles); failed tasks are rebuilt
+   (feedback loop) before anything is written into the project.
+4. **DONE** — review; type a new instruction, ask what happened, or refine.
+
+While it runs, the TUI is a dashboard (not a code stream):
+
+- **AGENTES** — who is working now, on which model, tokens and elapsed time.
+- **TAREFAS** — task board with status (`pend`/`corre`/`feito`/`ok`/`falhou`).
+- **MÉTRICAS** — tokens in/out, estimated cost, free/paid mix (`L` local,
+  `G` free Gemini, `F` free API, `P` paid), verification counters.
+- **AVISOS** — 429/quota, timeouts, fallbacks, failed tasks, critic unavailable.
+- The compact log keeps only the last events (`STREAM_MODE=progress` by default;
+  `full` streams code, `off` silences it).
+
+## Software factory (steps 1-9)
+
+Hierarchical pipeline with resumable JSON state. In the TUI:
+
+```
+/factory <objetivo> [pasta do projeto]   # arranca o passo 1 (requisitos)
+go                                       # avança passos 2-9
+/resume                                  # retoma de .factory/state.json após interrupção
+```
+
+Headless:
+
+```bash
+crew-tui --factory "objetivo" --project ~/projetos_opencode/foo --yes
+crew-tui --resume --project ~/projetos_opencode/foo
+```
+
+| Passo | Papel | Modelo | Output |
+|---|---|---|---|
+| 1 REQUIREMENTS | analista sénior (terso) | Gemini Flash → Argon | `requirements` no estado |
+| 2 SCAFFOLD | júnior | Qwen local | esqueleto de ficheiros |
+| 3 ARCHITECT | engenheiro-chefe | Gemini Pro → Argon | interfaces + tarefas (role por complexidade) |
+| 4 BUILD | sénior/júnior por tarefa | Gemini/Argon, Qwen | ficheiros + `py_compile`/`node --check` |
+| 5 FIX | sénior → chefe | Gemini → Argon | loop recursivo com log de erros |
+| 6 INTEGRATE | execução real | — | run do entrypoint / Playwright |
+| 7 SENIOR_FIX | sénior → chefe | Gemini → Argon | correção de erros de integração |
+| 8 VISUAL | browser + visão | Playwright + Gemini | `ui_report` + screenshot |
+| 9 SIGN_OFF | chefe | Gemini Pro → Argon | `project_memory.json` |
+
+Artefactos (por projeto): `.factory/state.json` (retomável), `.factory/logs/*.log`,
+`.factory/candidates/`, `.factory/backups/`, `.factory/tests/`, `project_memory.json`.
+
+**Auditoria Playwright (sem LLM):** carrega `index.html` em Chromium headless e falha
+com erros de consola/página, pedidos 404 e *contratos DOM* — IDs usados pelo JS/CSS
+que não existem no HTML. É esta a rede que apanha o caso `#title-screen` vs
+`#title-overlay`.
+
+## Pointing at a folder ("trabalha na pasta X")
+
+If your instruction contains a folder path (e.g. `@~/projetos/foo` or a bare
+`/home/miguel/projetos/foo`), the system reads the folder into a bounded,
+privacy-safe context brief (file tree + contents) and injects it into the spec
+and build prompts. It:
+
+- skips `.git`, `.venv`, `node_modules`, caches, binaries and secrets
+  (never reads `.env`, `*.pem`, `*.key`, `id_rsa*`);
+- caps the scan (`SCAN_MAX_FILES`, `SCAN_MAX_CHARS_PER_FILE`, `SCAN_TOTAL_CHARS`).
+
+You can also set `PROJECT_DIR` in `.env` to always use a default folder.
+
+## Model roles (colour-coded in the TUI)
+
+| Tag | Model | Role |
+|---|---|---|
+| `[FIELDMARSHAL]` (red) | `deepseek-v4-pro` + `kimi-k3.1-pro` fallback (429) | spec/manager |
+| `[ARCHITECT]` (blue) | `gemini-3.1-pro-preview` (thinking) + kimi fallback | plan/design, algorithms |
+| `[PLAN]` (bright blue) | — | human-readable plan + questions |
+| `[GEMINI]` (purple) | `gemini-3.5-flash` (thinking) | workhorse generator, UI/UX |
+| `[WORKER]` (green) | local Qwen, else `beam-free` | execution / boilerplate |
+| `[DEV]` | `big-pickle` (free zen) → Gemini Pro → off-peak DeepSeek | senior dev + fixer |
+| `[CRITIC]` (yellow) | opposite family of the producer | falsification review |
+| `[ORACLE]` (cyan) | `py_compile`/`ruff`/`node --check` | external signal |
+
+## Reasoning levels
+
+Thinking is controlled per role (`THINK_*` env vars, `1`/`0`):
+
+- ON (default): `FIELDMARSHAL`, `ARCHITECT` — design/planning benefits from
+  reasoning (`REASONING_EFFORT=low|medium|high` → `reasoning_effort`).
+- OFF (default): `WORKER`, `CRITIC`, `FAST_CLOUD`, `GEMINI` — fast/structured
+  roles send `enable_thinking: false` (DeepSeek/Kimi/llama.cpp template param;
+  Gemini uses `thinking_budget=0`), so the token budget goes to output, not
+  `<think>` blocks.
+
+Gemini "too busy"/rate-limit handling: the Gemini role runs
+`GEMINI_MODEL` with an automatic fallback to `GEMINI_FALLBACK_MODEL`
+(default `gemini-3.8-flash`) on API errors/429 — the API equivalent of the
+consumer app's Pro→Flash downgrade, but under your control.
+
+## Stealth senior dev / fixer
+
+The senior developer (`role=senior`) and the fixer prefer the free
+`big-pickle` model (`SENIOR_MODEL`, served from `SENIOR_BASE_URL`, the free
+zen endpoint). Because that endpoint currently answers `429 FreeUsageLimitError`
+to API clients, the pool probes it once at startup and only puts it in the
+chain when it actually replies. Order: `big-pickle` → `GEMINI_PRO_MODEL` →
+the Gemini workhorse chain → off-peak DeepSeek. If the model is pulled or
+priced, the chain degrades to the already-paid Gemini with no code change.
+Set `SENIOR_PROBE=0` to never use it, `SENIOR_FORCE=1` to pin it as primary
+even when the probe fails (each task then pays one 429 before falling back),
+or point `SENIOR_BASE_URL` at the Go endpoint once it is available there.
+
+## OpenCode Go as a last resort
+
+`OPENCODE_MODE` controls the paid subscription endpoint:
+
+- `last` (default) — local Qwen and the sunk-cost Gemini Plus carry the work;
+  OpenCode Go models are appended at the end of every chain.
+- `primary` — legacy behaviour (Go models first).
+- `off` — the key is ignored entirely (use when the subscription ends).
+
+The manager, architect, reviewer, escalation, QA and worker fallbacks are all
+ordered accordingly, so switching to `off` requires no code change.
+
+## Pay-as-you-go peak policy
+
+When a direct DeepSeek key is present (`DEEPSEEK_API_KEY`), the architect/chief
+chain is routed by the UTC clock:
+
+- **Off-peak** → direct DeepSeek (`DEEPSEEK_MODEL`, default `deepseek-v4-pro`) is
+  the primary; Gemini Pro and the Go models become fallbacks.
+- **Peak** → Gemini Pro is primary and direct DeepSeek is excluded from the
+  architect fallback chain, protecting the pay-as-you-go bill even if Gemini
+  fails. OpenRouter/Go remain available as configured fallbacks.
+
+Configure the windows with `PEAK_WINDOWS_UTC` (comma-separated `HH:MM-HH:MM`,
+default `01:00-04:00,06:00-10:00`), `PEAK_WEEKDAYS_ONLY=1` and
+`PEAK_POLICY=0` to disable. Without a key the policy is inert and routing is
+unchanged. Handles are rebuilt automatically when the run crosses a boundary.
+Windows follow DeepSeek's official schedule (Mon–Fri 01:00–04:00 and
+06:00–10:00 UTC; everything else, including weekends, is off-peak at 50%).
+
+## Power management (keep awake / off-peak sleep)
+
+Long runs are power-aware (`power.py`):
+
+- **Keep awake** (`KEEP_AWAKE=1`) — while a factory/orchestrator run is active,
+  crew-tui holds a `systemd-inhibit --what=idle` lock so GNOME's 30-minute
+  auto-suspend never cuts a build in half.
+- **Off-peak gate** (`SLEEP_OFFPEAK=1`) — at every step/task boundary, if the
+  clock is inside a DeepSeek peak window, the run is paused, the RTC alarm is
+  armed for the next off-peak start, and the machine suspends (only after
+  `OFFPEAK_IDLE_MIN` minutes of user inactivity). On wake it clears the alarm,
+  restarts local Qwen, refreshes the pool and continues; DeepSeek is primary
+  again. The marker is persisted as `paused_until` in `.factory/state.json`, so
+  `crew-tui --resume` picks it up.
+- `--unattended` (or `SLEEP_IF_ACTIVE=1`) suspends even if you are using the
+  machine. Default is to stay awake and stay paused, so a run never hijacks
+  your session.
+- Pauses only happen between LLM calls (never mid-request).
+- An early wake (keyboard/USB) re-suspends up to 3× instead of resuming during
+  peak; after that it waits awake until off-peak. The RTC alarm is always
+  cancelled on resume, run end, and interpreter exit (best-effort).
+
+The privileged part is a small helper (RTC alarm needs root):
+
+```bash
+sudo bash scripts/install-crew-sleep.sh      # installs /usr/local/sbin/crew-sleep + sudoers
+sudo -n /usr/local/sbin/crew-sleep --dry-run --arm $(( $(date -u +%s) + 3600 ))
+```
+
+It arms `/sys/class/rtc/rtc0/wakealarm` and calls `systemctl suspend` (not
+`rtcwake -m mem`) so the NVIDIA suspend/resume hooks run. The gate invokes the
+helper through `sudo -n` (the sudoers rule grants NOPASSWD for this exact
+path). If the alarm cannot be armed, or `sudo -n` fails, or suspend is
+inhibited, the run stays paused and waits awake with the idle inhibitor still
+held — it never sleeps without a guaranteed RTC wake-up. The gate works on
+`s2idle` (the current default); `deep` S3 can be tested by changing
+`/sys/power/mem_sleep` manually. Without the helper, the gate still pauses but
+waits awake. `SLEEP_OFFPEAK` is inert without a `DEEPSEEK_API_KEY` (nothing to
+save). Estimated s2idle overhead vs deep S3 is ~5–20 W (≈0.1–0.3 €/month for a
+2 h daily pause) — reliability was preferred.
+
+## Configuration
+
+All settings come from env vars (see `.env.example`). Key ones:
+
+- `OPENCODE_API_KEY` — cloud API key.
+- `GEMINI_API_KEY` — optional; disables Gemini-only roles if absent.
+- `DEEPSEEK_API_KEY` — optional; enables the direct pay-as-you-go routing.
+- `LOCAL_LLM_URL` / `LOCAL_MODEL_NAME` — your llama.cpp endpoint/model.
+- `LOCAL_START_CMD` — optional on-demand start command for the local server.
+- `KEEP_AWAKE=1` — hold an idle inhibitor while a run is active.
+- `SLEEP_OFFPEAK=1` — pause at peak, arm RTC, suspend; needs `SLEEP_HELPER` and
+  a `DEEPSEEK_API_KEY`.
+- `OFFPEAK_IDLE_MIN` / `SLEEP_IF_ACTIVE` — when it is safe to suspend.
+- `LOCAL_SERVICE` / `QWEN_RESTART_ON_WAKE` — stop/start Qwen around suspend.
+
+Without a local worker, `WORKER` automatically falls back to `BEAM_FREE_MODEL`
+via the OpenCode API. Without `OPENCODE_API_KEY`, only local/Gemini roles run.
+
+## Telemetry & migration
+
+Every agent/team step appends one compact JSON line to `logs/events.jsonl`
+(append-only, never rewritten → `git diff`-friendly). Events carry **metadata +
+hashes only** — the actual payloads (spec, generated code/reports) live as
+files under `specs/` and `workspace/<run-id>/` and are referenced by `sha`.
+
+Event kinds: `run_start`, `spec_frozen`, `spec_refined`, `spec_fallback`,
+`task_start`, `task_built`, `task_rebuilt`, `task_verified`, `task_failed`,
+`task_skipped`, `llm_call`, `oracle`, `critic`, `feedback_loop`,
+`context_compress`, `run_done`.
+
+- Rotates automatically at `LOG_MAX_BYTES` (default 10 MB) to `logs/events.<ts>.jsonl`.
+- No secrets/PII in logs: content is hashed, never stored inline.
+
+The whole state lives inside the project directory (`logs/`, `specs/`,
+`workspace/`, `.env`). To migrate to another machine, copy/`rsync` the project
+folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.

@@ -1,0 +1,101 @@
+#!/bin/bash
+# crew-sleep: privileged half of crew-tui's off-peak policy.
+#
+#   crew-sleep --arm EPOCH     arm the RTC alarm (epoch = UTC seconds)
+#   crew-sleep --at EPOCH      arm, then suspend; alarm cleared after resume
+#   crew-sleep --suspend       suspend now (assumes an alarm is already armed)
+#   crew-sleep --cancel        clear the RTC alarm
+#   crew-sleep --dry-run ...   print what would happen, touch nothing
+#
+# Installed once as root by scripts/install-crew-sleep.sh together with a
+# sudoers rule (NOPASSWD, this exact path only).  We call `systemctl suspend`
+# instead of `rtcwake -m mem` on purpose: the NVIDIA suspend/resume hooks only
+# run through logind/systemd.
+set -euo pipefail
+
+WAKE=/sys/class/rtc/rtc0/wakealarm
+NOW=$(date -u +%s)
+DRY=0
+MODE=""
+EPOCH=""
+
+usage() {
+    echo "usage: crew-sleep --arm EPOCH | --at EPOCH | --suspend | --cancel [--dry-run]" >&2
+    exit 2
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --arm)      MODE=arm;     EPOCH="${2:-}"; shift 2 ;;
+        --at)       MODE=at;      EPOCH="${2:-}"; shift 2 ;;
+        --suspend)  MODE=suspend; shift ;;
+        --cancel)   MODE=cancel;  shift ;;
+        --dry-run)  DRY=1;        shift ;;
+        *) usage ;;
+    esac
+done
+[ -n "$MODE" ] || usage
+
+validate() {
+    case "$1" in
+        ''|*[!0-9]*) echo "crew-sleep: epoch inválido: '$1'" >&2; exit 2 ;;
+    esac
+    if [ "$1" -lt $((NOW + 60)) ] || [ "$1" -gt $((NOW + 3 * 86400)) ]; then
+        echo "crew-sleep: epoch fora da janela (agora+60s .. agora+3d)" >&2
+        exit 2
+    fi
+}
+
+arm() {
+    validate "$1"
+    if [ "$DRY" = 1 ]; then
+        echo "dry-run: arm $1 (em $(( $1 - NOW ))s: $(date -u -d "@$1" '+%F %T UTC'))"
+        return 0
+    fi
+    [ -w "$WAKE" ] || { echo "crew-sleep: $WAKE não é escrevível" >&2; exit 1; }
+    if ! printf '0\n' > "$WAKE"; then
+        echo "crew-sleep: não consegui limpar o alarme RTC" >&2
+        exit 1
+    fi
+    if ! printf '%s\n' "$1" > "$WAKE"; then
+        echo "crew-sleep: não consegui armar o alarme RTC" >&2
+        exit 1
+    fi
+    echo "crew-sleep: alarme RTC $(date -u -d "@$1" '+%F %T UTC')"
+}
+
+cancel() {
+    if [ "$DRY" = 1 ]; then echo "dry-run: cancel"; return 0; fi
+    [ -e "$WAKE" ] || { echo "crew-sleep: RTC alarm inexistente ($WAKE)" >&2; return 1; }
+    [ -w "$WAKE" ] || { echo "crew-sleep: $WAKE não é escrevível" >&2; return 1; }
+    if ! printf '0\n' > "$WAKE"; then
+        echo "crew-sleep: não consegui cancelar o alarme RTC" >&2
+        return 1
+    fi
+    echo "crew-sleep: alarme cancelado"
+}
+
+suspend() {
+    if [ "$DRY" = 1 ]; then echo "dry-run: suspend"; return 0; fi
+    systemctl suspend
+    echo "crew-sleep: retomado"
+}
+
+case "$MODE" in
+    arm)     arm "$EPOCH" ;;
+    at)
+        arm "$EPOCH"
+        if [ "$DRY" = 1 ]; then echo "dry-run: suspend"; cancel; exit 0; fi
+        if systemctl suspend; then
+            echo "crew-sleep: retomado"
+        else
+            suspend_rc=$?
+            echo "crew-sleep: suspender falhou (rc=$suspend_rc)" >&2
+            cancel || exit 1
+            exit "$suspend_rc"
+        fi
+        cancel
+        ;;
+    suspend) suspend ;;
+    cancel)  cancel ;;
+esac
