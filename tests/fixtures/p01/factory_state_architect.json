@@ -1,0 +1,34 @@
+{
+  "project": "/tmp/crew-demo",
+  "goal": "demo",
+  "step": "ARCHITECT",
+  "requirements": {
+    "objective": "demo app",
+    "scope_in": ["one file"],
+    "scope_out": ["database"],
+    "constraints": ["stdlib"],
+    "acceptance": ["runs"],
+    "assumptions": [],
+    "open_questions": []
+  },
+  "answers": [],
+  "scaffold": {"files": ["app.py"], "skipped": [], "notes": []},
+  "architecture": {
+    "approach": "single module",
+    "modules": [{"path": "app.py", "responsibility": "entry"}],
+    "interfaces": [{"name": "main", "file": "app.py", "inputs": [], "outputs": [], "errors": [], "used_by": []}],
+    "test_plan": [],
+    "tasks": [{"id": "t1", "title": "entry", "description": "main", "target_file": "app.py", "acceptance": ["runs"], "depends_on": [], "complexity": "low", "role": "junior"}]
+  },
+  "tasks": [
+    {"id": "t1", "title": "entry", "description": "main", "target_file": "app.py", "acceptance": ["runs"], "depends_on": [], "complexity": "low", "role": "junior", "status": "done", "attempts": 1, "errors": []}
+  ],
+  "integration": {},
+  "visual": {},
+  "signoff": {},
+  "paused_until": 0.0,
+  "pause_reason": "",
+  "history": [],
+  "created": "2026-01-01T00:00:00Z",
+  "updated": "2026-01-01T00:00:00Z"
+}

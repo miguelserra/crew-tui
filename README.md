@@ -108,6 +108,50 @@ Then set the model names you want (see the next section). Keys are never
 written to disk by the app beyond the `.env` file you edit yourself, and
 `.env` is git-ignored. Never commit real keys.
 
+## Engine selection and canonical state (P1)
+
+`CREW_ENGINE` selects the engine for **new** executions:
+
+```dotenv
+CREW_ENGINE=legacy    # default in P1 (strangler)
+CREW_ENGINE=unified   # new canonical state + corrected phase order
+```
+
+- New runs persist exactly one canonical file: `.crew/state.json` (unified) or
+  `.factory/state.json` (legacy, with additive `engine_kind`/`engine_version`/
+  `schema_version` metadata). There is no permanent dual-write.
+- `--resume` uses the engine stored in the state; changing `CREW_ENGINE` does
+  not switch a running/resumed execution. An unavailable engine or a future
+  schema is a hard error, never a silent fallback.
+- Format migration and engine migration are separate:
+  `--migrate-state --project DIR` converts `.factory` to `.crew` **without**
+  changing the engine; `--migrate-engine --project DIR` flips `engine_kind` to
+  unified. The old files are preserved for rollback.
+- The architecture gate is independent from `--yes`: headless runs need
+  `--approve-architecture`. `--yes` only answers questions/assumptions.
+- Models whose billing cannot be proven are blocked unless
+  `--allow-unknown`/`ALLOW_UNKNOWN=1` is explicit.
+- Corrupt state raises and is preserved; it is never replaced by an empty state.
+
+## Financial circuit breaker
+
+Pay-as-you-go models are **never** called implicitly:
+
+- Each constructed model carries a billing class (`local`, `free`, `fixed`,
+  `payg`). Fixed-cost subscriptions (OpenCode Go, Gemini Plus) are **not**
+  treated as paid.
+- Fallback chains are built without `payg` handles unless `ALLOW_PAID=1`.
+- A free-tier `429`/quota that exhausts the chain suspends the run with
+  `BudgetSuspended` instead of silently falling back to a paid endpoint.
+- In the TUI, a modal asks which paid model to use; refusing keeps the breaker
+  closed (the step fails, nothing is spent).
+- Headless factory: use `--allow-paid` (or `ALLOW_PAID=1`) to pre-authorize.
+
+```dotenv
+ALLOW_PAID=0          # 1 only for unattended runs that may spend money
+PAYG_MODELS=          # extra per-token ids, comma-separated
+```
+
 ## Adapting to other models or providers
 
 All model selection is **environment-driven** — there is no hard-coded model
@@ -394,7 +438,12 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | Path | What it is |
 |---|---|
 | `main.py` | Config, `LLMPool` (model routing), `Verifier`, `Orchestrator`, Textual TUI, CLI |
-| `factory.py` | 9-step resumable factory + Playwright audit + DOM-contract check |
+| `factory.py` | Legacy 9-step factory adapter + Playwright audit + DOM-contract check |
+| `state.py` | Canonical `ProjectState`/`Task`/`TaskAttempt`, legacy migration, path validation |
+| `store.py` | Atomic canonical store, staging promotion, resume resolution, format migration |
+| `registry.py` | `CredentialProfile`/`ModelRef`: provider, endpoint, billing, capabilities |
+| `attempts.py` | Per-candidate attempt scoreboard (stdlib) |
+| `engine.py` | Engine selection, approvals, dispatch guard, workflow adapters |
 | `peak.py` | Pure peak/off-peak window helpers (shared, no I/O) |
 | `power.py` | Platform dispatcher (Linux vs Windows) |
 | `power_linux.py` | `systemd-inhibit` keep-awake + RTC alarm/suspend gate |
@@ -402,7 +451,7 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `scripts/crew-sleep` | Root helper that arms the RTC alarm / suspends (Linux) |
 | `scripts/install-crew-sleep.sh` | One-time root install + sudoers rule |
 | `setup.ps1`, `run.ps1` | Windows bootstrap and launcher |
-| `tests/` | Regression tests for the power policy (Linux + Windows) |
+| `tests/` | Power, budget and P0/P1 engine/state/migration tests |
 
 ## Tests & CI
 

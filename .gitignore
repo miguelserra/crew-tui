@@ -21,6 +21,7 @@ logs/
 specs/
 workspace/
 .factory/
+.crew/
 
 # OS / editor noise
 .DS_Store

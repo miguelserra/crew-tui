@@ -38,6 +38,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from main import (LANG_SUFFIX, LLMPool, Settings, Verifier,
                   extract_code_blocks_typed, extract_json_block, guess_lang)
+from state import StateCorruptError
 from power import make_power
 
 ROLES = ("ANALYST", "SCAFFOLD", "ARCHITECT", "DEV", "TEST", "INTEG", "VISUAL", "SIGN")
@@ -115,6 +116,9 @@ class TaskState:
     status: str = "pending"
     attempts: int = 0
     errors: list[str] = field(default_factory=list)
+    # Historical per-call identity (schema-compatible, optional).
+    attempt_log: list[dict[str, Any]] = field(default_factory=list)
+    delivered_by: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -140,6 +144,9 @@ class FactoryState:
     signoff: dict[str, Any] = field(default_factory=dict)
     paused_until: float = 0.0
     pause_reason: str = ""
+    engine_kind: str = "legacy"
+    engine_version: str = "legacy"
+    schema_version: int = 1
     history: list[dict[str, Any]] = field(default_factory=list)
     created: str = ""
     updated: str = ""
@@ -194,7 +201,8 @@ class Factory:
                 return FactoryState.from_dict(
                     json.loads(self.state_path.read_text(encoding="utf-8")))
             except Exception as e:
-                self.emit("SYSTEM", f"estado da factory ilegível ({e}); a recomeçar")
+                # Never replace an unreadable state with an empty one.
+                raise StateCorruptError(str(self.state_path), str(e)) from e
         now = _now()
         return FactoryState(project=str(self.root), created=now, updated=now)
 
@@ -247,6 +255,32 @@ class Factory:
             return (pool.senior_dev or pool.gemini or pool.architect), "DEV"
         return (pool.senior_dev or pool.gemini or pool.architect), "DEV"
 
+    def on_attempt(self, event: Any) -> None:
+        """Record every candidate call in the legacy factory state."""
+        task_id = getattr(event, "task", "")
+        if task_id:
+            for ts in self.state.tasks:
+                if ts.id == task_id:
+                    ts.attempt_log.append(event.attempt.to_dict())
+                    if event.attempt.outcome == "ok":
+                        ts.delivered_by = event.attempt.model.to_dict()
+                    break
+        else:
+            self.state.history.append({"kind": "attempt", **event.to_dict(), "at": _now()})
+        try:
+            self.save()
+        except Exception:
+            pass
+
+    def _mark_delivered(self, task_id: str) -> None:
+        for ts in self.state.tasks:
+            if ts.id != task_id:
+                continue
+            for raw in reversed(ts.attempt_log):
+                if raw.get("outcome") == "ok" and raw.get("model"):
+                    ts.delivered_by = raw["model"]
+                    return
+
     def _ask(self, role: str, system: str, user: str, tag: str) -> str:
         self.power.before_step(tag)
         self.pool.refresh_peak()
@@ -259,6 +293,8 @@ class Factory:
     # -- step 1: requirements ---------------------------------------------- #
 
     def prepare(self, goal: str, feedback: str = "") -> dict[str, Any]:
+        if getattr(self.pool, "attempt_sink", None) is None:
+            self.pool.attempt_sink = self.on_attempt
         self.power.start()
         try:
             return self._prepare(goal, feedback)
@@ -315,6 +351,8 @@ If the goal is clear, return an empty list."""
     ORDER = ("SCAFFOLD", "ARCHITECT", "BUILD", "INTEGRATE", "VISUAL", "SIGN_OFF", "DONE")
 
     def build(self) -> bool:
+        if getattr(self.pool, "attempt_sink", None) is None:
+            self.pool.attempt_sink = self.on_attempt
         if not self.state.requirements:
             raise RuntimeError("sem requisitos — chama prepare()/--factory primeiro")
         steps = {
@@ -1043,6 +1081,7 @@ Write the handover memory for the next engineer. STRICT JSON:
         self._backup(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(code.rstrip("\n") + "\n", encoding="utf-8")
+        self._mark_delivered(task.id)
 
     def _backup(self, path: Path) -> None:
         if not path.is_file():

@@ -1,0 +1,8 @@
+{
+  "goal": "demo app",
+  "review": false,
+  "non_negotiables": ["stdlib"],
+  "acceptance_criteria": ["runs"],
+  "questions": [],
+  "tasks": [{"id": "t1", "title": "entry", "description": "main", "team": "programming", "target_file": "app.py", "acceptance": ["runs"], "review": false, "status": "verified"}]
+}

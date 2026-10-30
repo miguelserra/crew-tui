@@ -1,0 +1,7 @@
+{
+  "goal": "demo app",
+  "project_root": "/tmp/crew-demo",
+  "files": ["app.py"],
+  "results": {"t1": {"status": "verified", "file": "app.py"}},
+  "history": [{"goal": "demo app", "statuses": {"verified": 1}}]
+}

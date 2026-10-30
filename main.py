@@ -30,6 +30,7 @@ Run:  python main.py
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import json
 import os
@@ -59,7 +60,8 @@ from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, Footer, Header, Input, RichLog, Static
+from textual.screen import ModalScreen
+from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Select, Static
 
 try:
     from langchain_openai import ChatOpenAI
@@ -74,6 +76,20 @@ except Exception:  # pragma: no cover - env without the google stack
     ChatGoogleGenerativeAI = None  # type: ignore
 
 from power import make_power
+from budget import BudgetSuspended, bills_per_token, openrouter_is_free, payg_options
+from attempts import AttemptCollector, AttemptEvent
+from registry import (
+    BILLING_FREE as MB_FREE, BILLING_LOCAL as MB_LOCAL, BILLING_PAYG as MB_PAYG,
+    BILLING_SUBSCRIPTION as MB_SUBSCRIPTION, BILLING_UNKNOWN as MB_UNKNOWN,
+    ModelRef, family_of, ref_for, ref_from_handle,
+)
+from engine import (
+    ENGINE_LEGACY, ENGINE_UNIFIED, ENGINE_VERSION, EngineError, EngineFacade,
+    FactoryAdapter, UnknownBilling, WorkflowEngine, iter_model_refs, migrate_engine,
+    migrate_state, new_unified_state, open_execution, resolve_engine,
+)
+from store import StateManager
+from state import StateCorruptError, StateError
 
 
 # --------------------------------------------------------------------------- #
@@ -157,6 +173,12 @@ class Settings:
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-pro"
+    # Budget breaker: pay-as-you-go models (direct DeepSeek, non-free
+    # OpenRouter) are never called unless explicitly authorized here or via
+    # the interactive override modal.
+    allow_paid: bool = False
+    allow_unknown: bool = False  # authorize models whose billing cannot be proved
+    payg_models: str = ""      # extra comma-separated ids that bill per token
     # Cost policy: during a peak UTC window, skip pay-as-you-go DeepSeek and
     # fall back to the already-paid Gemini Plus subscription.
     peak_policy: bool = True
@@ -260,6 +282,9 @@ class Settings:
             deepseek_api_key=env.get("DEEPSEEK_API_KEY", ""),
             deepseek_base_url=env.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
             deepseek_model=env.get("DEEPSEEK_MODEL", "deepseek-v4-pro"),
+            allow_paid=_env_bool(env, "ALLOW_PAID", False),
+            allow_unknown=_env_bool(env, "ALLOW_UNKNOWN", False),
+            payg_models=env.get("PAYG_MODELS", ""),
             peak_policy=_env_bool(env, "PEAK_POLICY", True),
             peak_windows=env.get("PEAK_WINDOWS_UTC", "01:00-04:00,06:00-10:00"),
             peak_weekdays_only=_env_bool(env, "PEAK_WEEKDAYS_ONLY", True),
@@ -560,6 +585,70 @@ class TUIStreamHandler(BaseCallbackHandler):
         self._emit(f"⚠ {error}", bold=True)
 
 
+_ATTEMPT_CTX: contextvars.ContextVar[Optional[AttemptCollector]] = contextvars.ContextVar(
+    "crew_attempt", default=None)
+
+
+def _served_model_id(response: Any) -> str:
+    out = getattr(response, "llm_output", None) or {}
+    if isinstance(out, dict):
+        for key in ("model_name", "model"):
+            if out.get(key):
+                return str(out[key])
+    gens = getattr(response, "generations", None) or []
+    try:
+        meta = gens[0][0].message.response_metadata or {}
+        return str(meta.get("model_name") or meta.get("model") or "")
+    except Exception:
+        return ""
+
+
+class AttemptHandler(BaseCallbackHandler):
+    """Records every candidate call inside a fallback chain."""
+
+    def __init__(self, ref: ModelRef):
+        super().__init__()
+        self.ref = ref
+        self._ids: dict[Any, str] = {}
+
+    def on_llm_start(self, serialized, prompts, run_id=None, **kwargs) -> None:
+        col = _ATTEMPT_CTX.get()
+        if col is None or run_id is None:
+            return
+        self._ids[run_id] = col.start(self.ref)
+
+    def on_llm_end(self, response, run_id=None, **kwargs) -> None:
+        col = _ATTEMPT_CTX.get()
+        if col is None or run_id is None:
+            return
+        attempt_id = self._ids.pop(run_id, None)
+        if attempt_id:
+            col.finish(attempt_id, "ok", served_id=_served_model_id(response))
+
+    def on_llm_error(self, error, run_id=None, **kwargs) -> None:
+        col = _ATTEMPT_CTX.get()
+        if col is None or run_id is None:
+            return
+        attempt_id = self._ids.pop(run_id, None)
+        if attempt_id:
+            col.finish(attempt_id, _error_kind(error), error=str(error))
+
+
+def _attach_identity(llm: Any, ref: ModelRef) -> Any:
+    """Attach provider/endpoint/profile metadata without changing routing."""
+    if llm is not None:
+        for key, value in (
+            ("_model_ref", ref), ("_provider", ref.provider),
+            ("_endpoint", ref.endpoint), ("_credential_profile", ref.credential_profile),
+            ("_billing", ref.billing),
+        ):
+            try:
+                object.__setattr__(llm, key, value)
+            except Exception:
+                pass
+    return llm
+
+
 class ProgressHandler(BaseCallbackHandler):
     """Cheap live progress instead of streaming every token of code.
 
@@ -622,6 +711,13 @@ class LLMPool:
         self._sink_factory = sink_factory
         self._progress_factory = progress_factory
         self.telemetry = telemetry
+        # Budget breaker state: pay-as-you-go models require explicit consent.
+        self.allow_paid = bool(settings.allow_paid)
+        self.on_budget: Optional[Callable[[str, list[str]], Optional[str]]] = None
+        self.budget_events: list[dict[str, Any]] = []
+        self.dispatch_guard: Optional[Callable[[list[ModelRef]], None]] = None
+        self.attempt_sink: Optional[Callable[[AttemptEvent], None]] = None
+        self.allow_unknown = bool(settings.allow_unknown)
 
         self.cloud_enabled = bool(settings.opencode_api_key) and settings.opencode_mode != "off"
         self.openrouter_enabled = bool(settings.openrouter_api_key)
@@ -658,19 +754,23 @@ class LLMPool:
     def _sink(self, tag: str) -> Callable[[Text], None]:
         return self._sink_factory(tag)
 
-    def _handlers(self, tag: str) -> list[Any]:
-        """Full-token streaming, compact progress, or nothing at all."""
+    def _handlers(self, tag: str, ref: Optional[ModelRef] = None) -> list[Any]:
+        """Full-token streaming, compact progress, and per-candidate attempts."""
         mode = (self.settings.stream_mode or "progress").lower()
+        handlers: list[Any] = []
         if mode == "full":
-            return [TUIStreamHandler(tag, self._sink(tag))]
-        if mode == "progress" and self._progress_factory is not None:
-            return [ProgressHandler(tag, self._progress_factory(tag))]
-        return []
+            handlers.append(TUIStreamHandler(tag, self._sink(tag)))
+        elif mode == "progress" and self._progress_factory is not None:
+            handlers.append(ProgressHandler(tag, self._progress_factory(tag)))
+        if ref is not None:
+            handlers.append(AttemptHandler(ref))
+        return handlers
 
     def _cloud(self, model: str, tag: str, temperature: Optional[float] = None,
                thinking: bool = False, max_tokens: int = 8192) -> Any:
         if not self.cloud_enabled or ChatOpenAI is None:
             return None
+        ref = ref_for("opencode-go", model, family=family_of(model))
         # NOTE: temperature is omitted on purpose: several OpenCode Go models
         # (kimi-k3.x, reasoning models) reject anything but 1.
         kwargs: dict[str, Any] = dict(
@@ -685,20 +785,21 @@ class LLMPool:
                 "x-opencode-session": self._session_id,
                 "x-opencode-request": f"req_{uuid4().hex[:16]}",
             },
-            callbacks=self._handlers(tag),
+            callbacks=self._handlers(tag, ref),
         )
         if temperature is not None:
             kwargs["temperature"] = temperature
         if thinking:
             kwargs["reasoning_effort"] = self.settings.reasoning_effort
-        return ChatOpenAI(**kwargs)
+        return _attach_identity(ChatOpenAI(**kwargs), ref)
 
     def _free_cloud(self, model: str, tag: str, max_tokens: int = 8192,
                     max_retries: int = 2) -> Any:
         """Same key, different (free zen) endpoint — used for the stealth model."""
         if not self.cloud_enabled or ChatOpenAI is None:
             return None
-        return ChatOpenAI(
+        ref = ref_for("opencode-free", model, family=family_of(model))
+        return _attach_identity(ChatOpenAI(
             model=model,
             base_url=self.settings.senior_base_url,
             api_key=self.settings.opencode_api_key,
@@ -710,8 +811,8 @@ class LLMPool:
                 "x-opencode-session": self._session_id,
                 "x-opencode-request": f"req_{uuid4().hex[:16]}",
             },
-            callbacks=self._handlers(tag),
-        )
+            callbacks=self._handlers(tag, ref),
+        ), ref)
 
     def _probe_senior(self) -> bool:
         """One cheap call to check whether the free stealth model is usable.
@@ -734,6 +835,9 @@ class LLMPool:
                     thinking: bool = False, max_tokens: int = 8192) -> Any:
         if not self.openrouter_enabled or ChatOpenAI is None:
             return None
+        billing = (MB_FREE if openrouter_is_free(model, self.settings.openrouter_free_model)
+                   else MB_PAYG)
+        ref = ref_for("openrouter", model, family=family_of(model), billing=billing)
         kwargs: dict[str, Any] = dict(
             model=model,
             base_url=self.settings.openrouter_base_url,
@@ -746,33 +850,35 @@ class LLMPool:
                 "HTTP-Referer": "https://crew-tui.local",
                 "X-Title": "Crew TUI",
             },
-            callbacks=self._handlers(tag),
+            callbacks=self._handlers(tag, ref),
         )
         if temperature is not None:
             kwargs["temperature"] = temperature
         if thinking:
             kwargs["reasoning_effort"] = self.settings.reasoning_effort
-        return ChatOpenAI(**kwargs)
+        return _attach_identity(ChatOpenAI(**kwargs), ref)
 
     def _deepseek(self, model: Optional[str] = None, tag: str = "DEEPSEEK",
                   thinking: bool = False, max_tokens: int = 16384) -> Any:
         """Direct DeepSeek API (pay-as-you-go). Disabled without a key."""
         if not self.deepseek_enabled or ChatOpenAI is None:
             return None
+        mid = model or self.settings.deepseek_model
+        ref = ref_for("deepseek-api", mid, family=family_of(mid), billing=MB_PAYG)
         kwargs: dict[str, Any] = dict(
-            model=model or self.settings.deepseek_model,
+            model=mid,
             base_url=self.settings.deepseek_base_url,
             api_key=self.settings.deepseek_api_key,
             streaming=True,
             max_tokens=max_tokens,
             max_retries=2,
             request_timeout=300,
-            callbacks=self._handlers(tag),
+            callbacks=self._handlers(tag, ref),
         )
         if thinking:
             kwargs["reasoning_effort"] = self.settings.reasoning_effort
             kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-        return ChatOpenAI(**kwargs)
+        return _attach_identity(ChatOpenAI(**kwargs), ref)
 
     def is_peak(self, now: Optional[datetime] = None) -> bool:
         """True when `now` (UTC) falls inside a protected pay-as-you-go window.
@@ -817,7 +923,10 @@ class LLMPool:
                 thinking: bool = False, tag: str = "GEMINI") -> Any:
         if not self.gemini_enabled or ChatGoogleGenerativeAI is None:
             return None
-        return ChatGoogleGenerativeAI(
+        mid = model or self.settings.gemini_model
+        ref = ref_for("gemini-plus", mid, family=family_of(mid),
+                      billing=MB_SUBSCRIPTION)
+        return _attach_identity(ChatGoogleGenerativeAI(
             model=model or self.settings.gemini_model,
             google_api_key=self.settings.gemini_api_key,
             temperature=temperature,
@@ -826,12 +935,15 @@ class LLMPool:
             timeout=120,
             max_output_tokens=self.settings.gemini_max_output_tokens,
             thinking_budget=4096 if thinking else 0,
-            callbacks=self._handlers(tag),
-        )
+            callbacks=self._handlers(tag, ref),
+        ), ref)
 
     def _local_or_beam(self, tag: str) -> Any:
         if self.local_up and ChatOpenAI is not None:
             thinking = self.settings.think_worker if tag == "WORKER" else self.settings.think_critic
+            ref = ref_for("local", self.settings.local_model_name,
+                          family=family_of(self.settings.local_model_name),
+                          billing=MB_LOCAL)
             kwargs: dict[str, Any] = dict(
                 model=self.settings.local_model_name,
                 base_url=self.settings.local_llm_url,
@@ -839,14 +951,19 @@ class LLMPool:
                 temperature=0.3,
                 streaming=True,
                 request_timeout=600,
-                callbacks=self._handlers(tag),
+                callbacks=self._handlers(tag, ref),
             )
             if not thinking:
                 kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
-            return ChatOpenAI(**kwargs)
+            return _attach_identity(ChatOpenAI(**kwargs), ref)
         # Local down: Gemini (sunk cost) first, subscription model only last.
         return (self._gemini(self.settings.gemini_model, thinking=False, tag=tag)
                 or self._cloud(self.settings.beam_free_model, tag, thinking=self.settings.think_worker))
+
+    def _allowed(self, llms: list[Any]) -> list[Any]:
+        """Drop pay-as-you-go handles unless the user explicitly authorized them."""
+        return [llm for llm in llms
+                if llm is not None and (self.allow_paid or not bills_per_token(llm))]
 
     def _build(self) -> None:
         s = self.settings
@@ -862,7 +979,7 @@ class LLMPool:
         manager_chain = ([fieldmarshal, fieldmarshal_fb, manager_gemini, manager_openrouter]
                          if go_primary else
                          [manager_gemini, manager_openrouter, fieldmarshal, fieldmarshal_fb])
-        manager_chain = [c for c in manager_chain if c is not None]
+        manager_chain = self._allowed(manager_chain)
         self.manager_primary = manager_chain[0] if manager_chain else None
         manager_fallbacks = manager_chain[1:]
         if self.manager_primary is not None and manager_fallbacks:
@@ -878,7 +995,8 @@ class LLMPool:
         arch_argon = self._cloud(s.review_model, "ARCHITECT", max_tokens=16384)
         arch_openrouter = self._openrouter(s.openrouter_model, "ARCHITECT")
         self.deepseek = self._deepseek(s.deepseek_model, "ARCHITECT", thinking=True, max_tokens=24576)
-        self.deepseek_offpeak = None if (self.deepseek is None or self.is_peak()) else self.deepseek
+        self.deepseek_offpeak = (None if (self.deepseek is None or self.is_peak()
+                                        or not self.allow_paid) else self.deepseek)
         if self.deepseek_offpeak is not None:
             arch_primary = self.deepseek_offpeak
             arch_rest = [self.gemini_pro, arch_openrouter, arch_argon, arch_cloud]
@@ -887,7 +1005,7 @@ class LLMPool:
             arch_rest = ([arch_argon, arch_openrouter, arch_cloud]
                          if go_primary else
                          [arch_openrouter, arch_argon, arch_cloud])
-        arch_fallbacks = [c for c in arch_rest if c is not None]
+        arch_fallbacks = self._allowed(arch_rest)
         if arch_primary is not None and arch_fallbacks:
             self.architect = arch_primary.with_fallbacks(arch_fallbacks)
         else:
@@ -901,7 +1019,7 @@ class LLMPool:
                           [self.deepseek_offpeak, self.gemini_pro,
                            self._cloud(s.review_model, "ESCALATE", max_tokens=16384),
                            self._cloud(s.fieldmarshal_model, "ESCALATE", thinking=True)])
-        escalate_chain = [c for c in escalate_chain if c is not None]
+        escalate_chain = self._allowed(escalate_chain)
         if len(escalate_chain) > 1:
             self.escalate = escalate_chain[0].with_fallbacks(escalate_chain[1:])
         else:
@@ -927,9 +1045,7 @@ class LLMPool:
                         self._gemini(s.gemini_fallback_model, thinking=False, tag="REVIEW"),
                         self._openrouter(s.openrouter_model, "REVIEW", max_tokens=16384),
                         self._cloud(s.review_model, "REVIEW", max_tokens=16384)])
-        for cand in review_pool:
-            if cand is not None:
-                review_candidates.append(cand)
+        review_candidates = self._allowed(review_pool)
         if review_candidates:
             self.reviewer = (review_candidates[0].with_fallbacks(review_candidates[1:])
                              if len(review_candidates) > 1 else review_candidates[0])
@@ -953,6 +1069,7 @@ class LLMPool:
         if go_fallback is not None:
             fallbacks.append(go_fallback)
 
+        fallbacks = self._allowed(fallbacks)
         if gemini_primary is not None and fallbacks:
             self.gemini = gemini_primary.with_fallbacks(fallbacks)
         elif gemini_primary is not None:
@@ -964,8 +1081,7 @@ class LLMPool:
         # then Gemini Pro, the Gemini workhorse chain, and off-peak DeepSeek.
         senior_primary = (self._free_cloud(s.senior_model, "DEV", max_tokens=16384)
                           if (self.settings.senior_force or self.big_pickle_up) else None)
-        senior_fallbacks = [c for c in (self.gemini_pro, self.gemini, self.deepseek_offpeak)
-                            if c is not None]
+        senior_fallbacks = self._allowed([self.gemini_pro, self.gemini, self.deepseek_offpeak])
         if senior_primary is not None and senior_fallbacks:
             self.senior_dev = senior_primary.with_fallbacks(senior_fallbacks)
         else:
@@ -1064,23 +1180,86 @@ class LLMPool:
         return str(content)
 
     def complete(self, llm: Any, messages: list[Any], meta: Optional[dict[str, Any]] = None) -> str:
-        """Run `llm.invoke` and return text. Streaming callbacks fire live."""
+        """Run `llm.invoke` and return text. Streaming callbacks fire live.
+
+        Every candidate attempted inside a fallback chain is recorded as its
+        own ``TaskAttempt``. The spend gate and the unknown-billing guard run
+        before any candidate is dispatched.
+        """
         if llm is None:
             raise RuntimeError("model unavailable (missing key/endpoint)")
+        meta = meta or {}
+        tag = meta.get("tag") or "OVERRIDE"
+        refs = iter_model_refs(llm)
+        dispatch_refs = refs or [ref_from_handle(llm)]
+        if self.dispatch_guard is not None:
+            # A handle without identity is treated as unknown, never as free.
+            self.dispatch_guard(dispatch_refs)
+        elif not getattr(self, "allow_unknown", False):
+            for ref in dispatch_refs:
+                if ref.billing == MB_UNKNOWN:
+                    raise UnknownBilling(
+                        f"billing desconhecido para {ref.provider}/{ref.endpoint}/"
+                        f"{ref.model_id}; autoriza com ALLOW_UNKNOWN=1/--allow-unknown")
+        # Pre-flight: even a role whose only handle is paid must ask first.
+        if bills_per_token(llm) and not self.allow_paid:
+            choice = self._request_paid(tag, "este papel só tinha um modelo pago disponível")
+            paid = self._payg_model(choice, tag) if choice else None
+            if paid is None:
+                raise BudgetSuspended(
+                    f"{tag}: modelo pago bloqueado pelo circuit breaker; "
+                    "autoriza no TUI ou define ALLOW_PAID=1")
+            llm = paid
+            self._activate_paid()
+        collector = AttemptCollector(run_id=str(meta.get("run") or ""),
+                                     task=str(meta.get("task") or ""), tag=tag)
+        token = _ATTEMPT_CTX.set(collector)
+        try:
+            result = self._invoke(llm, messages, meta, tag, allow_breaker=True)
+            if not collector.events():
+                collector.synthesize(refs[0] if refs else ref_from_handle(llm), "ok")
+            return result
+        except Exception as e:
+            if not collector.events():
+                collector.synthesize(refs[0] if refs else ref_from_handle(llm),
+                                     _error_kind(e), error=str(e))
+            raise
+        finally:
+            _ATTEMPT_CTX.reset(token)
+            if self.attempt_sink is not None:
+                for event in collector.events():
+                    try:
+                        self.attempt_sink(event)
+                    except Exception:
+                        pass
+
+    def _invoke(self, llm: Any, messages: list[Any], meta: Optional[dict[str, Any]],
+                tag: str, allow_breaker: bool) -> str:
         model = self._model_name(llm)
         run = (meta or {}).get("run")
         started = time.monotonic()
         if self.telemetry is not None and run:
             self.telemetry.record(run, "llm_start", model=model,
-                                  tag=(meta or {}).get("tag"), task=(meta or {}).get("task"))
+                                  tag=tag, task=(meta or {}).get("task"))
         try:
             with self._local_lock if llm is self.worker else _null_lock():
                 response = llm.invoke(messages)
         except Exception as e:
+            kind = _error_kind(e)
             if self.telemetry is not None and run:
                 self.telemetry.record(run, "llm_error", model=model,
-                                      tag=(meta or {}).get("tag"), task=(meta or {}).get("task"),
-                                      kind=_error_kind(e), error=str(e)[:300])
+                                      tag=tag, task=(meta or {}).get("task"),
+                                      kind=kind, error=str(e)[:300])
+            if allow_breaker and kind == "429/quota" and not self.allow_paid:
+                choice = self._request_paid(
+                    tag, f"429/quota em {model}: a cadeia gratuita esgotou-se")
+                paid = self._payg_model(choice, tag) if choice else None
+                if paid is not None:
+                    self._activate_paid()
+                    return self._invoke(paid, messages, meta, tag, allow_breaker=False)
+                raise BudgetSuspended(
+                    f"{tag}: 429/quota sem autorização para usar modelos pagos; "
+                    "autoriza no TUI, ALLOW_PAID=1 ou --allow-paid") from e
             raise
         self._record_usage(meta, response, model, int((time.monotonic() - started) * 1000))
         text = self._content_str(response)
@@ -1088,6 +1267,42 @@ class LLMPool:
             raise RuntimeError(f"empty response from {model} "
                                f"(finish_reason={getattr(response, 'response_metadata', {}).get('finish_reason')})")
         return text
+
+    # -- budget breaker ----------------------------------------------------- #
+
+    def payg_options(self) -> list[str]:
+        """Pay-as-you-go models the user may authorize."""
+        return payg_options(
+            self.deepseek_enabled, self.settings.deepseek_model,
+            self.openrouter_enabled, self.settings.openrouter_model,
+            self.settings.openrouter_free_model, self.settings.payg_models)
+
+    def _request_paid(self, tag: str, reason: str) -> Optional[str]:
+        options = self.payg_options()
+        self.budget_events.append({"kind": "suspend", "tag": tag,
+                                   "reason": reason, "options": options})
+        if not options:
+            return None
+        if self.on_budget is not None:
+            return self.on_budget(reason, options)
+        return options[0] if self.allow_paid else None
+
+    def _payg_model(self, model: Optional[str], tag: str) -> Any:
+        model = (model or "").strip()
+        if not model:
+            return None
+        if self.deepseek_enabled and model == self.settings.deepseek_model:
+            return self._deepseek(model, tag, max_tokens=16384)
+        if self.openrouter_enabled and ("/" in model or model.endswith(":free")):
+            return self._openrouter(model, tag, max_tokens=16384)
+        if self.cloud_enabled:
+            return self._cloud(model, tag, thinking=False)
+        return None
+
+    def _activate_paid(self) -> None:
+        if not self.allow_paid:
+            self.allow_paid = True
+            self._build()
 
     def _model_name(self, llm: Any) -> str:
         for attr in ("model_name", "model"):
@@ -1273,6 +1488,8 @@ class TaskSpec(BaseModel):
     target_file: str = ""
     review: bool = False
     status: str = "pending"
+    attempts: list[dict] = Field(default_factory=list)
+    delivered_by: Optional[dict] = None
 
 
 class SpecContract(BaseModel):
@@ -2091,8 +2308,32 @@ class Orchestrator:
 
     # -- spec --------------------------------------------------------------- #
 
+    def on_attempt(self, event: AttemptEvent) -> None:
+        """Record every candidate call in the legacy orchestrator run."""
+        if self.spec is not None and event.task:
+            for task in self.spec.tasks:
+                if task.id == event.task:
+                    task.attempts.append(event.attempt.to_dict())
+                    if event.attempt.outcome == "ok":
+                        task.delivered_by = event.attempt.model.to_dict()
+                    break
+        else:
+            self.history.append({"kind": "attempt", **event.to_dict()})
+        try:
+            if self.spec is not None:
+                self._save_spec(self.spec)
+        except Exception:
+            pass
+
+    def _mark_delivered(self, task: TaskSpec) -> None:
+        for raw in reversed(task.attempts):
+            if raw.get("outcome") == "ok" and raw.get("model"):
+                task.delivered_by = raw["model"]
+                return
+
     def draft_spec(self, instruction: str, feedback: str = "",
                    continues: bool = False) -> SpecContract:
+        self.pool.attempt_sink = self.on_attempt
         fresh = self.run_id is None
         review = bool(REVIEW_RE.search(instruction or ""))
         if fresh:
@@ -2390,6 +2631,7 @@ class Orchestrator:
             self.power.stop()
 
     def _execute(self) -> None:
+        self.pool.attempt_sink = self.on_attempt
         if self.spec is None:
             return
         self.results = {}
@@ -3103,6 +3345,59 @@ class DashboardState:
         return out or Text("—", style="grey42")
 
 
+class BudgetOverrideModal(ModalScreen[Optional[str]]):
+    """Human-in-the-loop authorization for a pay-as-you-go model.
+
+    Dismisses with the chosen model id, or ``None`` to keep the breaker closed.
+    """
+
+    CSS = """
+    BudgetOverrideModal { align: center middle; }
+    #budget-dialog {
+        width: 64;
+        height: auto;
+        padding: 2;
+        border: thick $warning;
+        background: $surface;
+    }
+    #budget-title { text-style: bold; color: $warning; margin-bottom: 1; }
+    #budget-reason { margin-bottom: 1; color: $text-muted; }
+    #budget-select { margin-bottom: 1; }
+    #budget-buttons { height: auto; align: right middle; }
+    #budget-buttons Button { margin-left: 1; }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancelar")]
+
+    def __init__(self, reason: str, options: list[str]):
+        super().__init__()
+        self.reason = reason
+        self.options = options
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="budget-dialog"):
+            yield Label("⚠ Circuit breaker financeiro", id="budget-title")
+            yield Static(self.reason, id="budget-reason")
+            yield Static("Escolhe o modelo pago com que queres continuar:")
+            yield Select([(m, m) for m in self.options], id="budget-select",
+                         value=self.options[0] if self.options else Select.BLANK)
+            with Horizontal(id="budget-buttons"):
+                yield Button("Autorizar e continuar", id="budget-ok", variant="warning")
+                yield Button("Cancelar", id="budget-cancel", variant="error")
+
+    @on(Button.Pressed, "#budget-ok")
+    def _ok(self) -> None:
+        value = self.query_one("#budget-select", Select).value
+        self.dismiss(value if isinstance(value, str) else None)
+
+    @on(Button.Pressed, "#budget-cancel")
+    def _cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class CrewTUIApp(App):
     TITLE = "Agent Pool — Dashboard"
     SUB_TITLE = "SPEC → BUILD → VERIFY"
@@ -3174,6 +3469,7 @@ class CrewTUIApp(App):
         self._busy = False
         self._progress_text = ""
         self.factory: Optional[Any] = None
+        self.engine: Optional[Any] = None
         self._factory_mode = False
 
     # -- lifecycle ---------------------------------------------------------- #
@@ -3232,6 +3528,7 @@ class CrewTUIApp(App):
         self.telemetry.subscribe(self._on_telemetry)
         self.pool = LLMPool(self.settings, sink_factory=self._sink_factory,
                             telemetry=self.telemetry, progress_factory=self._progress_factory)
+        self.pool.on_budget = self._budget_override
         self.orchestrator = Orchestrator(self.settings, self.pool, emit=self._emit_ctrl, telemetry=self.telemetry)
         if self.orchestrator.load_session():
             self._write(tagged("SYSTEM", "sessão anterior recuperada:", bold=True))
@@ -3325,6 +3622,40 @@ class CrewTUIApp(App):
     def _emit_ctrl(self, tag: str, text: str) -> None:
         self.call_from_thread(self._write, tagged(tag, text))
 
+    def _budget_override(self, reason: str, options: list[str]) -> Optional[str]:
+        """Block a worker thread until the human authorizes (or refuses) paid use.
+
+        Called from the agent worker; the modal lives on the Textual loop, so
+        we schedule it with ``call_from_thread`` and park on an Event.
+        """
+        if not options:
+            return None
+        if getattr(self, "_budget_modal_open", False):
+            return None
+        box: dict[str, Optional[str]] = {"value": None}
+        done = threading.Event()
+
+        def show() -> None:
+            self._budget_modal_open = True
+
+            def chosen(value: Optional[str]) -> None:
+                box["value"] = value
+                self._budget_modal_open = False
+                done.set()
+
+            self.push_screen(BudgetOverrideModal(reason, options), chosen)
+
+        try:
+            self.call_from_thread(show)
+        except Exception:
+            return None
+        done.wait()
+        if box["value"]:
+            self._write(tagged("SYSTEM", f"breaker: autorizado {box['value']}", bold=True))
+        else:
+            self._write(tagged("SYSTEM", "breaker: override recusado — execução parada", bold=True))
+        return box["value"]
+
     def _refresh_status(self) -> None:
         self._refresh_dashboard()
 
@@ -3365,11 +3696,55 @@ class CrewTUIApp(App):
 
     def _start_factory(self, goal: str, resume: bool = False) -> None:
         from factory import Factory
+        store = StateManager(self.settings.workspace_dir, self.settings.log_dir)
         root = self._factory_project(goal)
-        self.factory = Factory(self.settings, self.pool, emit=self._factory_emit,
-                               project_root=root, telemetry=self.telemetry)
+        state = None
+        kind = None
+        if resume:
+            try:
+                target = store.resolve_resume(root)
+            except StateCorruptError as exc:
+                self._write(tagged("SYSTEM", str(exc), bold=True))
+                self._write(tagged("SYSTEM", "estado preservado; corrige/migra antes de retomar.",
+                                   bold=True))
+                return
+            if target is not None and target.project_state is not None:
+                state = target.project_state
+                kind = target.engine_kind
+        if kind is None and not resume:
+            try:
+                kind = resolve_engine()
+            except EngineError:
+                kind = ENGINE_LEGACY
+
+        if state is not None or kind == ENGINE_UNIFIED:
+            if state is None:
+                state = new_unified_state(goal or "projeto", str(root),
+                                          engine_version=ENGINE_VERSION)
+            if not state.project_root:
+                state.project_root = str(root)
+            adapter = FactoryAdapter(self.settings, self.pool, self._factory_emit, state,
+                                     legacy_order=(kind == ENGINE_LEGACY))
+            eng = WorkflowEngine(state, store, adapter, emit=self._factory_emit,
+                                 allow_unknown=self.settings.allow_unknown)
+            eng.apply_pool(self.pool)
+            eng.save()
+            self.engine = eng
+            self.factory = EngineFacade(eng, store)
+            kind = state.engine_kind
+        else:
+            self.engine = None
+            self.pool.attempt_sink = None
+            try:
+                self.factory = Factory(self.settings, self.pool, emit=self._factory_emit,
+                                       project_root=root, telemetry=self.telemetry)
+            except StateCorruptError as exc:
+                self._write(tagged("SYSTEM", str(exc), bold=True))
+                self._write(tagged("SYSTEM", "estado preservado; corrige/migra o ficheiro antes de retomar.",
+                                   bold=True))
+                return
         self._factory_mode = True
-        self._write(tagged("FACTORY", f"projeto: {root}", bold=True))
+        self._write(tagged("FACTORY", f"projeto: {root} · motor: {kind}", bold=True))
         if resume and self.factory.state.requirements:
             self._write(tagged("SYSTEM", f"a retomar do passo {self.factory.state.step} …"))
             self._set_phase("BUILD")
@@ -3425,6 +3800,26 @@ class CrewTUIApp(App):
         self._busy = False
 
     def _factory_done(self, ok: bool) -> None:
+        pause = getattr(self.factory, "pause_reason", "") if self.factory else ""
+        if not ok and pause == "architecture_approval":
+            self._clear_progress()
+            self._busy = False
+            self._set_phase("PLAN")
+            arch = getattr(self.factory, "state", None)
+            self._write(tagged("SYSTEM", "arquitetura pronta — revê os módulos/interfaces.",
+                               bold=True))
+            if arch is not None:
+                self._write(tagged("ARCHITECT", f"{len(arch.tasks)} tarefa(s) definidas."))
+            self._write(tagged("SYSTEM", "escreve 'go' para APROVAR a arquitetura e continuar.",
+                               bold=True))
+            return
+        if not ok and pause.endswith("_failed"):
+            self._clear_progress()
+            self._busy = False
+            self._set_phase("PLAN")
+            self._write(tagged("SYSTEM", f"parou em {pause}: vê o log e responde com feedback.",
+                               bold=True))
+            return
         self._clear_progress()
         self._busy = False
         self._factory_mode = False
@@ -3479,8 +3874,9 @@ class CrewTUIApp(App):
         if self.phase in ("AWAIT", "PLAN"):
             if self._factory_mode and self.factory is not None:
                 if text.lower().strip(" .!") in APPROVE_KEYWORDS:
-                    self._write(tagged("SYSTEM", "go recebido — a executar passos 2-9 "
-                                                 "(scaffold → architect → build → integração → visual → sign-off) …",
+                    self._write(tagged("SYSTEM", "go recebido — a executar as fases do motor "
+                                                 "(SPEC → ARCHITECTURE → SCAFFOLD → BUILD → "
+                                                 "VERIFY → INTEGRATE → VISUAL → SIGN-OFF) …",
                                        bold=True))
                     self._set_phase("BUILD")
                     self._busy = True
@@ -3624,18 +4020,24 @@ class CrewTUIApp(App):
         self._busy = False
 
 
-def _factory_cli(args: Any) -> int:
+def _legacy_factory_cli(args: Any, settings: Any = None, store: Any = None) -> int:
     """Headless entrypoint: ``crew-tui --factory GOAL [--project DIR] [--yes|--resume]``."""
     from factory import Factory
 
-    settings = Settings.from_env()
+    if settings is None:
+        settings = Settings.from_env()
     settings.unattended = bool(getattr(args, "unattended", False))
+    if getattr(args, "allow_paid", False):
+        settings.allow_paid = True
+    if getattr(args, "allow_unknown", False):
+        settings.allow_unknown = True
     if settings.unattended:
         settings.sleep_if_active = True
     telemetry = Telemetry(settings)
     emit = lambda tag, text: print(f"[{tag}] {text}", flush=True)
     pool = LLMPool(settings, sink_factory=lambda tag: (lambda r: None),
                    telemetry=telemetry, progress_factory=lambda tag: (lambda t, c: None))
+    pool.attempt_sink = None
     print("discover:", pool.status_summary(), flush=True)
     pool.discover()
 
@@ -3675,19 +4077,192 @@ def _factory_cli(args: Any) -> int:
     return 0 if ok else 1
 
 
+def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
+                    state: Any = None) -> int:
+    """Run the unified/legacy engine with canonical .crew persistence."""
+    telemetry = Telemetry(settings)
+    emit = lambda tag, text: print(f"[{tag}] {text}", flush=True)
+    pool = LLMPool(settings, sink_factory=lambda tag: (lambda r: None),
+                   telemetry=telemetry, progress_factory=lambda tag: (lambda t, c: None))
+    print("discover:", pool.status_summary(), flush=True)
+    pool.discover()
+
+    root = Path(os.path.expanduser(args.project)) if args.project else None
+    if state is not None and state.project_root:
+        root = Path(state.project_root)
+    if root is None:
+        goal = args.factory or (state.goal if state is not None else "projeto")
+        slug = re.sub(r"[^a-z0-9]+", "_", goal.lower()).strip("_")[:40] or "projeto"
+        root = Path(os.path.expanduser(settings.project_dir)) / slug
+    root.mkdir(parents=True, exist_ok=True)
+
+    if state is None:
+        if not args.factory:
+            print("uso: crew-tui --factory \"objetivo\" [--project DIR]", flush=True)
+            return 2
+        state = new_unified_state(args.factory, str(root), engine_version=ENGINE_VERSION)
+        state.engine_kind = kind
+    else:
+        kind = state.engine_kind
+        if not state.project_root:
+            state.project_root = str(root)
+
+    env_kind = resolve_engine()
+    if args.resume and env_kind != kind:
+        print(f"aviso: CREW_ENGINE={env_kind} ignorado no resume; "
+              f"o estado usa engine_kind={kind}", flush=True)
+
+    adapter = FactoryAdapter(settings, pool, emit, state,
+                             legacy_order=(kind == ENGINE_LEGACY))
+    eng = WorkflowEngine(state, store, adapter, emit=emit,
+                         allow_unknown=bool(getattr(args, "allow_unknown", False)
+                                            or settings.allow_unknown))
+    eng.apply_pool(pool)
+    eng.save()
+
+    for _ in range(16):
+        result = eng.run()
+        if result == "done":
+            done = sum(1 for t in state.tasks if t.status in ("done", "verified"))
+            print(f"PASS · fase {state.phase} · {done}/{len(state.tasks)} tarefas · {root}",
+                  flush=True)
+            print(f"estado: {eng.store.project_state_path(root) if state.project_root else eng.store.staging_path(state.run_id)}",
+                  flush=True)
+            return 0
+        if result == "failed":
+            print(f"FAIL · fase {state.phase} · {state.pause.detail or state.pause.reason}",
+                  flush=True)
+            return 1
+        reason = state.pause.reason
+        if reason in ("spec_questions", "spec_approval"):
+            questions = list(state.requirements.open_questions)
+            answered = False
+            if questions and not args.yes:
+                for q in questions:
+                    try:
+                        ans = input(f"Q: {q}\nA: ").strip()
+                    except EOFError:
+                        ans = ""
+                    if ans:
+                        adapter.answer(q, ans)
+                        answered = True
+            if answered:
+                eng.spec_step()
+            eng.approve_spec()
+            print("[SPEC] aprovado — a avançar para a arquitetura", flush=True)
+            continue
+        if reason == "architecture_approval":
+            print(f"[GATE] arquitetura pronta: {state.architecture_hash()}", flush=True)
+            if getattr(args, "approve_architecture", False):
+                eng.approve_architecture()
+                print("[GATE] arquitetura aprovada", flush=True)
+                continue
+            print("gate fechado: usa --approve-architecture (--yes não o contorna)",
+                  flush=True)
+            return 4
+        print(f"PAUSED · {reason}: {state.pause.detail}", flush=True)
+        return 4
+    print("PAUSED · limite de iterações do motor", flush=True)
+    return 4
+
+
+def _factory_cli(args: Any) -> int:
+    """Dispatch new runs by CREW_ENGINE and resumes by the persisted engine."""
+    settings = Settings.from_env()
+    settings.unattended = bool(getattr(args, "unattended", False))
+    if getattr(args, "allow_paid", False):
+        settings.allow_paid = True
+    if getattr(args, "allow_unknown", False):
+        settings.allow_unknown = True
+    if settings.unattended:
+        settings.sleep_if_active = True
+    store = StateManager(settings.workspace_dir, settings.log_dir)
+
+    if args.resume:
+        root = Path(os.path.expanduser(args.project)) if args.project else None
+        target = store.resolve_resume(root)
+        if target is not None and target.project_state is not None:
+            return _engine_cli_run(args, target.engine_kind, settings, store,
+                                   target.state)
+        if (target is not None and target.project_state is None
+                and target.engine_kind == ENGINE_UNIFIED):
+            print(f"[STATE] estado inconsistente: {target.path} declara unified "
+                  "mas não tem formato canónico", flush=True)
+            return 6
+        return _legacy_factory_cli(args, settings, store)
+
+    try:
+        kind = resolve_engine()
+    except EngineError as exc:
+        print(f"[ENGINE] {exc}", flush=True)
+        return 2
+    if kind == ENGINE_UNIFIED:
+        return _engine_cli_run(args, kind, settings, store, None)
+    return _legacy_factory_cli(args, settings, store)
+
+
+def _migrate_cli(args: Any) -> int:
+    settings = Settings.from_env()
+    store = StateManager(settings.workspace_dir, settings.log_dir)
+    if not args.project:
+        print("--migrate-state/--migrate-engine exigem --project DIR", flush=True)
+        return 2
+    root = Path(os.path.expanduser(args.project))
+    if getattr(args, "migrate_state", False):
+        state = migrate_state(store, str(root))
+        print(f"formato migrado: {store.project_state_path(root)} "
+              f"(engine_kind={state.engine_kind}, schema={state.schema_version})", flush=True)
+    if getattr(args, "migrate_engine", False):
+        state = store.load_project(store.project_state_path(root))
+        state = migrate_engine(store, state)
+        print(f"motor migrado: engine_kind={state.engine_kind} "
+              f"(engine_version={state.engine_version})", flush=True)
+    return 0
+
+
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(prog="crew-tui", description="Agent pool dashboard + software factory")
     parser.add_argument("--factory", metavar="GOAL", help="corre a pipeline 1-9 headless para este objetivo")
     parser.add_argument("--project", metavar="DIR", help="pasta do projeto (default: PROJECT_DIR/<slug>)")
-    parser.add_argument("--resume", action="store_true", help="retoma a factory a partir de .factory/state.json")
+    parser.add_argument("--resume", action="store_true",
+                        help="retoma a execução a partir do estado persistido (.crew/.factory)")
     parser.add_argument("--yes", action="store_true", help="não faz perguntas (assume pressupostos)")
     parser.add_argument("--unattended", action="store_true",
                         help="no pico, suspende mesmo com a sessão ativa (acorda off-peak)")
+    parser.add_argument("--allow-paid", action="store_true",
+                        help="autoriza pay-as-you-go (DeepSeek direto / OpenRouter pago)")
+    parser.add_argument("--allow-unknown", action="store_true",
+                        help="autoriza billing desconhecido (nunca por omissão)")
+    parser.add_argument("--approve-architecture", action="store_true",
+                        help="aprova a arquitetura (o --yes não a aprova)")
+    parser.add_argument("--migrate-state", action="store_true",
+                        help="converte .factory/state.json para .crew/state.json (não muda o motor)")
+    parser.add_argument("--migrate-engine", action="store_true",
+                        help="muda engine_kind para unified (operação distinta)")
     args = parser.parse_args()
+    if args.migrate_state or args.migrate_engine:
+        try:
+            raise SystemExit(_migrate_cli(args))
+        except (StateError, FileNotFoundError) as e:
+            print(f"[STATE] {e}", flush=True)
+            raise SystemExit(6)
     if args.factory or args.resume:
-        raise SystemExit(_factory_cli(args))
+        try:
+            raise SystemExit(_factory_cli(args))
+        except BudgetSuspended as e:
+            print(f"[BREAKER] {e}", flush=True)
+            raise SystemExit(3)
+        except UnknownBilling as e:
+            print(f"[BILLING] {e}", flush=True)
+            raise SystemExit(5)
+        except EngineError as e:
+            print(f"[ENGINE] {e}", flush=True)
+            raise SystemExit(2)
+        except StateCorruptError as e:
+            print(f"[STATE] {e}", flush=True)
+            raise SystemExit(6)
     CrewTUIApp().run()
 
 
