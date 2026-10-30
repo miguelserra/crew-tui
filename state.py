@@ -438,6 +438,38 @@ def validate_tasks(tasks: list[Task],
     return normalized
 
 
+def validate_dependencies(tasks: list[Task]) -> None:
+    """Reject missing dependency ids, self-dependencies and cycles."""
+    ids = [t.id for t in tasks]
+    if len(ids) != len(set(ids)):
+        raise StateValidationError("tarefas com ids duplicados")
+    known = set(ids)
+    graph: dict[str, list[str]] = {}
+    for task in tasks:
+        missing = [d for d in task.depends_on if d not in known]
+        if missing:
+            raise StateValidationError(
+                f"tarefa {task.id} depende de ids inexistentes: {missing}")
+        if task.id in task.depends_on:
+            raise StateValidationError(f"tarefa {task.id} depende de si própria")
+        graph[task.id] = list(task.depends_on)
+    marks: dict[str, int] = {}
+
+    def visit(node: str) -> None:
+        mark = marks.get(node, 0)
+        if mark == 1:
+            raise StateValidationError(f"dependências cíclicas envolvendo {node}")
+        if mark == 2:
+            return
+        marks[node] = 1
+        for dep in graph.get(node, []):
+            visit(dep)
+        marks[node] = 2
+
+    for node in graph:
+        visit(node)
+
+
 def _norm_text(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").casefold()).strip()
 
@@ -632,6 +664,7 @@ class ProjectState:
         if self.phase not in PHASES:
             raise StateValidationError(f"phase inválida: {self.phase!r}")
         self.tasks = validate_tasks(self.tasks, project_root=self.project_root or None)
+        validate_dependencies(self.tasks)
         link_traceability(self.requirements, self.tasks)
         validate_traceability(self.requirements, self.tasks)
         crit_ids = set(self.requirements.criterion_ids())

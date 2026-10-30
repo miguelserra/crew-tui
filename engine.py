@@ -34,6 +34,7 @@ from state import (
     new_id,
     link_traceability,
     validate_traceability,
+    validate_dependencies,
     utc_now,
 )
 from store import ResumeTarget, StateManager, atomic_write_json
@@ -511,6 +512,7 @@ class FactoryAdapter:
                               or (dict(prev.legacy_extra) if prev else {})),
             ))
         self.project.tasks = tasks
+        validate_dependencies(self.project.tasks)
         link_traceability(self.project.requirements, self.project.tasks)
         validate_traceability(self.project.requirements, self.project.tasks)
         self.project.integration = dict(fs.integration)
@@ -617,33 +619,7 @@ def migrate_state(store: StateManager, project_root: str) -> ProjectState:
 
 
 def _validate_dependencies(tasks: list[Task]) -> None:
-    ids = [t.id for t in tasks]
-    if len(ids) != len(set(ids)):
-        raise EngineError("tarefas com ids duplicados")
-    known = set(ids)
-    graph: dict[str, list[str]] = {}
-    for task in tasks:
-        missing = [d for d in task.depends_on if d not in known]
-        if missing:
-            raise EngineError(f"tarefa {task.id} depende de ids inexistentes: {missing}")
-        graph[task.id] = [d for d in task.depends_on if d != task.id]
-        if task.id in task.depends_on:
-            raise EngineError(f"tarefa {task.id} depende de si própria")
-    state: dict[str, int] = {}
-
-    def visit(node: str) -> None:
-        mark = state.get(node, 0)
-        if mark == 1:
-            raise EngineError(f"dependências cíclicas envolvendo {node}")
-        if mark == 2:
-            return
-        state[node] = 1
-        for dep in graph.get(node, []):
-            visit(dep)
-        state[node] = 2
-
-    for node in graph:
-        visit(node)
+    validate_dependencies(tasks)
 
 
 def validate_unified_state(state: ProjectState) -> None:

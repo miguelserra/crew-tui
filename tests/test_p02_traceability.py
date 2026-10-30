@@ -67,13 +67,13 @@ class TraceabilityTests(unittest.TestCase):
     def test_dag_rejects_missing_dependencies_and_cycles(self):
         missing = [s.Task(id="t1", kind="build", target_file="a.py",
                           depends_on=["ghost"])]
-        with self.assertRaises(e.EngineError):
+        with self.assertRaises(s.StateValidationError):
             e._validate_dependencies(missing)
         cycle = [
             s.Task(id="t1", kind="build", target_file="a.py", depends_on=["t2"]),
             s.Task(id="t2", kind="build", target_file="b.py", depends_on=["t1"]),
         ]
-        with self.assertRaises(e.EngineError):
+        with self.assertRaises(s.StateValidationError):
             e._validate_dependencies(cycle)
 
 

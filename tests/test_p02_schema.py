@@ -105,6 +105,16 @@ class SchemaMigrationTests(unittest.TestCase):
         self.assertEqual(len(snaps2), 1)
         self.assertEqual(first.run_id, second.run_id)
 
+    def test_invalid_v2_dag_is_rejected_and_preserved(self):
+        raw = v2_state(self.project)
+        raw["tasks"][0]["depends_on"] = ["ghost"]
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(self.path, raw)
+        before = self.path.read_bytes()
+        with self.assertRaises(s.StateValidationError):
+            self.store.migrate_schema_to_v3(self.project)
+        self.assertEqual(self.path.read_bytes(), before)
+
     def test_corrupt_v2_is_preserved(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("{broken", encoding="utf-8")

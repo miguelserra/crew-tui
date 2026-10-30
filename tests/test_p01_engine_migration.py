@@ -71,23 +71,17 @@ class MigrateEngineTests(unittest.TestCase):
         self.assertEqual(out.pause.reason, "architecture_approval")
         self.assertFalse(out.architecture_approved())
 
-    def test_missing_dependency_rejected_and_source_preserved(self):
-        st = self._state(tasks=[s.Task(id="t1", kind="build", target_file="a.py",
-                                       depends_on=["ghost"])])
-        path = self._save(st)
-        before = path.read_bytes()
-        with self.assertRaises(e.EngineError):
-            e.migrate_engine(self.store, st)
-        self.assertEqual(path.read_bytes(), before)
+    def test_missing_dependency_is_rejected_at_state_boundary(self):
+        with self.assertRaises(s.StateValidationError):
+            self._state(tasks=[s.Task(id="t1", kind="build", target_file="a.py",
+                                      depends_on=["ghost"])])
 
-    def test_cycle_rejected(self):
-        st = self._state(tasks=[
-            s.Task(id="t1", kind="build", target_file="a.py", depends_on=["t2"]),
-            s.Task(id="t2", kind="build", target_file="b.py", depends_on=["t1"]),
-        ])
-        self._save(st)
-        with self.assertRaises(e.EngineError):
-            e.migrate_engine(self.store, st)
+    def test_cycle_is_rejected_at_state_boundary(self):
+        with self.assertRaises(s.StateValidationError):
+            self._state(tasks=[
+                s.Task(id="t1", kind="build", target_file="a.py", depends_on=["t2"]),
+                s.Task(id="t2", kind="build", target_file="b.py", depends_on=["t1"]),
+            ])
 
     def test_snapshot_created_and_factory_untouched(self):
         factory = self.store.legacy_factory_path(self.project)
