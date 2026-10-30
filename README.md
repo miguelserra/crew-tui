@@ -10,9 +10,11 @@ Instead of letting one LLM "just write code", it freezes a spec, splits the work
 into atomic tasks, routes each task to a capable model, and refuses to deliver
 anything that fails an external oracle plus a cross-model critic.
 
-- **Pipeline:** SPEC → (human gate) → BUILD → VERIFY → DONE, plus a resumable
-  9-step factory (requirements → scaffold → architecture → build → fix →
-  integrate → visual → sign-off).
+- **Pipeline:** SPEC → (human gate) → ARCHITECTURE → SCAFFOLD → BUILD →
+  VERIFY/FIX → INTEGRATE → VISUAL → SIGN-OFF, with resumable canonical state.
+- **Canonical domain:** a single `ProjectState` (requirements, architecture,
+  tasks, approvals, verification history); legacy formats are compatibility
+  views, not parallel sources of truth.
 - **Verification is not optional:** `py_compile` / `node --check` / Playwright
   (console errors + DOM-contract audit) plus a critic from a **different model
   family** that must produce falsifiable objections.
@@ -98,7 +100,7 @@ local + Gemini only). The minimum useful setup is one strong cloud key:
 
 ```dotenv
 # Pick what you have; all are optional.
-GEMINI_API_KEY=...        # large context + multimodal critic, free tier
+GEMINI_API_KEY=...        # Gemini Plus: large context + multimodal critic
 DEEPSEEK_API_KEY=...      # pay-as-you-go, used off-peak for hard reasoning
 OPENCODE_API_KEY=...      # OpenAI-compatible subscription gateway (last resort)
 OPENROUTER_API_KEY=...    # optional free models
@@ -108,7 +110,7 @@ Then set the model names you want (see the next section). Keys are never
 written to disk by the app beyond the `.env` file you edit yourself, and
 `.env` is git-ignored. Never commit real keys.
 
-## Engine selection and canonical state (P1)
+## Engine selection and canonical state
 
 There is a **single Crew entry**: an ordinary instruction (TUI) or a
 positional goal (CLI, `crew-tui "objetivo" --project DIR`) starts the workflow.
@@ -139,6 +141,37 @@ CREW_ENGINE=unified   # new canonical state + corrected phase order
 - Models whose billing cannot be proven are blocked unless
   `--allow-unknown`/`ALLOW_UNKNOWN=1` is explicit.
 - Corrupt state raises and is preserved; it is never replaced by an empty state.
+
+## Canonical contracts (P2)
+
+`ProjectState` is the aggregate root and the only in-memory source of truth:
+
+- **RequirementContract** — objective, scope, constraints and acceptance
+  criteria. Each criterion has an `id`, `text`, `task_ids` and an optional
+  explicit `justification`; `link_traceability`/`validate_traceability` close
+  Requirement → Task → Verification.
+- **ArchitectureContract** — modules, interfaces and test plan.
+- **Task** — kind (`build|review|prose`), target file, role/complexity,
+  acceptance, dependencies and `requirement_ids`; the DAG rejects missing
+  dependencies and cycles.
+- **Approval** — the architecture hash covers the architecture contract, every
+  task plan field (including files, acceptance, dependencies and requirement
+  links) and the traceability mapping. Any plan change re-closes the gate;
+  progress/status changes do not.
+- **VerificationRecord** — verdict plus `criterion_ids` and oracle/critic/
+  visual/integration history.
+
+Schema control is explicit:
+
+```bash
+crew-tui --migrate-schema --project DIR    # .crew v2 -> v3 (no engine change)
+crew-tui --migrate-state  --project DIR    # .factory -> canonical .crew v3
+crew-tui --migrate-engine --project DIR    # v3 only; validates and snapshots
+```
+
+A v2 `.crew` is never upgraded silently on load. Unmapped legacy fields are
+preserved in `ProjectState.extensions`, contract `raw` data and
+`Task.legacy_extra`.
 
 ## Financial circuit breaker
 
@@ -240,37 +273,39 @@ While it runs, the TUI is a dashboard (not a code stream):
 - The compact log keeps only the last events (`STREAM_MODE=progress` by default;
   `full` streams code, `off` silences it).
 
-## Software factory (steps 1-9)
+## Software factory (single Crew entry)
 
-Hierarchical pipeline with resumable JSON state. In the TUI:
+Hierarchical workflow with a single canonical `ProjectState`. In the TUI an
+ordinary instruction starts it; `/resume` continues from persisted state:
 
 ```
-/factory <objetivo> [pasta do projeto]   # arranca o passo 1 (requisitos)
-go                                       # avança passos 2-9
-/resume                                  # retoma de .factory/state.json após interrupção
+<descreve o objetivo>          # entrada única (SPEC → ... → SIGN-OFF)
+go                             # aprova o SPEC e, mais tarde, a arquitetura
+/resume                        # retoma do estado persistido
 ```
 
-Headless:
+`/factory` and `--factory` are deprecated aliases with a warning. Headless:
 
 ```bash
-crew-tui --factory "objetivo" --project ~/projetos_opencode/foo --yes
+crew-tui "objetivo" --project ~/projetos_opencode/foo --yes --approve-architecture
 crew-tui --resume --project ~/projetos_opencode/foo
 ```
 
-| Passo | Papel | Modelo | Output |
+| Fase | Papel | Modelo | Output |
 |---|---|---|---|
-| 1 REQUIREMENTS | analista sénior (terso) | Gemini Flash → Argon | `requirements` no estado |
-| 2 SCAFFOLD | júnior | Qwen local | esqueleto de ficheiros |
-| 3 ARCHITECT | engenheiro-chefe | Gemini Pro → Argon | interfaces + tarefas (role por complexidade) |
+| 1 REQUIREMENTS/SPEC | analista sénior (terso) | Gemini/Argon | critérios de aceitação + perguntas |
+| 2 ARCHITECTURE | engenheiro-chefe | Gemini Pro → Argon | módulos, interfaces, tarefas, plano de testes |
+| 3 SCAFFOLD | júnior | Qwen local/Gemini | esqueleto de ficheiros (determinístico em P6) |
 | 4 BUILD | sénior/júnior por tarefa | Gemini/Argon, Qwen | ficheiros + `py_compile`/`node --check` |
-| 5 FIX | sénior → chefe | Gemini → Argon | loop recursivo com log de erros |
+| 5 VERIFY/FIX | sénior → chefe | Gemini → Argon | oráculo + crítico + ciclos de correção |
 | 6 INTEGRATE | execução real | — | run do entrypoint / Playwright |
-| 7 SENIOR_FIX | sénior → chefe | Gemini → Argon | correção de erros de integração |
-| 8 VISUAL | browser + visão | Playwright + Gemini | `ui_report` + screenshot |
-| 9 SIGN_OFF | chefe | Gemini Pro → Argon | `project_memory.json` |
+| 7 VISUAL | browser + visão | Playwright + Gemini | `ui_report` + screenshot |
+| 8 SIGN-OFF | chefe | Gemini Pro → Argon | `project_memory.json` |
 
-Artefactos (por projeto): `.factory/state.json` (retomável), `.factory/logs/*.log`,
-`.factory/candidates/`, `.factory/backups/`, `.factory/tests/`, `project_memory.json`.
+Artefactos: `.crew/state.json` é o estado canónico (schema v3);
+`.factory/state.json` é uma vista de compatibilidade para execuções legacy;
+`.factory/logs/`, `candidates/`, `backups/`, `tests/` e `project_memory.json`
+continuam a ser artefactos por projeto.
 
 **Auditoria Playwright (sem LLM):** carrega `index.html` em Chromium headless e falha
 com erros de consola/página, pedidos 404 e *contratos DOM* — IDs usados pelo JS/CSS
@@ -445,7 +480,7 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | Path | What it is |
 |---|---|
 | `main.py` | Config, `LLMPool` (model routing), `Verifier`, `Orchestrator`, Textual TUI, CLI |
-| `factory.py` | Legacy 9-step factory adapter + Playwright audit + DOM-contract check |
+| `factory.py` | Legacy Factory compatibility adapter + Playwright audit + DOM-contract check |
 | `state.py` | Canonical `ProjectState`/`Task`/`TaskAttempt`, legacy migration, path validation |
 | `store.py` | Atomic canonical store, staging promotion, resume resolution, format migration |
 | `registry.py` | `CredentialProfile`/`ModelRef`: provider, endpoint, billing, capabilities |
@@ -458,18 +493,22 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `scripts/crew-sleep` | Root helper that arms the RTC alarm / suspends (Linux) |
 | `scripts/install-crew-sleep.sh` | One-time root install + sudoers rule |
 | `setup.ps1`, `run.ps1` | Windows bootstrap and launcher |
-| `tests/` | Power, budget and P0/P1 engine/state/migration tests |
+| `tests/` | Power, budget, P0/P1 foundation and P2 contract/migration tests |
 
 ## Tests & CI
 
 ```bash
-.venv/bin/python tests/test_power.py        # Linux backend
-python tests/test_power_win.py              # Windows backend (on Windows)
+python -m unittest discover -s tests -p "test_p01_*.py"   # core, no deps
+python -m unittest discover -s tests -p "test_p02_*.py"   # core, no deps
+.venv/bin/python -m unittest discover -s tests -p "test_p0*_integration.py"
+python tests/test_power.py
+python tests/test_budget.py
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) byte-compiles every module and runs
-the power tests on Linux (Python 3.12 and 3.13) and on Windows (Python 3.13).
-The Linux RTC/suspend integration test is skipped on headless CI runners.
+GitHub Actions byte-compiles every module and runs the core suites on Linux
+(Python 3.10, 3.12 and 3.13) and Windows (3.13), plus dependency-backed
+integration tests on Linux and Windows (no API keys). The Linux RTC/suspend
+integration test is skipped on headless CI runners.
 
 ## License
 

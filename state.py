@@ -22,7 +22,8 @@ from typing import Any, Optional
 
 from registry import ModelRef
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+SCHEMA_V2 = 2
 LEGACY_SCHEMA_VERSION = 1
 
 ENGINE_LEGACY = "legacy"
@@ -129,17 +130,49 @@ class TaskAttempt:
 
 
 @dataclass
+class AcceptanceCriterion:
+    id: str
+    text: str
+    task_ids: list[str] = field(default_factory=list)
+    justification: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "text": self.text,
+            "task_ids": list(self.task_ids),
+            "justification": self.justification,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "AcceptanceCriterion":
+        data = data or {}
+        return cls(
+            id=str(data.get("id") or ""),
+            text=str(data.get("text") or data.get("criterion") or ""),
+            task_ids=[str(x) for x in (data.get("task_ids") or [])],
+            justification=str(data.get("justification") or ""),
+        )
+
+
+@dataclass
 class RequirementContract:
     objective: str = ""
     scope_in: list[str] = field(default_factory=list)
     scope_out: list[str] = field(default_factory=list)
     constraints: list[str] = field(default_factory=list)
     non_negotiables: list[str] = field(default_factory=list)
-    acceptance: list[str] = field(default_factory=list)
+    acceptance: list[AcceptanceCriterion] = field(default_factory=list)
     assumptions: list[str] = field(default_factory=list)
     open_questions: list[str] = field(default_factory=list)
     answers: list[dict[str, str]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+
+    def acceptance_texts(self) -> list[str]:
+        return [c.text for c in self.acceptance]
+
+    def criterion_ids(self) -> list[str]:
+        return [c.id for c in self.acceptance]
 
     def to_dict(self) -> dict[str, Any]:
         out = dict(self.raw)
@@ -149,7 +182,36 @@ class RequirementContract:
             "scope_out": list(self.scope_out),
             "constraints": list(self.constraints),
             "non_negotiables": list(self.non_negotiables),
-            "acceptance": list(self.acceptance),
+            "acceptance": [c.to_dict() for c in self.acceptance],
+            "assumptions": list(self.assumptions),
+            "open_questions": list(self.open_questions),
+            "answers": list(self.answers),
+        })
+        return out
+
+    def content_hash(self) -> str:
+        return sha256_json({
+            "objective": self.objective,
+            "scope_in": list(self.scope_in),
+            "scope_out": list(self.scope_out),
+            "constraints": list(self.constraints),
+            "non_negotiables": list(self.non_negotiables),
+            "acceptance": [{"id": c.id, "text": c.text} for c in self.acceptance],
+            "assumptions": list(self.assumptions),
+            "answers": list(self.answers),
+        })
+
+    def to_legacy_dict(self) -> dict[str, Any]:
+        """Shape consumed by the legacy Factory/Orchestrator prompts."""
+        out = dict(self.raw)
+        out.update({
+            "objective": self.objective,
+            "scope_in": list(self.scope_in),
+            "scope_out": list(self.scope_out),
+            "constraints": list(self.constraints),
+            "non_negotiables": list(self.non_negotiables),
+            "acceptance": self.acceptance_texts(),
+            "acceptance_criteria": [c.to_dict() for c in self.acceptance],
             "assumptions": list(self.assumptions),
             "open_questions": list(self.open_questions),
             "answers": list(self.answers),
@@ -159,14 +221,31 @@ class RequirementContract:
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "RequirementContract":
         data = data or {}
+        rich = data.get("acceptance_criteria")
+        if isinstance(rich, list) and any(isinstance(x, dict) for x in rich):
+            raw_acc = rich
+        else:
+            raw_acc = data.get("acceptance") or rich or []
+        if not isinstance(raw_acc, list):
+            raw_acc = [raw_acc]
+        criteria: list[AcceptanceCriterion] = []
+        for i, item in enumerate(raw_acc):
+            if isinstance(item, dict):
+                crit = AcceptanceCriterion.from_dict(item)
+                if not crit.text:
+                    crit.text = str(item.get("criterion") or "")
+            else:
+                crit = AcceptanceCriterion(id=f"ac{i + 1}", text=str(item))
+            if not crit.id:
+                crit.id = f"ac{i + 1}"
+            criteria.append(crit)
         return cls(
             objective=str(data.get("objective") or data.get("goal") or ""),
             scope_in=[str(x) for x in (data.get("scope_in") or [])],
             scope_out=[str(x) for x in (data.get("scope_out") or [])],
             constraints=[str(x) for x in (data.get("constraints") or [])],
             non_negotiables=[str(x) for x in (data.get("non_negotiables") or [])],
-            acceptance=[str(x) for x in (data.get("acceptance")
-                                         or data.get("acceptance_criteria") or [])],
+            acceptance=criteria,
             assumptions=[str(x) for x in (data.get("assumptions") or [])],
             open_questions=[str(x) for x in (data.get("open_questions")
                                              or data.get("questions") or [])],
@@ -204,14 +283,14 @@ class ArchitectureContract:
             raw=dict(data),
         )
 
+    def approval_payload(self) -> dict[str, Any]:
+        """Deterministic architecture payload; tasks are hashed separately."""
+        out = self.to_dict()
+        out.pop("tasks", None)  # canonical tasks live in ProjectState
+        return out
+
     def content_hash(self) -> str:
-        """Hash only the architecture content, not volatile metadata."""
-        return sha256_json({
-            "approach": self.approach,
-            "modules": self.modules,
-            "interfaces": self.interfaces,
-            "test_plan": self.test_plan,
-        })
+        return sha256_json(self.approval_payload())
 
 
 # --------------------------------------------------------------------------- #
@@ -250,6 +329,24 @@ class Task:
     errors: list[str] = field(default_factory=list)
     attempts: list[TaskAttempt] = field(default_factory=list)
     delivered_by: Optional[ModelRef] = None
+    requirement_ids: list[str] = field(default_factory=list)
+    legacy_extra: dict[str, Any] = field(default_factory=dict)
+
+    def plan_dict(self) -> dict[str, Any]:
+        """Fields covered by the architecture approval (no progress noise)."""
+        return {
+            "id": self.id,
+            "title": self.title,
+            "description": self.description,
+            "kind": self.kind,
+            "team": self.team,
+            "role": self.role,
+            "complexity": self.complexity,
+            "target_file": self.target_file,
+            "acceptance": list(self.acceptance),
+            "depends_on": list(self.depends_on),
+            "requirement_ids": sorted(self.requirement_ids),
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -267,6 +364,8 @@ class Task:
             "errors": list(self.errors),
             "attempts": [a.to_dict() for a in self.attempts],
             "delivered_by": self.delivered_by.to_dict() if self.delivered_by else None,
+            "requirement_ids": list(self.requirement_ids),
+            "legacy_extra": dict(self.legacy_extra),
         }
 
     @classmethod
@@ -288,6 +387,8 @@ class Task:
             attempts=[TaskAttempt.from_dict(x) for x in (data.get("attempts") or [])],
             delivered_by=(ModelRef.from_dict(data["delivered_by"])
                           if data.get("delivered_by") else None),
+            requirement_ids=[str(x) for x in (data.get("requirement_ids") or [])],
+            legacy_extra=dict(data.get("legacy_extra") or {}),
         )
 
 
@@ -335,6 +436,81 @@ def validate_tasks(tasks: list[Task],
                 seen[key] = task.id
         normalized.append(task)
     return normalized
+
+
+def _norm_text(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").casefold()).strip()
+
+
+def link_traceability(requirements: RequirementContract, tasks: list[Task]) -> None:
+    """Fill Requirement -> Task links deterministically, preserving explicit ones."""
+    criteria = requirements.acceptance
+    crit_by_id = {c.id: c for c in criteria}
+    task_by_id = {t.id: t for t in tasks}
+    for task in tasks:
+        task.requirement_ids = [rid for rid in task.requirement_ids if rid in crit_by_id]
+        task.requirement_ids = list(dict.fromkeys(task.requirement_ids))
+    for crit in criteria:
+        crit.task_ids = [tid for tid in crit.task_ids if tid in task_by_id]
+        crit.task_ids = list(dict.fromkeys(crit.task_ids))
+
+    for task in tasks:
+        for rid in task.requirement_ids:
+            crit = crit_by_id[rid]
+            if task.id not in crit.task_ids:
+                crit.task_ids.append(task.id)
+
+    for crit in criteria:
+        if crit.task_ids:
+            for tid in crit.task_ids:
+                task = task_by_id[tid]
+                if crit.id not in task.requirement_ids:
+                    task.requirement_ids.append(crit.id)
+            continue
+        needle = _norm_text(crit.text)
+        matches: list[str] = []
+        if needle:
+            for task in tasks:
+                hay = _norm_text(" | ".join(
+                    [task.title, task.description, " | ".join(task.acceptance)]))
+                if needle in hay or any(
+                        _norm_text(a) and _norm_text(a) in needle for a in task.acceptance):
+                    matches.append(task.id)
+        if matches:
+            crit.task_ids = sorted(set(matches))
+            for tid in crit.task_ids:
+                task = task_by_id[tid]
+                if crit.id not in task.requirement_ids:
+                    task.requirement_ids.append(crit.id)
+        elif not crit.justification.strip():
+            crit.justification = "auto: sem tarefa correspondente no plano"
+
+
+def validate_traceability(requirements: RequirementContract, tasks: list[Task]) -> None:
+    criteria = requirements.acceptance
+    task_by_id = {t.id: t for t in tasks}
+    crit_ids: set[str] = set()
+    for crit in criteria:
+        if not crit.id:
+            raise StateValidationError("critério de aceitação sem id")
+        if crit.id in crit_ids:
+            raise StateValidationError(f"critério de aceitação duplicado: {crit.id}")
+        crit_ids.add(crit.id)
+        for tid in crit.task_ids:
+            if tid not in task_by_id:
+                raise StateValidationError(
+                    f"critério {crit.id} aponta para tarefa inexistente: {tid}")
+            if crit.id not in task_by_id[tid].requirement_ids:
+                raise StateValidationError(
+                    f"rastreabilidade assimétrica: {crit.id} <-> {tid}")
+        if not crit.task_ids and not crit.justification.strip():
+            raise StateValidationError(
+                f"critério {crit.id} sem tarefa e sem justificação explícita")
+    for task in tasks:
+        for rid in task.requirement_ids:
+            if rid not in crit_ids:
+                raise StateValidationError(
+                    f"tarefa {task.id} refere critério inexistente: {rid}")
 
 
 # --------------------------------------------------------------------------- #
@@ -391,6 +567,7 @@ class PauseState:
 @dataclass
 class VerificationRecord:
     verdict: str = "UNVERIFIED"  # PASS|FAIL|UNVERIFIED|SKIP
+    criterion_ids: list[str] = field(default_factory=list)
     oracle: dict[str, Any] = field(default_factory=dict)
     critic: dict[str, Any] = field(default_factory=dict)
     visual: dict[str, Any] = field(default_factory=dict)
@@ -407,6 +584,7 @@ class VerificationRecord:
         data = data or {}
         return cls(
             verdict=str(data.get("verdict") or "UNVERIFIED"),
+            criterion_ids=[str(x) for x in (data.get("criterion_ids") or [])],
             oracle=dict(data.get("oracle") or {}),
             critic=dict(data.get("critic") or {}),
             visual=dict(data.get("visual") or {}),
@@ -444,6 +622,7 @@ class ProjectState:
     pause: PauseState = field(default_factory=PauseState)
     history: list[dict[str, Any]] = field(default_factory=list)
     migrations: list[dict[str, Any]] = field(default_factory=list)
+    extensions: dict[str, Any] = field(default_factory=dict)
     created: str = ""
     updated: str = ""
 
@@ -453,6 +632,14 @@ class ProjectState:
         if self.phase not in PHASES:
             raise StateValidationError(f"phase inválida: {self.phase!r}")
         self.tasks = validate_tasks(self.tasks, project_root=self.project_root or None)
+        link_traceability(self.requirements, self.tasks)
+        validate_traceability(self.requirements, self.tasks)
+        crit_ids = set(self.requirements.criterion_ids())
+        for record in self.verifications.values():
+            for cid in record.criterion_ids:
+                if cid not in crit_ids:
+                    raise StateValidationError(
+                        f"verificação refere critério inexistente: {cid}")
         if not self.created:
             self.created = utc_now()
         if not self.updated:
@@ -461,7 +648,23 @@ class ProjectState:
     # -- architecture approval -------------------------------------------- #
 
     def architecture_hash(self) -> str:
-        return self.architecture.content_hash()
+        """Hash the approved plan: architecture + tasks + traceability."""
+        link_traceability(self.requirements, self.tasks)
+        criteria = [
+            {"id": c.id, "text": c.text,
+             "task_ids": sorted(c.task_ids), "justification": c.justification}
+            for c in self.requirements.acceptance
+        ]
+        return sha256_json({
+            "architecture": self.architecture.approval_payload(),
+            "tasks": [t.plan_dict() for t in sorted(self.tasks, key=lambda t: t.id)],
+            "traceability": criteria,
+        })
+
+    def spec_approved(self) -> bool:
+        h = self.requirements.content_hash()
+        return any(a.kind == "spec" and a.decision == "approved"
+                   and a.artifact_hash == h for a in self.approvals)
 
     def architecture_approved(self) -> bool:
         h = self.architecture_hash()
@@ -469,6 +672,8 @@ class ProjectState:
                    and a.artifact_hash == h for a in self.approvals)
 
     def approve_architecture(self, actor: str = "human", detail: str = "") -> Approval:
+        link_traceability(self.requirements, self.tasks)
+        validate_traceability(self.requirements, self.tasks)
         approval = Approval(kind="architecture", artifact_hash=self.architecture_hash(),
                             actor=actor, decision="approved",
                             timestamp=utc_now(), detail=detail)
@@ -492,7 +697,7 @@ class ProjectState:
         """Re-close the gate if the architecture changed after approval."""
         if not self.architecture_approved():
             self.pause = PauseState(reason="architecture_approval",
-                                    phase="ARCHITECTURE", since=utc_now())
+                                    phase=self.phase, since=utc_now())
             return True
         return False
 
@@ -520,6 +725,7 @@ class ProjectState:
             "pause": self.pause.to_dict(),
             "history": self.history,
             "migrations": self.migrations,
+            "extensions": self.extensions,
             "created": self.created,
             "updated": utc_now(),
         }
@@ -529,9 +735,15 @@ class ProjectState:
         if not isinstance(data, dict):
             raise StateSchemaError("estado não é um objeto JSON")
         schema = int(data.get("schema_version") or 0)
+        if schema == SCHEMA_V2:
+            raise StateSchemaError(
+                "schema_version 2: corre --migrate-schema antes de retomar")
         if schema > SCHEMA_VERSION:
             raise StateSchemaError(
                 f"schema_version {schema} > suportado {SCHEMA_VERSION}")
+        if schema != SCHEMA_VERSION:
+            raise StateSchemaError(
+                f"schema_version {schema} não suportado (esperado {SCHEMA_VERSION})")
         kind = str(data.get("engine_kind") or "")
         if not kind:
             raise StateSchemaError("estado sem engine_kind")
@@ -557,9 +769,47 @@ class ProjectState:
             pause=PauseState.from_dict(data.get("pause")),
             history=[dict(x) for x in (data.get("history") or [])],
             migrations=[dict(x) for x in (data.get("migrations") or [])],
+            extensions=dict(data.get("extensions") or {}),
             created=str(data.get("created") or ""),
             updated=str(data.get("updated") or ""),
         )
+
+
+def upgrade_v2_to_v3(data: dict[str, Any]) -> ProjectState:
+    """Explicit schema v2 -> v3 upgrade (lossless compatibility metadata)."""
+    if not isinstance(data, dict):
+        raise StateSchemaError("estado v2 não é um objeto")
+    schema = int(data.get("schema_version") or 0)
+    if schema == SCHEMA_VERSION:
+        return ProjectState.from_dict(data)
+    if schema != SCHEMA_V2:
+        raise StateSchemaError(
+            f"migração v2->v3 requer schema 2, recebido {schema}")
+    known = set(ProjectState.__dataclass_fields__)
+    extensions = dict(data.get("extensions") or {})
+    for key, value in data.items():
+        if key not in known and key != "tasks":
+            extensions.setdefault(key, value)
+    known_task = set(Task.__dataclass_fields__)
+    tasks: list[dict[str, Any]] = []
+    for raw in data.get("tasks") or []:
+        if not isinstance(raw, dict):
+            continue
+        task = dict(raw)
+        extra = {k: v for k, v in task.items() if k not in known_task}
+        if extra:
+            merged = dict(task.get("legacy_extra") or {})
+            merged.update(extra)
+            task["legacy_extra"] = merged
+        tasks.append(task)
+    payload = dict(data)
+    payload["schema_version"] = SCHEMA_VERSION
+    payload["extensions"] = extensions
+    payload["tasks"] = tasks
+    migrations = list(data.get("migrations") or [])
+    migrations.append({"from": "schema-v2", "to": "schema-v3", "at": utc_now()})
+    payload["migrations"] = migrations
+    return ProjectState.from_dict(payload)
 
 
 # --------------------------------------------------------------------------- #
@@ -603,6 +853,9 @@ def _legacy_task_to_task(data: dict[str, Any]) -> Task:
             if isinstance(raw, dict):
                 attempts.append(TaskAttempt.from_dict(raw))
     delivered = data.get("delivered_by")
+    known_task = set(Task.__dataclass_fields__)
+    extra = dict(data.get("legacy_extra") or {})
+    extra.update({k: v for k, v in data.items() if k not in known_task})
     return Task(
         id=str(data.get("id") or new_id("t_")),
         title=str(data.get("title") or ""),
@@ -618,6 +871,8 @@ def _legacy_task_to_task(data: dict[str, Any]) -> Task:
         errors=[str(x) for x in (data.get("errors") or [])],
         attempts=attempts,
         delivered_by=(ModelRef.from_dict(delivered) if delivered else None),
+        requirement_ids=[str(x) for x in (data.get("requirement_ids") or [])],
+        legacy_extra=extra,
     )
 
 
@@ -663,10 +918,24 @@ def from_legacy_factory(data: dict[str, Any],
         pause=PauseState(reason=str(data.get("pause_reason") or ""),
                          phase=phase if data.get("pause_reason") else "",
                          since=utc_now() if data.get("pause_reason") else ""),
+        approvals=[Approval.from_dict(a) for a in (data.get("approvals") or [])],
+        verifications={str(k): VerificationRecord.from_dict(v)
+                       for k, v in (data.get("verifications") or {}).items()},
+        extensions=dict(data.get("extensions") or {}),
         history=[dict(x) for x in (data.get("history") or [])],
         created=str(data.get("created") or ""),
         updated=str(data.get("updated") or ""),
     )
+    known_factory = {
+        "project", "goal", "step", "requirements", "answers", "scaffold",
+        "architecture", "tasks", "integration", "visual", "signoff",
+        "paused_until", "pause_reason", "engine_kind", "engine_version",
+        "schema_version", "run_id", "history", "created", "updated",
+        "approvals", "verifications", "extensions",
+    }
+    st.extensions.setdefault("legacy_factory", {
+        k: v for k, v in data.items() if k not in known_factory
+    })
     st.migrations.append({
         "from": "factory", "to": "project", "at": utc_now(),
         "legacy_step": step, "legacy_schema": LEGACY_SCHEMA_VERSION,
@@ -713,8 +982,82 @@ def from_legacy_session(session: dict[str, Any],
         tasks=tasks,
         history=[dict(x) for x in (session.get("history") or [])],
     )
+    st.extensions.setdefault("legacy_session", {
+        k: v for k, v in session.items()
+        if k not in {"goal", "project_root", "files", "results", "history", "run_id"}
+    })
     st.migrations.append({"from": "session", "to": "project", "at": utc_now()})
     return st
+
+
+PHASE_TO_LEGACY_STEP = {
+    "SPEC": "REQUIREMENTS",
+    "SCAFFOLD": "SCAFFOLD",
+    "ARCHITECTURE": "ARCHITECT",
+    "BUILD": "BUILD",
+    "VERIFY": "BUILD",
+    "INTEGRATE": "INTEGRATE",
+    "VISUAL": "VISUAL",
+    "SIGNOFF": "SIGN_OFF",
+    "DONE": "DONE",
+}
+
+
+def task_compat_dict(task: Task) -> dict[str, Any]:
+    """Task shape consumed by the legacy FactoryState."""
+    return {
+        "id": task.id,
+        "title": task.title,
+        "description": task.description,
+        "target_file": task.target_file,
+        "acceptance": list(task.acceptance),
+        "depends_on": list(task.depends_on),
+        "complexity": task.complexity,
+        "role": task.role,
+        "status": task.status,
+        "attempts": len(task.attempts),
+        "errors": list(task.errors),
+        "attempt_log": [a.to_dict() for a in task.attempts],
+        "delivered_by": task.delivered_by.to_dict() if task.delivered_by else None,
+        "requirement_ids": list(task.requirement_ids),
+        "legacy_extra": dict(task.legacy_extra),
+    }
+
+
+def factory_compat_dict(state: ProjectState) -> dict[str, Any]:
+    """Legacy .factory/state.json serialization of the canonical state.
+
+    The canonical in-memory source remains ProjectState; this is a
+    compatibility representation, never a second source of truth.
+    """
+    data: dict[str, Any] = {
+        "project": state.project_root,
+        "goal": state.goal,
+        "step": PHASE_TO_LEGACY_STEP.get(state.phase, "BUILD"),
+        "requirements": state.requirements.to_legacy_dict(),
+        "answers": list(state.requirements.answers),
+        "scaffold": dict(state.scaffold),
+        "architecture": state.architecture.to_dict(),
+        "tasks": [task_compat_dict(t) for t in state.tasks],
+        "integration": dict(state.integration),
+        "visual": dict(state.visual),
+        "signoff": dict(state.signoff),
+        "paused_until": 0.0,
+        "pause_reason": state.pause.reason,
+        "engine_kind": ENGINE_LEGACY,
+        "engine_version": "legacy",
+        "schema_version": LEGACY_SCHEMA_VERSION,
+        "run_id": state.run_id,
+        "history": list(state.history),
+        "approvals": [a.to_dict() for a in state.approvals],
+        "verifications": {k: v.to_dict() for k, v in state.verifications.items()},
+        "extensions": dict(state.extensions),
+        "created": state.created,
+        "updated": state.updated,
+    }
+    for key, value in (state.extensions.get("legacy_factory") or {}).items():
+        data.setdefault(key, value)
+    return data
 
 
 def with_attempt(task: Task, attempt: TaskAttempt) -> None:

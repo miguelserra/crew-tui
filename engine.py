@@ -24,6 +24,7 @@ from state import (
     ArchitectureContract,
     PauseState,
     PHASES,
+    SCHEMA_VERSION,
     ProjectState,
     RequirementContract,
     StateValidationError,
@@ -31,6 +32,8 @@ from state import (
     sha256_json,
     TaskAttempt,
     new_id,
+    link_traceability,
+    validate_traceability,
     utc_now,
 )
 from store import ResumeTarget, StateManager, atomic_write_json
@@ -100,12 +103,14 @@ class WorkflowEngine:
     """Phase driver over an adapter. Persists exactly one canonical state."""
 
     def __init__(self, state: ProjectState, store: StateManager, adapter: "WorkflowAdapter",
-                 emit: Optional[Any] = None, allow_unknown: bool = False):
+                 emit: Optional[Any] = None, allow_unknown: bool = False,
+                 persistence: str = "crew"):
         self.state = state
         self.store = store
         self.adapter = adapter
         self.emit = emit or (lambda *a, **k: None)
         self.allow_unknown = allow_unknown
+        self.persistence = persistence if persistence in ("crew", "factory") else "crew"
         self._last_ok: dict[str, ModelRef] = {}
 
     # -- pool wiring -------------------------------------------------------- #
@@ -156,6 +161,9 @@ class WorkflowEngine:
 
     def save(self) -> None:
         self.state.updated = utc_now()
+        if self.persistence == "factory" and self.state.project_root:
+            self.store.save_factory_from_project(self.state.project_root, self.state)
+            return
         if self.state.project_root:
             final = self.store.project_state_path(self.state.project_root)
             staging = self.store.staging_path(self.state.run_id)
@@ -169,10 +177,13 @@ class WorkflowEngine:
     # -- approvals ---------------------------------------------------------- #
 
     def _has_approval(self, kind: str) -> bool:
+        if kind == "spec":
+            return self.state.spec_approved()
         return any(a.kind == kind and a.decision == "approved" for a in self.state.approvals)
 
     def approve_spec(self, actor: str = "human") -> None:
         self.state.approvals.append(Approval(kind="spec", actor=actor,
+                                            artifact_hash=self.state.requirements.content_hash(),
                                             decision="approved", timestamp=utc_now()))
         if self.state.pause.reason in ("spec_questions", "spec_approval"):
             self.state.pause = PauseState()
@@ -244,7 +255,7 @@ class WorkflowEngine:
             self.state.phase = self.adapter.next_phase("SPEC")
             self.save()
             return "ok"
-        if (phase == "ARCHITECTURE" and self.state.architecture
+        if (phase == "ARCHITECTURE" and _has_architecture(self.state)
                 and self.state.architecture_approved()):
             self.state.phase = self.adapter.next_phase("ARCHITECTURE")
             self.save()
@@ -256,7 +267,7 @@ class WorkflowEngine:
         if phase == "ARCHITECTURE":
             ok = self.adapter.step("ARCHITECTURE")
             self.adapter.sync_to_project()
-            if not ok:
+            if not ok or not _has_architecture(self.state):
                 self._pause("architecture_failed")
                 return "failed"
             if not self.state.architecture_approved():
@@ -274,7 +285,7 @@ class WorkflowEngine:
 
         # Re-close the architecture gate if the architecture changed since approval.
         if phase in ("SCAFFOLD", "BUILD", "INTEGRATE", "VISUAL", "SIGNOFF"):
-            if self.state.architecture and not self.state.architecture_approved():
+            if _has_architecture(self.state) and not self.state.architecture_approved():
                 self._pause("architecture_approval", self.state.architecture_hash())
                 return "paused"
 
@@ -355,8 +366,11 @@ class EngineFacade:
         self.store = store
         root = engine.state.project_root
         self.root = Path(root) if root else Path(".")
-        self.state_path = (store.project_state_path(root) if root
-                           else store.staging_path(engine.state.run_id))
+        if engine.persistence == "factory" and root:
+            self.state_path = store.legacy_factory_path(root)
+        else:
+            self.state_path = (store.project_state_path(root) if root
+                               else store.staging_path(engine.state.run_id))
 
     @property
     def state(self) -> StateView:
@@ -450,10 +464,13 @@ class FactoryAdapter:
                 role=t.role, status=t.status, errors=list(t.errors),
                 attempt_log=[a.to_dict() for a in t.attempts],
                 delivered_by=t.delivered_by.to_dict() if t.delivered_by else None,
+                requirement_ids=list(t.requirement_ids),
+                legacy_extra=dict(t.legacy_extra),
             ))
         return self._FactoryState(
             project=str(project.project_root), goal=project.goal,
-            step=project.phase, requirements=project.requirements.to_dict(),
+            step=project.phase, run_id=project.run_id,
+            requirements=project.requirements.to_legacy_dict(),
             answers=list(project.requirements.answers),
             scaffold=dict(project.scaffold),
             architecture=project.architecture.to_dict(),
@@ -487,8 +504,15 @@ class FactoryAdapter:
                           if ts.attempt_log else (prev.attempts if prev else [])),
                 delivered_by=(ModelRef.from_dict(ts.delivered_by) if ts.delivered_by
                               else (prev.delivered_by if prev else None)),
+                requirement_ids=(list(ts.requirement_ids)
+                                 if getattr(ts, "requirement_ids", None)
+                                 else (list(prev.requirement_ids) if prev else [])),
+                legacy_extra=(dict(getattr(ts, "legacy_extra", {}) or {})
+                              or (dict(prev.legacy_extra) if prev else {})),
             ))
         self.project.tasks = tasks
+        link_traceability(self.project.requirements, self.project.tasks)
+        validate_traceability(self.project.requirements, self.project.tasks)
         self.project.integration = dict(fs.integration)
         self.project.visual = dict(fs.visual)
         self.project.signoff = dict(fs.signoff)
@@ -624,15 +648,16 @@ def _validate_dependencies(tasks: list[Task]) -> None:
 
 def validate_unified_state(state: ProjectState) -> None:
     """Refuse an execution that the unified engine cannot resume safely."""
-    if state.schema_version < 2:
-        raise EngineError("migra primeiro o formato com --migrate-state")
+    if state.schema_version < SCHEMA_VERSION:
+        raise EngineError("migra primeiro o schema com --migrate-schema")
     if state.engine_kind not in (ENGINE_LEGACY, ENGINE_UNIFIED):
         raise EngineError(f"engine_kind inválido: {state.engine_kind!r}")
     if state.phase not in PHASES:
         raise EngineError(f"fase desconhecida: {state.phase!r}")
     try:
-        from state import validate_tasks
+        from state import validate_tasks, validate_traceability
         validate_tasks(state.tasks, project_root=state.project_root or None)
+        validate_traceability(state.requirements, state.tasks)
     except StateValidationError as exc:
         raise EngineError(f"tarefas incompatíveis: {exc}") from exc
     _validate_dependencies(state.tasks)
@@ -640,6 +665,11 @@ def validate_unified_state(state: ProjectState) -> None:
         raise EngineError("contrato de requisitos inválido")
     if not isinstance(state.architecture, ArchitectureContract):
         raise EngineError("contrato de arquitectura inválido")
+
+
+def _has_architecture(state: ProjectState) -> bool:
+    a = state.architecture
+    return bool(a.approach or a.modules or a.interfaces or a.test_plan)
 
 
 def _normalize_for_unified(state: ProjectState) -> None:

@@ -119,6 +119,8 @@ class TaskState:
     # Historical per-call identity (schema-compatible, optional).
     attempt_log: list[dict[str, Any]] = field(default_factory=list)
     delivered_by: Optional[dict[str, Any]] = None
+    requirement_ids: list[str] = field(default_factory=list)
+    legacy_extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -459,6 +461,7 @@ Design the solution. STRICT JSON:
                    "errors": [str], "used_by": [str]}}],
   "tasks": [{{"id": "t1", "title": str, "description": str, "target_file": str,
               "acceptance": [str], "depends_on": [str],
+              "requirement_ids": [str],
               "complexity": "low"|"medium"|"high", "role": "junior"|"senior"}}],
   "test_plan": [{{"task": str, "check": str}}]}}
 
@@ -466,7 +469,9 @@ Rules:
 - One target_file per task; no two pending tasks share the same file.
 - target_file must be a path inside the project, existing or new.
 - complexity "high" for UI/cross-cutting logic; "low" for pure helpers.
-- Interfaces must include every cross-file call (name, inputs, outputs, errors)."""
+- Interfaces must include every cross-file call (name, inputs, outputs, errors).
+- Every task must list requirement_ids referencing the acceptance_criteria ids
+  above; do not leave a criterion unmapped."""
         try:
             raw = self._ask("chief", ARCHITECT_SYSTEM, prompt, "ARCHITECT")
             data = _json_or_raise(raw, "architecture")
@@ -492,6 +497,7 @@ Rules:
                 target_file=target,
                 acceptance=[str(a) for a in (t.get("acceptance") or [])],
                 depends_on=[str(d) for d in (t.get("depends_on") or [])],
+                requirement_ids=[str(r) for r in (t.get("requirement_ids") or [])],
                 complexity=complexity, role=role))
         if not tasks:
             self.emit("SYSTEM", "architect não devolveu tarefas válidas")

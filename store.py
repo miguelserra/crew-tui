@@ -22,11 +22,14 @@ from state import (
     ENGINE_KINDS,
     ENGINE_LEGACY,
     SCHEMA_VERSION,
+    SCHEMA_V2,
     LEGACY_SCHEMA_VERSION,
     ProjectState,
     StateCorruptError,
+    factory_compat_dict,
     from_legacy_factory,
     sha256_json,
+    upgrade_v2_to_v3,
     utc_now,
 )
 
@@ -148,6 +151,13 @@ class StateManager:
                           validate=lambda data: ProjectState.from_dict(data))
         return path
 
+    def save_factory_from_project(self, project_root: str | Path,
+                                  state: ProjectState) -> Path:
+        """Write the legacy compatibility format from canonical ProjectState."""
+        path = self.legacy_factory_path(project_root)
+        atomic_write_json(path, factory_compat_dict(state))
+        return path
+
     # -- legacy ------------------------------------------------------------- #
 
     def load_legacy_factory(self, project_root: str | Path) -> dict[str, Any]:
@@ -234,6 +244,33 @@ class StateManager:
             return ResumeTarget(ENGINE_LEGACY, session, LEGACY_SCHEMA_VERSION,
                                 legacy_raw=raw)
         return None
+
+    # -- schema migration (explicit v2 -> v3) ------------------------------- #
+
+    def migrate_schema_to_v3(self, project_root: str | Path) -> ProjectState:
+        """Explicitly convert a v2 .crew state to v3; idempotent on v3."""
+        project_root = Path(project_root).expanduser().resolve()
+        path = self.project_state_path(project_root)
+        raw = read_json(path)
+        schema = int(raw.get("schema_version") or 0)
+        if schema == SCHEMA_VERSION:
+            return self.load_project(path)
+        if schema != SCHEMA_V2:
+            raise StateSchemaError(
+                f"migração de schema requer v2, recebido {schema} em {path}")
+        source_hash = sha256_json(raw)
+        hist = self.history_dir(project_root)
+        hist.mkdir(parents=True, exist_ok=True)
+        snap = hist / f"schema-v2-source-{source_hash[:16]}.json"
+        if not snap.exists():
+            atomic_write_json(snap, raw)
+        state = upgrade_v2_to_v3(raw)
+        state.project_root = str(project_root)
+        if state.migrations:
+            state.migrations[-1]["source_sha256"] = source_hash
+        atomic_write_json(path, state.to_dict(),
+                          validate=lambda data: ProjectState.from_dict(data))
+        return state
 
     # -- format migration (does NOT change the engine) ---------------------- #
 

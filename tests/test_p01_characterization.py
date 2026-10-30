@@ -31,7 +31,7 @@ class HistoricalFormatTests(unittest.TestCase):
         self.assertEqual(st.requirements.scope_in, ["one file"])
         self.assertEqual(st.requirements.scope_out, ["database"])
         self.assertEqual(st.requirements.constraints, ["stdlib"])
-        self.assertEqual(st.requirements.acceptance, ["runs"])
+        self.assertEqual(st.requirements.acceptance_texts(), ["runs"])
 
     def test_old_architecture_interfaces_survive(self):
         raw = json.loads((FIX / "factory_state_architect.json").read_text())

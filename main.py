@@ -89,7 +89,8 @@ from engine import (
     migrate_state, new_unified_state, open_execution, resolve_engine,
 )
 from store import StateManager
-from state import StateCorruptError, StateError
+from state import (ProjectState, StateCorruptError, StateError, from_legacy_factory,
+                   new_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -3696,11 +3697,11 @@ class CrewTUIApp(App):
             pass
 
     def _start_factory(self, goal: str, resume: bool = False) -> None:
-        from factory import Factory
         store = StateManager(self.settings.workspace_dir, self.settings.log_dir)
         root = self._factory_project(goal)
         state = None
         kind = None
+        persistence = "crew"
         if resume:
             try:
                 target = store.resolve_resume(root)
@@ -3709,43 +3710,56 @@ class CrewTUIApp(App):
                 self._write(tagged("SYSTEM", "estado preservado; corrige/migra antes de retomar.",
                                    bold=True))
                 return
+            except StateError as exc:
+                self._write(tagged("SYSTEM", str(exc), bold=True))
+                self._write(tagged("SYSTEM", "corre --migrate-schema ou --migrate-engine.",
+                                   bold=True))
+                return
             if target is not None and target.project_state is not None:
                 state = target.project_state
                 kind = target.engine_kind
+                persistence = "crew"
+            elif (target is not None and target.legacy_raw is not None
+                  and target.path == store.legacy_factory_path(root)):
+                if target.engine_kind == ENGINE_UNIFIED:
+                    self._write(tagged("SYSTEM", "estado .factory inconsistente (unified)", bold=True))
+                    return
+                state = from_legacy_factory(target.legacy_raw, engine_kind=ENGINE_LEGACY)
+                kind = ENGINE_LEGACY
+                persistence = "factory"
         if kind is None and not resume:
             try:
                 kind = resolve_engine()
             except EngineError:
                 kind = ENGINE_LEGACY
+            persistence = "factory" if kind == ENGINE_LEGACY else "crew"
+            if kind == ENGINE_LEGACY and store.project_state_path(root).is_file():
+                self._write(tagged("SYSTEM", "existe .crew neste projeto; usa /resume "
+                                             "ou --migrate-engine antes de iniciar legacy.", bold=True))
+                return
 
-        if state is not None or kind == ENGINE_UNIFIED:
-            if state is None:
+        if state is None:
+            if kind == ENGINE_LEGACY:
+                state = ProjectState(run_id=new_id("run_"), project_root=str(root),
+                                     goal=goal or "projeto", engine_kind=ENGINE_LEGACY,
+                                     engine_version="legacy", phase="SPEC")
+            else:
                 state = new_unified_state(goal or "projeto", str(root),
                                           engine_version=ENGINE_VERSION)
-            if not state.project_root:
-                state.project_root = str(root)
-            adapter = FactoryAdapter(self.settings, self.pool, self._factory_emit, state,
-                                     legacy_order=(kind == ENGINE_LEGACY))
-            eng = WorkflowEngine(state, store, adapter, emit=self._factory_emit,
-                                 allow_unknown=self.settings.allow_unknown)
-            eng.apply_pool(self.pool)
-            eng.save()
-            self.engine = eng
-            self.factory = EngineFacade(eng, store)
-            kind = state.engine_kind
-        else:
-            self.engine = None
-            self.pool.attempt_sink = None
-            try:
-                self.factory = Factory(self.settings, self.pool, emit=self._factory_emit,
-                                       project_root=root, telemetry=self.telemetry)
-            except StateCorruptError as exc:
-                self._write(tagged("SYSTEM", str(exc), bold=True))
-                self._write(tagged("SYSTEM", "estado preservado; corrige/migra o ficheiro antes de retomar.",
-                                   bold=True))
-                return
+        if not state.project_root:
+            state.project_root = str(root)
+        adapter = FactoryAdapter(self.settings, self.pool, self._factory_emit, state,
+                                 legacy_order=(kind == ENGINE_LEGACY))
+        eng = WorkflowEngine(state, store, adapter, emit=self._factory_emit,
+                             allow_unknown=self.settings.allow_unknown,
+                             persistence=persistence)
+        eng.apply_pool(self.pool)
+        eng.save()
+        self.engine = eng
+        self.factory = EngineFacade(eng, store)
         self._factory_mode = True
-        self._write(tagged("CREW", f"projeto: {root} · motor: {kind}", bold=True))
+        self._write(tagged("CREW", f"projeto: {root} · motor: {kind} · estado: {persistence}",
+                           bold=True))
         if resume and self.factory.state.requirements:
             self._write(tagged("SYSTEM", f"a retomar do passo {self.factory.state.step} …"))
             self._set_phase("BUILD")
@@ -4086,7 +4100,7 @@ def _legacy_factory_cli(args: Any, settings: Any = None, store: Any = None) -> i
 
 
 def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
-                    state: Any = None) -> int:
+                    state: Any = None, persistence: str = "crew") -> int:
     """Run the unified/legacy engine with canonical .crew persistence."""
     telemetry = Telemetry(settings)
     emit = lambda tag, text: print(f"[{tag}] {text}", flush=True)
@@ -4110,6 +4124,8 @@ def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
             return 2
         state = new_unified_state(args.factory, str(root), engine_version=ENGINE_VERSION)
         state.engine_kind = kind
+        if kind == ENGINE_LEGACY:
+            state.engine_version = "legacy"
     else:
         kind = state.engine_kind
         if not state.project_root:
@@ -4124,7 +4140,8 @@ def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
                              legacy_order=(kind == ENGINE_LEGACY))
     eng = WorkflowEngine(state, store, adapter, emit=emit,
                          allow_unknown=bool(getattr(args, "allow_unknown", False)
-                                            or settings.allow_unknown))
+                                            or settings.allow_unknown),
+                         persistence=persistence)
     eng.apply_pool(pool)
     eng.save()
 
@@ -4134,8 +4151,13 @@ def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
             done = sum(1 for t in state.tasks if t.status in ("done", "verified"))
             print(f"PASS · fase {state.phase} · {done}/{len(state.tasks)} tarefas · {root}",
                   flush=True)
-            print(f"estado: {eng.store.project_state_path(root) if state.project_root else eng.store.staging_path(state.run_id)}",
-                  flush=True)
+            if eng.persistence == "factory" and state.project_root:
+                path = eng.store.legacy_factory_path(root)
+            elif state.project_root:
+                path = eng.store.project_state_path(root)
+            else:
+                path = eng.store.staging_path(state.run_id)
+            print(f"estado: {path}", flush=True)
             return 0
         if result == "failed":
             print(f"FAIL · fase {state.phase} · {state.pause.detail or state.pause.reason}",
@@ -4191,7 +4213,18 @@ def _factory_cli(args: Any) -> int:
         target = store.resolve_resume(root)
         if target is not None and target.project_state is not None:
             return _engine_cli_run(args, target.engine_kind, settings, store,
-                                   target.project_state)
+                                   target.project_state, persistence="crew")
+        if (target is not None and target.project_state is None
+                and target.legacy_raw is not None
+                and target.path == store.legacy_factory_path(root)):
+            if target.engine_kind == ENGINE_UNIFIED:
+                print(f"[STATE] estado inconsistente: {target.path} declara unified "
+                      "mas não tem formato canónico", flush=True)
+                return 6
+            state = from_legacy_factory(target.legacy_raw,
+                                        engine_kind=ENGINE_LEGACY)
+            return _engine_cli_run(args, ENGINE_LEGACY, settings, store, state,
+                                   persistence="factory")
         if (target is not None and target.project_state is None
                 and target.engine_kind == ENGINE_UNIFIED):
             print(f"[STATE] estado inconsistente: {target.path} declara unified "
@@ -4205,21 +4238,31 @@ def _factory_cli(args: Any) -> int:
         print(f"[ENGINE] {exc}", flush=True)
         return 2
     if kind == ENGINE_UNIFIED:
-        return _engine_cli_run(args, kind, settings, store, None)
-    return _legacy_factory_cli(args, settings, store)
+        return _engine_cli_run(args, kind, settings, store, None, persistence="crew")
+    root = Path(os.path.expanduser(args.project)) if args.project else None
+    if root is not None and store.project_state_path(root).is_file():
+        print("[STATE] existe .crew neste projeto; usa --resume ou remove/migra "
+              "antes de iniciar um run legacy", flush=True)
+        return 2
+    return _engine_cli_run(args, kind, settings, store, None, persistence="factory")
 
 
 def _migrate_cli(args: Any) -> int:
     settings = Settings.from_env()
     store = StateManager(settings.workspace_dir, settings.log_dir)
     if not args.project:
-        print("--migrate-state/--migrate-engine exigem --project DIR", flush=True)
+        print("--migrate-state/--migrate-schema/--migrate-engine exigem --project DIR",
+              flush=True)
         return 2
     root = Path(os.path.expanduser(args.project))
     if getattr(args, "migrate_state", False):
         state = migrate_state(store, str(root))
         print(f"formato migrado: {store.project_state_path(root)} "
               f"(engine_kind={state.engine_kind}, schema={state.schema_version})", flush=True)
+    if getattr(args, "migrate_schema", False):
+        state = store.migrate_schema_to_v3(str(root))
+        print(f"schema migrado: {store.project_state_path(root)} "
+              f"(schema={state.schema_version})", flush=True)
     if getattr(args, "migrate_engine", False):
         state = store.load_project(store.project_state_path(root))
         state = migrate_engine(store, state)
@@ -4251,6 +4294,8 @@ def main() -> None:
                         help="aprova a arquitetura (o --yes não a aprova)")
     parser.add_argument("--migrate-state", action="store_true",
                         help="converte .factory/state.json para .crew/state.json (não muda o motor)")
+    parser.add_argument("--migrate-schema", action="store_true",
+                        help="converte .crew de schema v2 para v3 (não muda o motor)")
     parser.add_argument("--migrate-engine", action="store_true",
                         help="muda engine_kind para unified (operação distinta)")
     args = parser.parse_args()
@@ -4263,7 +4308,7 @@ def main() -> None:
         args.factory = args.goal
     if args.resume and args.factory:
         parser.error("--resume não aceita um objetivo")
-    if args.migrate_state or args.migrate_engine:
+    if args.migrate_state or args.migrate_schema or args.migrate_engine:
         try:
             raise SystemExit(_migrate_cli(args))
         except (StateError, FileNotFoundError) as e:
@@ -4282,6 +4327,9 @@ def main() -> None:
             print(f"[ENGINE] {e}", flush=True)
             raise SystemExit(2)
         except StateCorruptError as e:
+            print(f"[STATE] {e}", flush=True)
+            raise SystemExit(6)
+        except StateError as e:
             print(f"[STATE] {e}", flush=True)
             raise SystemExit(6)
     CrewTUIApp().run()
