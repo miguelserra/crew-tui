@@ -356,6 +356,7 @@ COLORS: dict[str, str] = {
     "ANALYST": "bright_blue",
     "SCAFFOLD": "green3",
     "FACTORY": "magenta",
+    "CREW": "magenta",
     "DEV": "green",
     "TEST": "cyan",
     "INTEG": "orange3",
@@ -3744,7 +3745,7 @@ class CrewTUIApp(App):
                                    bold=True))
                 return
         self._factory_mode = True
-        self._write(tagged("FACTORY", f"projeto: {root} · motor: {kind}", bold=True))
+        self._write(tagged("CREW", f"projeto: {root} · motor: {kind}", bold=True))
         if resume and self.factory.state.requirements:
             self._write(tagged("SYSTEM", f"a retomar do passo {self.factory.state.step} …"))
             self._set_phase("BUILD")
@@ -3828,12 +3829,12 @@ class CrewTUIApp(App):
             return
         st = self.factory.state
         done = sum(1 for t in st.tasks if t.status == "done")
-        self._write(tagged("FACTORY", f"passo final: {st.step} · {done}/{len(st.tasks)} tarefas concluídas",
+        self._write(tagged("CREW", f"passo final: {st.step} · {done}/{len(st.tasks)} tarefas concluídas",
                            bold=True))
         integ = st.integration.get("verdict") if st.integration else None
         vis = st.visual.get("verdict") if st.visual else None
         if integ or vis:
-            self._write(tagged("FACTORY", f"integração: {integ or '—'} · visual: {vis or '—'}"))
+            self._write(tagged("CREW", f"integração: {integ or '—'} · visual: {vis or '—'}"))
         for t in st.tasks:
             if t.status != "done":
                 self._write(tagged("SYSTEM", f"  {t.id} {t.target_file}: {t.status}"
@@ -3865,8 +3866,10 @@ class CrewTUIApp(App):
         m = self.FACTORY_RE.match(text)
         if m:
             goal = m.group(1).strip()
+            self._write(tagged("SYSTEM", "/factory está deprecated: escreve o objetivo "
+                                         "diretamente (entrada única do Crew).", bold=True))
             if not goal:
-                self._write(tagged("SYSTEM", "uso: /factory <objetivo> [pasta do projeto]"))
+                self._write(tagged("SYSTEM", "ex.: 'cria uma API de tarefas em ~/projetos/api'"))
                 return
             self._start_factory(goal)
             return
@@ -3911,11 +3914,16 @@ class CrewTUIApp(App):
                     self._set_phase("CHAT")
                     self._run_answer(text)
                     return
+            # Transitional read-only profile; the build path is the single
+            # Crew entry below.
+            if REVIEW_RE.search(text):
                 continues = self._continues_last_run(text)
-            else:
-                continues = False
-            self._set_phase("SPEC")
-            self._run_spec(text, continues)
+                self._set_phase("SPEC")
+                self._run_spec(text, continues)
+                return
+            if self.NEW_PROJECT_RE.search(text) and self.orchestrator is not None:
+                self.orchestrator.last_project_root = None
+            self._start_factory(text)
 
     QUESTION_RE = re.compile(
         r"^\s*(o que|que (fizeste|faz|está|houve|se passou)|porque|por que|onde|quando|"
@@ -4183,7 +4191,7 @@ def _factory_cli(args: Any) -> int:
         target = store.resolve_resume(root)
         if target is not None and target.project_state is not None:
             return _engine_cli_run(args, target.engine_kind, settings, store,
-                                   target.state)
+                                   target.project_state)
         if (target is not None and target.project_state is None
                 and target.engine_kind == ENGINE_UNIFIED):
             print(f"[STATE] estado inconsistente: {target.path} declara unified "
@@ -4216,7 +4224,8 @@ def _migrate_cli(args: Any) -> int:
         state = store.load_project(store.project_state_path(root))
         state = migrate_engine(store, state)
         print(f"motor migrado: engine_kind={state.engine_kind} "
-              f"(engine_version={state.engine_version})", flush=True)
+              f"(engine_version={state.engine_version}, phase={state.phase}, "
+              f"pause={state.pause.reason or '-'})", flush=True)
     return 0
 
 
@@ -4224,7 +4233,10 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(prog="crew-tui", description="Agent pool dashboard + software factory")
-    parser.add_argument("--factory", metavar="GOAL", help="corre a pipeline 1-9 headless para este objetivo")
+    parser.add_argument("goal", nargs="?", metavar="GOAL",
+                        help="objetivo (entrada única do Crew)")
+    parser.add_argument("--factory", metavar="GOAL",
+                        help="DEPRECATED: usa o objetivo posicional")
     parser.add_argument("--project", metavar="DIR", help="pasta do projeto (default: PROJECT_DIR/<slug>)")
     parser.add_argument("--resume", action="store_true",
                         help="retoma a execução a partir do estado persistido (.crew/.factory)")
@@ -4242,6 +4254,15 @@ def main() -> None:
     parser.add_argument("--migrate-engine", action="store_true",
                         help="muda engine_kind para unified (operação distinta)")
     args = parser.parse_args()
+    if args.goal and args.factory:
+        parser.error("dá o objetivo como posicional OU --factory (deprecated), não ambos")
+    if args.factory:
+        print("[DEPRECATED] --factory: usa 'crew-tui \"objetivo\"'", file=sys.stderr, flush=True)
+        args.goal = args.factory
+    if args.goal:
+        args.factory = args.goal
+    if args.resume and args.factory:
+        parser.error("--resume não aceita um objetivo")
     if args.migrate_state or args.migrate_engine:
         try:
             raise SystemExit(_migrate_cli(args))

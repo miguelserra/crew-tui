@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 from registry import ModelRef
@@ -290,12 +291,26 @@ class Task:
         )
 
 
-def validate_tasks(tasks: list[Task]) -> list[Task]:
+def _inside_root(path: Path, root: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except Exception:
+        return False
+    root_s = os.path.normcase(str(root.resolve()))
+    dest_s = os.path.normcase(str(resolved))
+    return dest_s == root_s or dest_s.startswith(root_s + os.sep)
+
+
+def validate_tasks(tasks: list[Task],
+                   project_root: str | Path | None = None) -> list[Task]:
     """Validate target paths and enforce one file per build task.
 
     Review/prose tasks may omit ``target_file``. Uniqueness is
     case-insensitive so a project behaves the same on Linux and Windows.
+    When ``project_root`` is known, the *resolved* path must stay inside it
+    (a symlink can otherwise escape an apparently relative path).
     """
+    root = Path(project_root).expanduser().resolve() if project_root else None
     seen: dict[str, str] = {}
     normalized: list[Task] = []
     for task in tasks:
@@ -306,6 +321,10 @@ def validate_tasks(tasks: list[Task]) -> list[Task]:
                 raise StateValidationError(f"tarefa {task.id}: build exige target_file")
         target = normalize_target_file(task.target_file)
         task.target_file = target
+        if target and root is not None:
+            if not _inside_root(root / target, root):
+                raise StateValidationError(
+                    f"target_file escapa da raiz do projeto (symlink?): {target!r}")
         if target:
             key = target.casefold()
             if task.kind == "build":
@@ -433,7 +452,7 @@ class ProjectState:
             raise StateValidationError(f"engine_kind inválido: {self.engine_kind!r}")
         if self.phase not in PHASES:
             raise StateValidationError(f"phase inválida: {self.phase!r}")
-        self.tasks = validate_tasks(self.tasks)
+        self.tasks = validate_tasks(self.tasks, project_root=self.project_root or None)
         if not self.created:
             self.created = utc_now()
         if not self.updated:

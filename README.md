@@ -110,6 +110,11 @@ written to disk by the app beyond the `.env` file you edit yourself, and
 
 ## Engine selection and canonical state (P1)
 
+There is a **single Crew entry**: an ordinary instruction (TUI) or a
+positional goal (CLI, `crew-tui "objetivo" --project DIR`) starts the workflow.
+`/factory` and `--factory` are deprecated aliases that forward to the same
+entry with a warning; they are not a separate product mode.
+
 `CREW_ENGINE` selects the engine for **new** executions:
 
 ```dotenv
@@ -125,8 +130,10 @@ CREW_ENGINE=unified   # new canonical state + corrected phase order
   schema is a hard error, never a silent fallback.
 - Format migration and engine migration are separate:
   `--migrate-state --project DIR` converts `.factory` to `.crew` **without**
-  changing the engine; `--migrate-engine --project DIR` flips `engine_kind` to
-  unified. The old files are preserved for rollback.
+  changing the engine; `--migrate-engine --project DIR` validates that the
+  state is resumable by unified (phases, tasks, dependencies, contracts,
+  checkpoints), snapshots it under `.crew/history/`, and only then flips
+  `engine_kind` transactionally. The old files are preserved for rollback.
 - The architecture gate is independent from `--yes`: headless runs need
   `--approve-architecture`. `--yes` only answers questions/assumptions.
 - Models whose billing cannot be proven are blocked unless

@@ -147,6 +147,7 @@ class FactoryState:
     engine_kind: str = "legacy"
     engine_version: str = "legacy"
     schema_version: int = 1
+    run_id: str = ""
     history: list[dict[str, Any]] = field(default_factory=list)
     created: str = ""
     updated: str = ""
@@ -189,6 +190,10 @@ class Factory:
         (self.dir / "backups").mkdir(exist_ok=True)
         self.state_path = self.dir / "state.json"
         self.state = self._load()
+        self.run_id = getattr(self.state, "run_id", "") or (
+            telemetry.new_run() if telemetry is not None else "")
+        if self.run_id and not getattr(self.state, "run_id", ""):
+            self.state.run_id = self.run_id
         self.power = make_power(settings, pool, emit,
                                 on_pause=self._pause_marker,
                                 on_resume=self._power_resume)
@@ -281,14 +286,18 @@ class Factory:
                     ts.delivered_by = raw["model"]
                     return
 
-    def _ask(self, role: str, system: str, user: str, tag: str) -> str:
+    def _ask(self, role: str, system: str, user: str, tag: str,
+             task_id: str = "") -> str:
         self.power.before_step(tag)
         self.pool.refresh_peak()
         llm, _ = self._llm(role)
         if llm is None:
             raise RuntimeError(f"sem modelo para o papel '{role}'")
+        meta = {"run": self.run_id or None, "tag": tag}
+        if task_id:
+            meta["task"] = task_id
         return self.pool.complete(llm, [SystemMessage(system), HumanMessage(user)],
-                                  meta={"run": None, "tag": tag})
+                                  meta=meta)
 
     # -- step 1: requirements ---------------------------------------------- #
 
@@ -553,7 +562,7 @@ No prose, no placeholders, no elided sections.
 {f"CURRENT CONTENT (keep everything that works, fix what the task asks):{chr(10)}```{fence}{chr(10)}{existing[:12000]}{chr(10)}```" if existing else ""}"""
         try:
             raw = self._ask(task.role, DEV_SYSTEM if task.role == "senior" else JUNIOR_SYSTEM,
-                            prompt, "DEV")
+                            prompt, "DEV", task.id)
         except Exception as e:
             task.errors.append(f"gerar: {e}")
             self.log("build", f"{task.id} ERRO ao gerar: {e}")
@@ -614,7 +623,7 @@ ERROR OUTPUT (attempt {n}/{attempts}):
 
 Output the COMPLETE corrected file in ONE fenced block."""
             try:
-                raw = self._ask(role, system, prompt, "DEV")
+                raw = self._ask(role, system, prompt, "DEV", task.id)
             except Exception as e:
                 self.log("fix", f"{task.id} tentativa {n}: modelo falhou: {e}")
                 continue
@@ -645,7 +654,7 @@ UNIT CONTENT:
 Rules: no network, no external services, deterministic, <= 40 lines.
 Output only the test file in one fenced block tagged python."""
         try:
-            raw = self._ask("junior", TEST_SYSTEM, prompt, "TEST")
+            raw = self._ask("junior", TEST_SYSTEM, prompt, "TEST", task.id)
             code = _one_block(raw, "python")
             test_path.write_text(code, encoding="utf-8")
         except Exception as e:

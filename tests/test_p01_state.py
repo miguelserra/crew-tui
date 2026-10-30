@@ -3,6 +3,7 @@
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -42,6 +43,25 @@ class TaskValidationTests(unittest.TestCase):
     def test_separators_are_normalized(self):
         task = s.validate_tasks([s.Task(id="t1", kind="build", target_file="src\\a\\b.py")])[0]
         self.assertEqual(task.target_file, "src/a/b.py")
+
+    def test_symlink_escape_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = base / "proj"
+            outside = base / "outside"
+            root.mkdir()
+            outside.mkdir()
+            try:
+                (root / "link").symlink_to(outside, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlink not permitted on this platform")
+            with self.assertRaises(s.StateValidationError):
+                s.validate_tasks([s.Task(id="t1", kind="build",
+                                         target_file="link/x.py")],
+                                 project_root=root)
+            # a normal relative path still passes
+            s.validate_tasks([s.Task(id="t2", kind="build",
+                                     target_file="src/x.py")], project_root=root)
 
 
 class AttemptTests(unittest.TestCase):

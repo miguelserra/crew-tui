@@ -23,15 +23,17 @@ from state import (
     Approval,
     ArchitectureContract,
     PauseState,
+    PHASES,
     ProjectState,
     RequirementContract,
     StateValidationError,
     Task,
+    sha256_json,
     TaskAttempt,
     new_id,
     utc_now,
 )
-from store import ResumeTarget, StateManager
+from store import ResumeTarget, StateManager, atomic_write_json
 
 ENGINE_VERSION = "1.0"
 
@@ -180,9 +182,9 @@ class WorkflowEngine:
 
     def approve_architecture(self, actor: str = "human") -> None:
         self.state.approve_architecture(actor=actor)
+        self.state.pause = PauseState()
         if self.state.phase == "ARCHITECTURE":
             self.state.phase = self.adapter.next_phase("ARCHITECTURE")
-            self.state.pause = PauseState()
         self.save()
 
     def approve_unknown_billing(self, ref: ModelRef, actor: str = "human") -> None:
@@ -206,7 +208,8 @@ class WorkflowEngine:
         elif self.state.pause.reason == "architecture_approval":
             if self.state.architecture_approved():
                 self.state.pause = PauseState()
-                self.state.phase = self.adapter.next_phase("ARCHITECTURE")
+                if self.state.phase == "ARCHITECTURE":
+                    self.state.phase = self.adapter.next_phase("ARCHITECTURE")
         elif self.state.pause.reason.endswith("_failed"):
             self.state.pause = PauseState()
         self.save()
@@ -589,15 +592,104 @@ def migrate_state(store: StateManager, project_root: str) -> ProjectState:
     return store.migrate_factory_to_crew(project_root)
 
 
-def migrate_engine(store: StateManager, state: ProjectState) -> ProjectState:
-    """Distinct operation: switch engine_kind to unified without changing data."""
+def _validate_dependencies(tasks: list[Task]) -> None:
+    ids = [t.id for t in tasks]
+    if len(ids) != len(set(ids)):
+        raise EngineError("tarefas com ids duplicados")
+    known = set(ids)
+    graph: dict[str, list[str]] = {}
+    for task in tasks:
+        missing = [d for d in task.depends_on if d not in known]
+        if missing:
+            raise EngineError(f"tarefa {task.id} depende de ids inexistentes: {missing}")
+        graph[task.id] = [d for d in task.depends_on if d != task.id]
+        if task.id in task.depends_on:
+            raise EngineError(f"tarefa {task.id} depende de si própria")
+    state: dict[str, int] = {}
+
+    def visit(node: str) -> None:
+        mark = state.get(node, 0)
+        if mark == 1:
+            raise EngineError(f"dependências cíclicas envolvendo {node}")
+        if mark == 2:
+            return
+        state[node] = 1
+        for dep in graph.get(node, []):
+            visit(dep)
+        state[node] = 2
+
+    for node in graph:
+        visit(node)
+
+
+def validate_unified_state(state: ProjectState) -> None:
+    """Refuse an execution that the unified engine cannot resume safely."""
     if state.schema_version < 2:
         raise EngineError("migra primeiro o formato com --migrate-state")
+    if state.engine_kind not in (ENGINE_LEGACY, ENGINE_UNIFIED):
+        raise EngineError(f"engine_kind inválido: {state.engine_kind!r}")
+    if state.phase not in PHASES:
+        raise EngineError(f"fase desconhecida: {state.phase!r}")
+    try:
+        from state import validate_tasks
+        validate_tasks(state.tasks, project_root=state.project_root or None)
+    except StateValidationError as exc:
+        raise EngineError(f"tarefas incompatíveis: {exc}") from exc
+    _validate_dependencies(state.tasks)
+    if not isinstance(state.requirements, RequirementContract):
+        raise EngineError("contrato de requisitos inválido")
+    if not isinstance(state.architecture, ArchitectureContract):
+        raise EngineError("contrato de arquitectura inválido")
+
+
+def _normalize_for_unified(state: ProjectState) -> None:
+    """Make a legacy state resumable by the corrected workflow order."""
+    has_req = bool(state.requirements.objective)
+    has_arch = bool(state.architecture.approach or state.architecture.interfaces
+                    or state.architecture.modules)
+    if not has_req:
+        state.phase = "SPEC"
+        return
+    if state.phase == "SPEC":
+        # Requirements exist but there is no spec checkpoint: keep the gate
+        # closed instead of silently proceeding.
+        state.pause = PauseState(reason="spec_approval", phase="SPEC", since=utc_now())
+        return
+    if not has_arch and state.phase not in ("SPEC", "ARCHITECTURE"):
+        state.phase = "ARCHITECTURE"
+        state.pause = PauseState()
+        return
+    if state.phase != "DONE" and state.architecture and not state.architecture_approved():
+        # Architecture exists but was never approved under the new gate.
+        state.pause = PauseState(reason="architecture_approval", phase=state.phase,
+                                 since=utc_now(), detail=state.architecture_hash())
+    if state.phase == "ARCHITECTURE" and state.architecture_approved():
+        state.pause = PauseState()
+
+
+def migrate_engine(store: StateManager, state: ProjectState) -> ProjectState:
+    """Transactional, idempotent switch of engine_kind (format must be v2)."""
+    validate_unified_state(state)
     if state.engine_kind == ENGINE_UNIFIED:
         return state
-    state.engine_kind = ENGINE_UNIFIED
-    state.engine_version = ENGINE_VERSION
-    state.migrations.append({"from": "legacy", "to": "unified", "at": utc_now(),
-                             "engine_changed": True})
-    store.save_project(state)
-    return state
+
+    source = state.to_dict()
+    source_hash = sha256_json(source)
+    snapshot_dir = store.history_dir(state.project_root) if state.project_root else None
+    if snapshot_dir is not None:
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snap = snapshot_dir / f"engine-source-{source_hash[:16]}.json"
+        if not snap.exists():
+            atomic_write_json(snap, source)
+
+    candidate = ProjectState.from_dict(source)
+    _normalize_for_unified(candidate)
+    validate_unified_state(candidate)
+    candidate.engine_kind = ENGINE_UNIFIED
+    candidate.engine_version = ENGINE_VERSION
+    candidate.migrations.append({
+        "from": "legacy", "to": "unified", "at": utc_now(),
+        "engine_changed": True, "source_sha256": source_hash,
+    })
+    store.save_project(candidate)
+    return candidate
