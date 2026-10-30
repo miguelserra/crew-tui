@@ -25,7 +25,7 @@ anything that fails an external oracle plus a cross-model critic.
 ```mermaid
 flowchart LR
     U[You] -->|goal| S[SPEC<br/>SpecContract]
-    S -->|human gate "go"| B[BUILD<br/>atomic tasks]
+    S -->|human gate: go| B[BUILD<br/>atomic tasks]
     B --> R{Model router}
     R -->|cheap| L[Local Qwen / Gemini Flash]
     R -->|strong| P[Gemini Pro / DeepSeek off-peak]
