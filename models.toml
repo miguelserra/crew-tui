@@ -1,0 +1,199 @@
+# Crew model registry.
+#
+# Identity = provider + endpoint + model_id + credential_profile.
+# Billing is explicit; capabilities are verified properties, never inferred
+# from a model name. Prices are Decimal strings per 1M tokens (USD) and are
+# only billable for billing = "payg". Subscription/free_quota consume quota,
+# they are not zero-cost PAYG calls.
+
+[profiles.local]
+provider = "local"
+endpoint = "local"
+api_key_env = ""
+billing = "local"
+
+[profiles.gemini-plus]
+provider = "google"
+endpoint = "gemini"
+api_key_env = "GEMINI_API_KEY"
+billing = "subscription"
+
+[profiles.opencode-go]
+provider = "opencode"
+endpoint = "go"
+api_key_env = "OPENCODE_API_KEY"
+billing = "subscription"
+
+[profiles.opencode-free]
+provider = "opencode"
+endpoint = "zen-free"
+api_key_env = "OPENCODE_API_KEY"
+billing = "free_quota"
+
+[profiles.openrouter]
+provider = "openrouter"
+endpoint = "api"
+api_key_env = "OPENROUTER_API_KEY"
+billing = "unknown"
+
+[profiles.deepseek-api]
+provider = "deepseek"
+endpoint = "direct-api"
+api_key_env = "DEEPSEEK_API_KEY"
+billing = "payg"
+
+[[models]]
+profile = "local"
+model_id = "qwen3.6-35b-a3b"
+family = "local"
+capabilities = ["text", "json"]
+billing = "local"
+quota_consumed = false
+currency = "USD"
+input_per_million = "0"
+output_per_million = "0"
+pricing_source = "local inference (no remote billing)"
+pricing_updated = "2026-10-30"
+
+[[models]]
+profile = "gemini-plus"
+model_id = "gemini-3.5-flash"
+family = "gemini"
+capabilities = ["text", "vision", "json"]
+billing = "subscription"
+quota_consumed = true
+currency = "USD"
+input_per_million = "0"
+output_per_million = "0"
+pricing_source = "Gemini Plus subscription (quota consumption, not PAYG)"
+pricing_updated = "2026-10-30"
+
+[[models]]
+profile = "gemini-plus"
+model_id = "gemini-3.8-flash"
+family = "gemini"
+capabilities = ["text", "vision", "json"]
+billing = "subscription"
+quota_consumed = true
+currency = "USD"
+input_per_million = "0"
+output_per_million = "0"
+pricing_source = "Gemini Plus subscription (quota consumption, not PAYG)"
+pricing_updated = "2026-10-30"
+
+[[models]]
+profile = "gemini-plus"
+model_id = "gemini-3.1-pro-preview"
+family = "gemini"
+capabilities = ["text", "vision", "json"]
+billing = "subscription"
+quota_consumed = true
+currency = "USD"
+input_per_million = "0"
+output_per_million = "0"
+pricing_source = "Gemini Plus subscription (quota consumption, not PAYG)"
+pricing_updated = "2026-10-30"
+
+[[models]]
+profile = "opencode-go"
+model_id = "deepseek-v4-pro"
+family = "deepseek"
+capabilities = ["text", "json"]
+billing = "subscription"
+quota_consumed = true
+currency = "USD"
+input_per_million = "0"
+output_per_million = "0"
+pricing_source = "OpenCode Go subscription (quota consumption, not PAYG)"
+pricing_updated = "2026-10-30"
+
+[[models]]
+profile = "opencode-go"
+model_id = "deepseek-v4.1-flash"
+family = "deepseek"
+capabilities = ["text", "json"]
+billing = "subscription"
+quota_consumed = true
+currency = "USD"
+input_per_million = "0"
+output_per_million = "0"
+pricing_source = "OpenCode Go subscription (quota consumption, not PAYG)"
+pricing_updated = "2026-10-30"
+
+[[models]]
+profile = "opencode-go"
+model_id = "kimi-k3.1-pro"
+family = "kimi"
+capabilities = ["text", "json"]
+billing = "subscription"
+quota_consumed = true
+currency = "USD"
+input_per_million = "0"
+output_per_million = "0"
+pricing_source = "OpenCode Go subscription (quota consumption, not PAYG)"
+pricing_updated = "2026-10-30"
+
+[[models]]
+profile = "opencode-go"
+model_id = "gemini-4-argon"
+family = "gemini"
+capabilities = ["text", "json"]
+billing = "subscription"
+quota_consumed = true
+currency = "USD"
+input_per_million = "0"
+output_per_million = "0"
+pricing_source = "OpenCode Go subscription (quota consumption, not PAYG)"
+pricing_updated = "2026-10-30"
+
+[[models]]
+profile = "opencode-go"
+model_id = "beam-free"
+family = "opencode"
+capabilities = ["text", "json"]
+billing = "subscription"
+quota_consumed = true
+currency = "USD"
+input_per_million = "0"
+output_per_million = "0"
+pricing_source = "OpenCode Go subscription (quota consumption, not PAYG)"
+pricing_updated = "2026-10-30"
+
+[[models]]
+profile = "opencode-free"
+model_id = "big-pickle"
+family = "opencode"
+capabilities = ["text", "json"]
+billing = "free_quota"
+quota_consumed = true
+currency = "USD"
+input_per_million = "0"
+output_per_million = "0"
+pricing_source = "free zen quota; availability probed at startup"
+pricing_updated = "2026-10-30"
+
+[[models]]
+profile = "openrouter"
+model_id = "nvidia/nemotron-3-ultra"
+family = "nvidia"
+capabilities = ["text", "json"]
+billing = "free_quota"
+quota_consumed = true
+currency = "USD"
+input_per_million = "0"
+output_per_million = "0"
+pricing_source = "OpenRouter /models pricing: prompt=completion=0"
+pricing_updated = "2026-10-30"
+
+[[models]]
+profile = "deepseek-api"
+model_id = "deepseek-v4-pro"
+family = "deepseek"
+capabilities = ["text", "json"]
+billing = "payg"
+quota_consumed = false
+currency = "USD"
+input_per_million = "0.60"
+output_per_million = "2.20"
+pricing_source = "DeepSeek API pricing"
+pricing_updated = "2026-10-30"

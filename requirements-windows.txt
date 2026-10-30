@@ -8,6 +8,7 @@ langchain-core>=1.4,<2
 langchain-openai>=1.5
 langchain-google-genai>=4.0
 pydantic>=2.9
+tomli>=2.0; python_version < "3.11"
 
 # Windows-specific: Playwright for visual audits (optional, install via setup.ps1 -Playwright)
 # playwright>=1.40,<2

@@ -26,25 +26,24 @@ anything that fails an external oracle plus a cross-model critic.
 
 ```mermaid
 flowchart LR
-    U[You] -->|goal| S[SPEC<br/>SpecContract]
-    S -->|human gate: go| B[BUILD<br/>atomic tasks]
-    B --> R{Model router}
-    R -->|cheap| L[Local Qwen / Gemini Flash]
-    R -->|strong| P[Gemini Pro / DeepSeek off-peak]
-    B --> V[VERIFY]
-    V --> O[Oracle: py_compile / node / Playwright]
+    U[You] -->|goal| S[SPEC<br/>RequirementContract]
+    S -->|human gate| A[ARCHITECTURE<br/>modules / interfaces / tasks]
+    A -->|approval hash| SC[SCAFFOLD<br/>deterministic skeleton]
+    SC --> B[BUILD<br/>atomic file tasks]
+    B --> V[VERIFY / FIX]
+    V --> O[Oracle: compile / node / tests]
     V --> C[Critic: different model family]
-    O --> D{pass?}
-    C --> D
-    D -->|no| F[Fix loop] --> B
-    D -->|yes| G[DONE + project_memory.json]
+    V --> I[INTEGRATE<br/>run + Playwright]
+    I --> VI[VISUAL<br/>multimodal only]
+    VI --> SG[SIGN-OFF + project_memory]
 ```
 
 Design principles:
 
-- **SPEC** — a Pydantic `SpecContract` (goal, non-negotiables, measurable
-  acceptance criteria, small tasks) is co-designed with you and frozen **before**
-  any code is generated.
+- **SPEC** — the canonical `RequirementContract` inside `ProjectState`
+  (objective, scope, constraints, measurable acceptance criteria with explicit
+  task traceability) is co-designed with you and frozen **before** any code is
+  generated. Legacy `SpecContract` remains a compatibility format.
 - **VERIFY** — two independent levers:
   1. an external **oracle** (`py_compile` + optional `ruff` / `node --check`);
   2. a **cross-model critic** (a different model family that must emit
@@ -74,7 +73,7 @@ Use the bundled PowerShell scripts:
 .\setup.ps1 -Playwright -Node   # venv + deps + %APPDATA%\crew-tui\.env
 notepad $env:APPDATA\crew-tui\.env   # add your keys
 .\run.ps1                            # TUI
-.\run.ps1 --factory "build a todo app" --project C:\dev\todo --yes
+.\run.ps1 "build a todo app" --project C:\dev\todo --yes --approve-architecture
 ```
 
 - `setup.ps1` creates `.venv`, installs `requirements-windows.txt`, and copies
@@ -173,13 +172,28 @@ A v2 `.crew` is never upgraded silently on load. Unmapped legacy fields are
 preserved in `ProjectState.extensions`, contract `raw` data and
 `Task.legacy_extra`.
 
+## Model Registry (P3)
+
+`models.toml` is the formal source of model knowledge:
+
+- identity = **provider + endpoint + model_id + credential_profile** (not the
+  display name);
+- billing = `local | free_quota | subscription | payg | unknown`;
+- explicit capabilities (`text`, `vision`, `json`, `tools`);
+- Decimal prices per 1M tokens, currency, provenance and `pricing_updated`;
+- OpenRouter is `free_quota` only when **both** confirmed prices are zero;
+- subscriptions/free quotas track quota consumption separately from PAYG cost;
+- `ModelRef` stores an identity snapshot for historical attempts/telemetry;
+- Python 3.10 uses `tomli`; 3.11+ uses `tomllib`.
+
 ## Financial circuit breaker
 
 Pay-as-you-go models are **never** called implicitly:
 
-- Each constructed model carries a billing class (`local`, `free`, `fixed`,
-  `payg`). Fixed-cost subscriptions (OpenCode Go, Gemini Plus) are **not**
-  treated as paid.
+- The Model Registry (`models.toml`) assigns each model an explicit
+  `billing` class: `local`, `free_quota`, `subscription`, `payg` or `unknown`.
+  Subscriptions and free quotas consume quota; they are **not** reported as
+  zero-cost PAYG calls. Unknown models are blocked without authorization.
 - Fallback chains are built without `payg` handles unless `ALLOW_PAID=1`.
 - A free-tier `429`/quota that exhausts the chain suspends the run with
   `BudgetSuspended` instead of silently falling back to a paid endpoint.
@@ -189,13 +203,15 @@ Pay-as-you-go models are **never** called implicitly:
 
 ```dotenv
 ALLOW_PAID=0          # 1 only for unattended runs that may spend money
-PAYG_MODELS=          # extra per-token ids, comma-separated
+PAYG_MODELS=          # extra per-token ids; prefer adding them to models.toml
 ```
 
 ## Adapting to other models or providers
 
-All model selection is **environment-driven** — there is no hard-coded model
-allowlist (the only table with model names is the dashboard's cost estimate).
+All model selection is **environment-driven**, but model identity, capabilities,
+billing and pricing come from the **Model Registry** in `models.toml` (override
+with `MODELS_CONFIG=/path/to/models.toml`). Add custom model ids there; an
+unregistered non-local model is `unknown` and blocked by the dispatch guard.
 
 ### Role → variable → default
 
@@ -483,7 +499,8 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `factory.py` | Legacy Factory compatibility adapter + Playwright audit + DOM-contract check |
 | `state.py` | Canonical `ProjectState`/`Task`/`TaskAttempt`, legacy migration, path validation |
 | `store.py` | Atomic canonical store, staging promotion, resume resolution, format migration |
-| `registry.py` | `CredentialProfile`/`ModelRef`: provider, endpoint, billing, capabilities |
+| `registry.py` | Model Registry: identity, billing, Decimal pricing, capabilities |
+| `models.toml` | Declarative model identities/profiles/prices (override with `MODELS_CONFIG`) |
 | `attempts.py` | Per-candidate attempt scoreboard (stdlib) |
 | `engine.py` | Engine selection, approvals, dispatch guard, workflow adapters |
 | `peak.py` | Pure peak/off-peak window helpers (shared, no I/O) |
@@ -493,13 +510,14 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `scripts/crew-sleep` | Root helper that arms the RTC alarm / suspends (Linux) |
 | `scripts/install-crew-sleep.sh` | One-time root install + sudoers rule |
 | `setup.ps1`, `run.ps1` | Windows bootstrap and launcher |
-| `tests/` | Power, budget, P0/P1 foundation and P2 contract/migration tests |
+| `tests/` | Power, budget, P0/P1 foundation, P2 contracts and P3 registry tests |
 
 ## Tests & CI
 
 ```bash
 python -m unittest discover -s tests -p "test_p01_*.py"   # core, no deps
 python -m unittest discover -s tests -p "test_p02_*.py"   # core, no deps
+python -m unittest discover -s tests -p "test_p03_*.py"   # registry, no deps
 .venv/bin/python -m unittest discover -s tests -p "test_p0*_integration.py"
 python tests/test_power.py
 python tests/test_budget.py

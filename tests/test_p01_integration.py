@@ -36,7 +36,7 @@ class AttemptIntegrationTests(unittest.TestCase):
             h = main.AttemptHandler(ref)
             h.on_llm_start(None, None, run_id="a")
             h.on_llm_error(RuntimeError("429 rate limit"), run_id="a")
-            h2 = main.AttemptHandler(ref_for("opencode-go", "kimi"))
+            h2 = main.AttemptHandler(ref_for("opencode-go", "kimi-k3.1-pro"))
             h2.on_llm_start(None, None, run_id="b")
             h2.on_llm_end(types.SimpleNamespace(
                 llm_output={"model_name": "kimi-k3.1-pro-2026"},
@@ -59,7 +59,7 @@ class AttemptIntegrationTests(unittest.TestCase):
 
         col = main.AttemptCollector(run_id="r", task="t1", tag="DEV")
         h1 = main.AttemptHandler(ref_for("gemini-plus", "flash"))
-        h2 = main.AttemptHandler(ref_for("opencode-go", "kimi"))
+        h2 = main.AttemptHandler(ref_for("opencode-go", "kimi-k3.1-pro"))
         m1 = Boom(responses=["x"], callbacks=[h1])
         m2 = FakeListChatModel(responses=["ok"], callbacks=[h2])
         chain = m1.with_fallbacks([m2])
@@ -70,8 +70,9 @@ class AttemptIntegrationTests(unittest.TestCase):
             main._ATTEMPT_CTX.reset(token)
         self.assertEqual([(e.attempt.outcome, e.attempt.model.model_id)
                           for e in col.events()],
-                         [("429/quota", "flash"), ("ok", "kimi")])
-        self.assertEqual(col.last_ok("t1").attempt.model.model_id, "kimi")
+                         [("429/quota", "flash"), ("ok", "kimi-k3.1-pro")])
+        self.assertEqual(col.last_ok("t1").attempt.model.model_id,
+                         "kimi-k3.1-pro")
 
     def test_complete_synthesizes_attempt_without_callbacks(self):
         seen = []
@@ -87,7 +88,7 @@ class AttemptIntegrationTests(unittest.TestCase):
         pool.on_budget = None
 
         class FakeLLM:
-            _model_ref = ref_for("opencode-go", "kimi")
+            _model_ref = ref_for("opencode-go", "kimi-k3.1-pro")
             _billing = "subscription"
             model_name = "kimi"
 
@@ -98,7 +99,7 @@ class AttemptIntegrationTests(unittest.TestCase):
         self.assertEqual(main.LLMPool.complete(pool, FakeLLM(), []), "ok")
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0].attempt.outcome, "ok")
-        self.assertEqual(seen[0].attempt.model.model_id, "kimi")
+        self.assertEqual(seen[0].attempt.model.model_id, "kimi-k3.1-pro")
 
     def test_unknown_billing_blocks_before_invoke(self):
         from registry import unknown_ref
@@ -140,10 +141,10 @@ class AttemptIntegrationTests(unittest.TestCase):
 
         class Chain:
             runnable = H(ref_for("gemini-plus", "flash"))
-            fallbacks = [H(ref_for("opencode-go", "kimi"))]
+            fallbacks = [H(ref_for("opencode-go", "kimi-k3.1-pro"))]
 
         refs = main.iter_model_refs(Chain())
-        self.assertEqual({r.model_id for r in refs}, {"flash", "kimi"})
+        self.assertEqual({r.model_id for r in refs}, {"flash", "kimi-k3.1-pro"})
 
 
 @unittest.skipUnless(DEPS_OK, f"runtime deps missing: {DEPS_ERR}")

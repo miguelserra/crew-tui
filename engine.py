@@ -449,7 +449,8 @@ class FactoryAdapter:
 
         self._FactoryState = FactoryState
         self._TaskState = TaskState
-        self.factory = EphemeralFactory(settings, pool, emit, project.project_root)
+        self.factory = EphemeralFactory(settings, pool, emit, project.project_root,
+                                        telemetry=getattr(pool, "telemetry", None))
         self.factory.state = self._to_factory_state(project)
         self.pool.attempt_sink = self._on_attempt_from_pool
 

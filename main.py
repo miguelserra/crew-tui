@@ -32,6 +32,7 @@ from __future__ import annotations
 import base64
 import contextvars
 import hashlib
+from decimal import Decimal, InvalidOperation
 import json
 import os
 import platform
@@ -76,12 +77,11 @@ except Exception:  # pragma: no cover - env without the google stack
     ChatGoogleGenerativeAI = None  # type: ignore
 
 from power import make_power
-from budget import BudgetSuspended, bills_per_token, openrouter_is_free, payg_options
+from budget import BudgetSuspended, bills_per_token
 from attempts import AttemptCollector, AttemptEvent
 from registry import (
-    BILLING_FREE as MB_FREE, BILLING_LOCAL as MB_LOCAL, BILLING_PAYG as MB_PAYG,
-    BILLING_SUBSCRIPTION as MB_SUBSCRIPTION, BILLING_UNKNOWN as MB_UNKNOWN,
-    ModelRef, family_of, ref_for, ref_from_handle,
+    BILLING_PAYG, BILLING_UNKNOWN as MB_UNKNOWN, CostEstimate, ModelIdentity, ModelRef,
+    ModelRegistry, RegistryError, normalize_billing, ref_from_handle,
 )
 from engine import (
     ENGINE_LEGACY, ENGINE_UNIFIED, ENGINE_VERSION, EngineError, EngineFacade,
@@ -374,44 +374,29 @@ APPROVE_KEYWORDS = GO_KEYWORDS | {"y", "yes", "ok", "sim", "s", "aprovar", "appr
 REVIEW_RE = re.compile(r"(?i)\b(rev[eê]|rever|revis[ãa]o|revis[ae]r?|analis[ae]r?|audit[ae]r?|"
                        r"review|audit)\b")
 
-# Approximate USD per 1M tokens (input, output). ONLY used for the dashboard's
-# "custo" figure (edit this table if provider pricing changes).
-PRICING: dict[str, tuple[float, float]] = {
-    "deepseek-v4-pro": (0.60, 2.20),
-    "deepseek-v4.1-flash": (0.10, 0.40),
-    "kimi-k3.1-pro": (0.60, 2.50),
+# Billing classes are the only dashboard tier dimension. Costs/prices come
+# from the Model Registry, never from the model display name.
+TIER_LABEL = {
+    "local": "local",
+    "free_quota": "free quota",
+    "subscription": "subscrição",
+    "payg": "payg",
+    "unknown": "desconhecido",
 }
-UNKNOWN_PAID_PRICE: tuple[float, float] = (0.20, 0.80)
-
-TIER_LABEL = {"local": "local", "gemini": "free", "free": "free", "paid": "pago"}
-TIER_STYLE = {"local": "green", "gemini": "magenta", "free": "cyan", "paid": "yellow"}
-
-
-def model_tier(name: str) -> str:
-    """Classify a model as local / free-Gemini / free / paid for the dashboard."""
-    n = (name or "").lower()
-    if not n:
-        return "paid"
-    if "qwen" in n or "local" in n or "llama" in n:
-        return "local"
-    if "gemini" in n:
-        return "gemini"
-    if "free" in n or n in {"big-pickle"}:
-        return "free"
-    return "paid"
+TIER_STYLE = {
+    "local": "green",
+    "free_quota": "cyan",
+    "subscription": "magenta",
+    "payg": "yellow",
+    "unknown": "red",
+}
+LEGACY_TIER = {"gemini": "subscription", "free": "free_quota", "paid": "payg"}
 
 
-def model_price(name: str) -> tuple[float, float]:
-    n = (name or "").lower()
-    for key, price in PRICING.items():
-        if key in n:
-            return price
-    return (0.0, 0.0) if model_tier(name) != "paid" else UNKNOWN_PAID_PRICE
-
-
-def estimate_cost(name: str, in_tokens: int, out_tokens: int) -> float:
-    pin, pout = model_price(name)
-    return (in_tokens * pin + out_tokens * pout) / 1_000_000
+def _event_billing(event: dict[str, Any]) -> str:
+    raw = event.get("billing") or event.get("tier") or "unknown"
+    raw = LEGACY_TIER.get(str(raw), str(raw))
+    return normalize_billing(raw)
 
 
 def _error_kind(error: Exception) -> str:
@@ -608,9 +593,10 @@ def _served_model_id(response: Any) -> str:
 class AttemptHandler(BaseCallbackHandler):
     """Records every candidate call inside a fallback chain."""
 
-    def __init__(self, ref: ModelRef):
+    def __init__(self, ref: ModelRef, registry: Optional[ModelRegistry] = None):
         super().__init__()
         self.ref = ref
+        self.registry = registry
         self._ids: dict[Any, str] = {}
 
     def on_llm_start(self, serialized, prompts, run_id=None, **kwargs) -> None:
@@ -625,7 +611,10 @@ class AttemptHandler(BaseCallbackHandler):
             return
         attempt_id = self._ids.pop(run_id, None)
         if attempt_id:
-            col.finish(attempt_id, "ok", served_id=_served_model_id(response))
+            served = _served_model_id(response)
+            served_ref = (self.registry.ref_served(self.ref, served)
+                          if (self.registry is not None and served) else None)
+            col.finish(attempt_id, "ok", served_id=served, served_ref=served_ref)
 
     def on_llm_error(self, error, run_id=None, **kwargs) -> None:
         col = _ATTEMPT_CTX.get()
@@ -720,6 +709,14 @@ class LLMPool:
         self.dispatch_guard: Optional[Callable[[list[ModelRef]], None]] = None
         self.attempt_sink: Optional[Callable[[AttemptEvent], None]] = None
         self.allow_unknown = bool(settings.allow_unknown)
+        try:
+            self.registry = ModelRegistry.load_default()
+            self.registry_error = ""
+        except Exception as exc:
+            self.registry = ModelRegistry()
+            self.registry_error = str(exc)
+        self.openrouter_pricing: dict[str, dict[str, Any]] = {}
+        self.probes: dict[tuple[str, str], bool] = {}
 
         self.cloud_enabled = bool(settings.opencode_api_key) and settings.opencode_mode != "off"
         self.openrouter_enabled = bool(settings.openrouter_api_key)
@@ -765,14 +762,15 @@ class LLMPool:
         elif mode == "progress" and self._progress_factory is not None:
             handlers.append(ProgressHandler(tag, self._progress_factory(tag)))
         if ref is not None:
-            handlers.append(AttemptHandler(ref))
+            handlers.append(AttemptHandler(ref, self.registry))
         return handlers
 
     def _cloud(self, model: str, tag: str, temperature: Optional[float] = None,
                thinking: bool = False, max_tokens: int = 8192) -> Any:
         if not self.cloud_enabled or ChatOpenAI is None:
             return None
-        ref = ref_for("opencode-go", model, family=family_of(model))
+        identity = self.registry.identity_for("opencode-go", model)
+        ref = self.registry.ref_for_identity(identity)
         # NOTE: temperature is omitted on purpose: several OpenCode Go models
         # (kimi-k3.x, reasoning models) reject anything but 1.
         kwargs: dict[str, Any] = dict(
@@ -800,7 +798,9 @@ class LLMPool:
         """Same key, different (free zen) endpoint — used for the stealth model."""
         if not self.cloud_enabled or ChatOpenAI is None:
             return None
-        ref = ref_for("opencode-free", model, family=family_of(model))
+        identity = self.registry.identity_for("opencode-free", model)
+        available = self.probes.get(("opencode-free", model))
+        ref = self.registry.ref_for_identity(identity, available=available)
         return _attach_identity(ChatOpenAI(
             model=model,
             base_url=self.settings.senior_base_url,
@@ -824,6 +824,10 @@ class LLMPool:
         """
         if not (self.settings.senior_probe and self.cloud_enabled):
             return False
+        identity = self.registry.identity_for("opencode-free",
+                                              self.settings.senior_model)
+        if identity.billing == "unknown" and not self.allow_unknown:
+            return False
         llm = self._free_cloud(self.settings.senior_model, "DEV", max_tokens=16, max_retries=0)
         if llm is None:
             return False
@@ -837,9 +841,9 @@ class LLMPool:
                     thinking: bool = False, max_tokens: int = 8192) -> Any:
         if not self.openrouter_enabled or ChatOpenAI is None:
             return None
-        billing = (MB_FREE if openrouter_is_free(model, self.settings.openrouter_free_model)
-                   else MB_PAYG)
-        ref = ref_for("openrouter", model, family=family_of(model), billing=billing)
+        identity = self.registry.openrouter_identity(
+            model, self.openrouter_pricing.get(model))
+        ref = self.registry.ref_for_identity(identity)
         kwargs: dict[str, Any] = dict(
             model=model,
             base_url=self.settings.openrouter_base_url,
@@ -866,7 +870,8 @@ class LLMPool:
         if not self.deepseek_enabled or ChatOpenAI is None:
             return None
         mid = model or self.settings.deepseek_model
-        ref = ref_for("deepseek-api", mid, family=family_of(mid), billing=MB_PAYG)
+        identity = self.registry.identity_for("deepseek-api", mid)
+        ref = self.registry.ref_for_identity(identity)
         kwargs: dict[str, Any] = dict(
             model=mid,
             base_url=self.settings.deepseek_base_url,
@@ -926,8 +931,8 @@ class LLMPool:
         if not self.gemini_enabled or ChatGoogleGenerativeAI is None:
             return None
         mid = model or self.settings.gemini_model
-        ref = ref_for("gemini-plus", mid, family=family_of(mid),
-                      billing=MB_SUBSCRIPTION)
+        identity = self.registry.identity_for("gemini-plus", mid)
+        ref = self.registry.ref_for_identity(identity)
         return _attach_identity(ChatGoogleGenerativeAI(
             model=model or self.settings.gemini_model,
             google_api_key=self.settings.gemini_api_key,
@@ -943,9 +948,9 @@ class LLMPool:
     def _local_or_beam(self, tag: str) -> Any:
         if self.local_up and ChatOpenAI is not None:
             thinking = self.settings.think_worker if tag == "WORKER" else self.settings.think_critic
-            ref = ref_for("local", self.settings.local_model_name,
-                          family=family_of(self.settings.local_model_name),
-                          billing=MB_LOCAL)
+            identity = self.registry.identity_for("local",
+                                                  self.settings.local_model_name)
+            ref = self.registry.ref_for_identity(identity)
             kwargs: dict[str, Any] = dict(
                 model=self.settings.local_model_name,
                 base_url=self.settings.local_llm_url,
@@ -1108,6 +1113,8 @@ class LLMPool:
         if self.cloud_enabled:
             info["cloud_models"] = self._list_cloud_models()
             self.big_pickle_up = self._probe_senior()
+            self.probes[("opencode-free", self.settings.senior_model)] = bool(
+                self.big_pickle_up)
             info["senior_up"] = self.big_pickle_up
         if self.openrouter_enabled:
             info["openrouter_models"] = self._list_openrouter_models()
@@ -1166,6 +1173,10 @@ class LLMPool:
             return []
         models = data.get("data", []) if isinstance(data, dict) else data
         self.openrouter_models = {m.get("id", "") for m in models if isinstance(m, dict)}
+        self.openrouter_pricing = {
+            str(m.get("id")): dict(m.get("pricing") or {})
+            for m in models if isinstance(m, dict) and m.get("id")
+        }
         return sorted(self.openrouter_models)
 
     # -- invocation helpers ------------------------------------------------- #
@@ -1263,7 +1274,9 @@ class LLMPool:
                     f"{tag}: 429/quota sem autorização para usar modelos pagos; "
                     "autoriza no TUI, ALLOW_PAID=1 ou --allow-paid") from e
             raise
-        self._record_usage(meta, response, model, int((time.monotonic() - started) * 1000))
+        fallback_ref = ref_from_handle(llm)
+        self._record_usage(meta, response, model, int((time.monotonic() - started) * 1000),
+                           fallback_ref=fallback_ref)
         text = self._content_str(response)
         if not text.strip():
             raise RuntimeError(f"empty response from {model} "
@@ -1273,11 +1286,22 @@ class LLMPool:
     # -- budget breaker ----------------------------------------------------- #
 
     def payg_options(self) -> list[str]:
-        """Pay-as-you-go models the user may authorize."""
-        return payg_options(
-            self.deepseek_enabled, self.settings.deepseek_model,
-            self.openrouter_enabled, self.settings.openrouter_model,
-            self.settings.openrouter_free_model, self.settings.payg_models)
+        """Registered pay-as-you-go models the user may authorize."""
+        out: list[str] = []
+        for identity in self.registry.models.values():
+            if identity.billing != BILLING_PAYG:
+                continue
+            if identity.credential_profile == "deepseek-api" and not self.deepseek_enabled:
+                continue
+            if identity.credential_profile == "openrouter" and not self.openrouter_enabled:
+                continue
+            if identity.model_id not in out:
+                out.append(identity.model_id)
+        for raw in (self.settings.payg_models or "").split(","):
+            m = raw.strip()
+            if m and m not in out:
+                out.append(m)
+        return out
 
     def _request_paid(self, tag: str, reason: str) -> Optional[str]:
         options = self.payg_options()
@@ -1318,7 +1342,8 @@ class LLMPool:
         return type(llm).__name__
 
     def _record_usage(self, meta: Optional[dict[str, Any]], response: Any,
-                      model: str = "", elapsed_ms: int = 0) -> None:
+                      model: str = "", elapsed_ms: int = 0,
+                      fallback_ref: Optional[ModelRef] = None) -> None:
         if self.telemetry is None or meta is None:
             return
         usage = getattr(response, "usage_metadata", None) or {}
@@ -1326,13 +1351,38 @@ class LLMPool:
         out_t = usage.get("output_tokens") or usage.get("output_token_count") or 0
         served = (getattr(response, "response_metadata", None) or {})
         served_name = served.get("model_name") or served.get("model")
+        task_id = (meta or {}).get("task") or None
+        collector = _ATTEMPT_CTX.get()
+        event = collector.last_ok(task_id) if collector is not None else None
+        ref = event.attempt.model if event is not None else fallback_ref
+        if ref is None:
+            ref = self.registry.ref_for("unknown", served_name or model or "unknown")
+        elif served_name and served_name != ref.model_id:
+            ref = self.registry.ref_served(ref, served_name)
+        identity = (ModelIdentity.from_dict(ref.identity) if ref.identity
+                    else self.registry.identity_for(ref.credential_profile, ref.model_id))
+        cost: CostEstimate = self.registry.estimate(identity, int(in_t), int(out_t))
         rec = dict(meta)
         run = rec.pop("run", None)
         if run:
-            rec.update({"in_tokens": in_t, "out_tokens": out_t,
-                        "model": served_name or model or "?",
-                        "tier": model_tier(served_name or model),
-                        "ms": elapsed_ms})
+            rec.update({
+                "in_tokens": in_t, "out_tokens": out_t,
+                "model": ref.model_id or served_name or model or "?",
+                "billing": identity.billing,
+                "provider": identity.provider,
+                "endpoint": identity.endpoint,
+                "credential_profile": identity.credential_profile,
+                "capabilities": sorted(identity.capabilities),
+                "identity": identity.to_dict(),
+                "cost": str(cost.total),
+                "currency": cost.currency,
+                "cost_basis": cost.basis,
+                "cost_known": cost.known,
+                "billable": cost.billable,
+                "quota_consumed": cost.quota_consumed,
+                "tier": identity.billing,
+                "ms": elapsed_ms,
+            })
             self.telemetry.record(run, "llm_call", **rec)
 
     def critic_for(self, producer_tag: str) -> Any:
@@ -1390,6 +1440,10 @@ class LLMPool:
 
     def status_summary(self) -> str:
         parts = []
+        if getattr(self, "registry_error", ""):
+            parts.append(f"registry ✗ {self.registry_error[:60]}")
+        else:
+            parts.append(f"registry ✓ {Path(self.registry.config_source).name}")
         parts.append("local Qwen" if self.local_up else f"local DOWN -> {self.settings.beam_free_model}")
         if not self.settings.opencode_api_key:
             parts.append("cloud ✗ (no OPENCODE_API_KEY)")
@@ -3096,10 +3150,10 @@ class DashboardState:
         self.calls = 0
         self.in_tokens = 0
         self.out_tokens = 0
-        self.cost = 0.0
+        self.cost = Decimal("0")
         self.errors = 0
         self.tier_tokens: dict[str, int] = {k: 0 for k in TIER_LABEL}
-        self.tier_cost: dict[str, float] = {k: 0.0 for k in TIER_LABEL}
+        self.tier_cost: dict[str, Decimal] = {k: Decimal("0") for k in TIER_LABEL}
         self.oracle_runs = 0
         self.oracle_fails = 0
         self.critic_runs = 0
@@ -3131,9 +3185,9 @@ class DashboardState:
         self.goal = goal or self.goal
         self.tasks.clear()
         self.calls = self.in_tokens = self.out_tokens = self.errors = 0
-        self.cost = 0.0
+        self.cost = Decimal("0")
         self.tier_tokens = {k: 0 for k in TIER_LABEL}
-        self.tier_cost = {k: 0.0 for k in TIER_LABEL}
+        self.tier_cost = {k: Decimal("0") for k in TIER_LABEL}
         self.oracle_runs = self.oracle_fails = 0
         self.critic_runs = self.critic_fails = self.critic_unavailable = 0
         self.loops = 0
@@ -3175,14 +3229,21 @@ class DashboardState:
             card.calls += 1
             card.in_tokens += inc
             card.out_tokens += out
-            tier = str(e.get("tier") or model_tier(card.model))
-            spend = estimate_cost(card.model, inc, out)
+            billing = _event_billing(e)
+            try:
+                spend = Decimal(str(e.get("cost") or "0"))
+            except (InvalidOperation, ValueError):
+                spend = Decimal("0")
+            if not bool(e.get("billable", billing == "payg")):
+                spend = Decimal("0")
+            if not bool(e.get("cost_known", True)):
+                spend = Decimal("0")
             self.calls += 1
             self.in_tokens += inc
             self.out_tokens += out
             self.cost += spend
-            self.tier_tokens[tier] = self.tier_tokens.get(tier, 0) + inc + out
-            self.tier_cost[tier] = self.tier_cost.get(tier, 0.0) + spend
+            self.tier_tokens[billing] = self.tier_tokens.get(billing, 0) + inc + out
+            self.tier_cost[billing] = self.tier_cost.get(billing, Decimal("0")) + spend
         elif ev in ("task_start", "task_built", "task_rebuilt", "task_verified",
                     "task_unverified", "task_failed", "task_skipped"):
             tid = str(e.get("task") or "?")
@@ -3308,9 +3369,12 @@ class DashboardState:
         total_tok = self.in_tokens + self.out_tokens
         table.add_row("tokens", Text(f"{_hum(total_tok)}  {_hum(self.in_tokens)}↓{_hum(self.out_tokens)}↑",
                                      style="bold white"))
-        paid = self.tier_cost.get("paid", 0.0)
-        table.add_row("custo", Text(f"${self.cost:.4f} " + (f"pago {paid:.4f}" if paid else "grátis"),
-                                    style="green"))
+        payg = self.tier_cost.get("payg", Decimal("0"))
+        quota = self.tier_tokens.get("subscription", 0) + self.tier_tokens.get("free_quota", 0)
+        detail = f"payg {payg:.4f}"
+        if quota:
+            detail += f" · quota {_hum(quota)}"
+        table.add_row("custo", Text(f"${self.cost:.4f}  {detail}", style="green"))
         done = sum(1 for t in self.tasks.values() if t.status == "verified")
         bad = sum(1 for t in self.tasks.values()
                   if t.status in ("failed", "failed-verification"))
@@ -3338,7 +3402,9 @@ class DashboardState:
     def render_tier_bar(self) -> Text:
         total = sum(self.tier_tokens.values()) or 1
         out = Text()
-        for tier, letter in (("local", "L"), ("gemini", "G"), ("free", "F"), ("paid", "P")):
+        for tier, letter in (("local", "L"), ("free_quota", "Q"),
+                             ("subscription", "S"), ("payg", "P"),
+                             ("unknown", "U")):
             n = self.tier_tokens.get(tier, 0)
             if not n:
                 continue

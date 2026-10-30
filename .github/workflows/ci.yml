@@ -31,6 +31,8 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p01_*.py"
       - name: P2 core tests
         run: python -m unittest discover -s tests -p "test_p02_*.py"
+      - name: P3 core tests
+        run: python -m unittest discover -s tests -p "test_p03_*.py"
 
   integration:
     name: Integration (py3.13)
@@ -67,3 +69,5 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p01_*.py"
       - name: P2 core tests
         run: python -m unittest discover -s tests -p "test_p02_*.py"
+      - name: P3 core tests
+        run: python -m unittest discover -s tests -p "test_p03_*.py"

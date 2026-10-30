@@ -18,10 +18,13 @@ class IdentityTests(unittest.TestCase):
                          r.BILLING_FREE)
 
     def test_billing_comes_from_profile_not_name(self):
-        gemini = r.ref_for("gemini-plus", "gemini-4-argon")
+        gemini = r.ref_for("gemini-plus", "gemini-3.5-flash")
         self.assertEqual(gemini.provider, "google")
         self.assertEqual(gemini.endpoint, "gemini")
         self.assertEqual(gemini.billing, r.BILLING_SUBSCRIPTION)
+        argon = r.ref_for("opencode-go", "gemini-4-argon")
+        self.assertEqual(argon.billing, r.BILLING_SUBSCRIPTION)
+        self.assertEqual(argon.provider, "opencode")
 
         deepseek_api = r.ref_for("deepseek-api", "deepseek-v4-pro")
         deepseek_go = r.ref_for("opencode-go", "deepseek-v4-pro")

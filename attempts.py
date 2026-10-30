@@ -54,7 +54,8 @@ class AttemptCollector:
 
     def finish(self, attempt_id: str, outcome: str,
                error: Optional[str] = None,
-               served_id: str = "") -> Optional[AttemptEvent]:
+               served_id: str = "",
+               served_ref: Optional[ModelRef] = None) -> Optional[AttemptEvent]:
         with self._lock:
             event = self._open.pop(attempt_id, None)
         if event is None:
@@ -63,7 +64,9 @@ class AttemptCollector:
         event.attempt.outcome = outcome
         if error:
             event.attempt.errors.append(str(error)[:500])
-        if served_id:
+        if served_ref is not None:
+            event.attempt.model = served_ref
+        elif served_id:
             event.attempt.model = ref_from_handle(
                 _RefCarrier(event.attempt.model), served_id=served_id)
         with self._lock:
