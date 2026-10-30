@@ -99,7 +99,7 @@ que não existem no HTML. É esta a rede que apanha o caso `#title-screen` vs
 ## Pointing at a folder ("trabalha na pasta X")
 
 If your instruction contains a folder path (e.g. `@~/projetos/foo` or a bare
-`/home/miguel/projetos/foo`), the system reads the folder into a bounded,
+`/home/user/projetos/foo`), the system reads the folder into a bounded,
 privacy-safe context brief (file tree + contents) and injects it into the spec
 and build prompts. It:
 
