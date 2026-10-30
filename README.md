@@ -1,42 +1,172 @@
-# Agent Pool TUI
+# crew-tui — Hierarchical AI Software Factory
 
-Multi-agent pool system wrapped in an async Textual TUI. No CrewAI — a native
-deterministic orchestrator (`SPEC → BUILD → VERIFY`) over a dual-API LangChain
-pool. Fully **portable**: auto-detects a local `llama.cpp` worker and falls back
-to a cloud model when it is down.
+[![CI](https://github.com/miguelserra/crew-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/miguelserra/crew-tui/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)](#windows-11)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-## Principles
+A deterministic, **verifiable** multi-agent software factory in a terminal UI.
+Instead of letting one LLM "just write code", it freezes a spec, splits the work
+into atomic tasks, routes each task to a capable model, and refuses to deliver
+anything that fails an external oracle plus a cross-model critic.
+
+- **Pipeline:** SPEC → (human gate) → BUILD → VERIFY → DONE, plus a resumable
+  9-step factory (requirements → scaffold → architecture → build → fix →
+  integrate → visual → sign-off).
+- **Verification is not optional:** `py_compile` / `node --check` / Playwright
+  (console errors + DOM-contract audit) plus a critic from a **different model
+  family** that must produce falsifiable objections.
+- **Cost-aware routing:** sunk-cost Gemini first, local Qwen for cheap work,
+  paid DeepSeek only off-peak, subscription models as a last resort.
+- **Portable:** Linux and Windows power backends, `.env`-driven, no CrewAI.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    U[You] -->|goal| S[SPEC<br/>SpecContract]
+    S -->|human gate "go"| B[BUILD<br/>atomic tasks]
+    B --> R{Model router}
+    R -->|cheap| L[Local Qwen / Gemini Flash]
+    R -->|strong| P[Gemini Pro / DeepSeek off-peak]
+    B --> V[VERIFY]
+    V --> O[Oracle: py_compile / node / Playwright]
+    V --> C[Critic: different model family]
+    O --> D{pass?}
+    C --> D
+    D -->|no| F[Fix loop] --> B
+    D -->|yes| G[DONE + project_memory.json]
+```
+
+Design principles:
 
 - **SPEC** — a Pydantic `SpecContract` (goal, non-negotiables, measurable
   acceptance criteria, small tasks) is co-designed with you and frozen **before**
   any code is generated.
 - **VERIFY** — two independent levers:
-  1. an external **oracle** (`py_compile` + optional `ruff`);
+  1. an external **oracle** (`py_compile` + optional `ruff` / `node --check`);
   2. a **cross-model critic** (a different model family that must emit
      falsifiable objections, never praise), plus a mandatory fix loop.
 - **ENVIRONMENT** — persistent `.env` config, deterministic context guard
   (local worker never receives >`LOCAL_SAFE_TOKENS` tokens; large contexts go
-  through Gemini), thread-safe callback layer (no `print()`).
+  through a larger model), thread-safe callback layer (no `print()`).
 
-## Install (portable)
+## Quick start (Linux / macOS)
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # then edit: add your keys
+cp .env.example .env        # then add your keys (see below)
+python main.py              # or: ./run.sh
 ```
 
-Requires Python 3.10+ (tested on 3.14). `crewai` is **not** used, so there is no
-`Python <3.14` constraint.
+Requires Python 3.10+ (tested on 3.14). `crewai` is **not** used.
+
+## Windows 11
+
+Use the bundled PowerShell scripts:
+
+```powershell
+# From the project folder, in PowerShell:
+.\setup.ps1 -Playwright -Node   # venv + deps + %APPDATA%\crew-tui\.env
+notepad $env:APPDATA\crew-tui\.env   # add your keys
+.\run.ps1                            # TUI
+.\run.ps1 --factory "build a todo app" --project C:\dev\todo --yes
+```
+
+- `setup.ps1` creates `.venv`, installs `requirements-windows.txt`, and copies
+  the config template. `-Playwright` installs Chromium for the visual audit;
+  `-Node` installs Node.js (for JS/TS oracle checks).
+- The Windows power backend keeps the PC awake and pauses at peak **without
+  suspending** (it waits awake until off-peak).
+- On Windows the config lives in `%APPDATA%\crew-tui\.env`; on Linux/macOS in
+  `~/.config/crew-tui/.env`. A project-local `.env` overrides both.
+
+## Set your API keys
+
+Configuration is read from, in order of precedence (highest wins):
+
+1. real environment variables;
+2. a project-local `.env`;
+3. the per-user config (`%APPDATA%\crew-tui\.env` on Windows,
+   `~/.config/crew-tui/.env` on Linux/macOS);
+4. built-in defaults.
+
+Every key is **optional** — roles degrade gracefully (e.g. no cloud key means
+local + Gemini only). The minimum useful setup is one strong cloud key:
+
+```dotenv
+# Pick what you have; all are optional.
+GEMINI_API_KEY=...        # large context + multimodal critic, free tier
+DEEPSEEK_API_KEY=...      # pay-as-you-go, used off-peak for hard reasoning
+OPENCODE_API_KEY=...      # OpenAI-compatible subscription gateway (last resort)
+OPENROUTER_API_KEY=...    # optional free models
+```
+
+Then set the model names you want (see the next section). Keys are never
+written to disk by the app beyond the `.env` file you edit yourself, and
+`.env` is git-ignored. Never commit real keys.
+
+## Adapting to other models or providers
+
+All model selection is **environment-driven** — there is no hard-coded model
+allowlist (the only table with model names is the dashboard's cost estimate).
+
+### Role → variable → default
+
+| Role | Variable | Default |
+|---|---|---|
+| Manager / spec | `FIELD_MARSHAL_MODEL` | `deepseek-v4-pro` |
+| Manager 429 fallback | `FALLBACK_MODEL` | `kimi-k3.1-pro` |
+| Architect / planner | `ARCHITECT_MODEL` | `kimi-k3.1-pro` |
+| Gemini workhorse | `GEMINI_MODEL` | `gemini-3.5-flash` |
+| Gemini Pro / critic | `GEMINI_PRO_MODEL` | `gemini-3.1-pro-preview` |
+| Fast cloud worker | `FAST_CLOUD_MODEL` | `deepseek-v4.1-flash` |
+| Reviewer / argon | `REVIEW_MODEL` | `gemini-4-argon` |
+| Senior dev / fixer | `SENIOR_MODEL` | `big-pickle` |
+| Local worker | `LOCAL_MODEL_NAME` | `qwen3.6-35b-a3b` |
+
+To swap models, change the value and (if needed) the endpoint:
+
+```dotenv
+# Any OpenAI-compatible gateway (OpenRouter, DeepSeek, vLLM, Ollama, LM Studio…)
+OPENCODE_BASE_URL=https://api.openai.com/v1   # or your gateway
+OPENCODE_API_KEY=sk-...
+FIELD_MARSHAL_MODEL=gpt-5.1
+ARCHITECT_MODEL=gpt-5.1-mini
+FAST_CLOUD_MODEL=gpt-5.1-mini
+```
+
+### Run fully local
+
+Point the worker at a local OpenAI-compatible server and leave cloud keys empty:
+
+```dotenv
+LOCAL_LLM_URL=http://127.0.0.1:8081/v1     # llama.cpp / vLLM / Ollama / LM Studio
+LOCAL_MODEL_NAME=your-local-model
+LOCAL_START_CMD=                            # e.g. ollama serve, optional
+# no OPENCODE/GEMINI/DEEPSEEK keys -> roles fall back to local only
+```
+
+### Add a brand-new provider
+
+The pool wraps four client types in `main.py` (`LLMPool`): `_cloud` (generic
+OpenAI-compatible), `_gemini` (native Google), `_openrouter`, and `_deepseek`.
+Most providers need **no code** — use `OPENCODE_BASE_URL` + `_cloud`. Only a
+provider with a non-OpenAI protocol needs a new `_yourprovider()` builder and a
+line in `_build()`; the role chains then pick it up. Per-role reasoning is
+controlled by the `THINK_*` variables.
 
 ## Run
 
 ```bash
-crew-tui        # launcher instalado em ~/.local/bin (usa o venv automaticamente)
-# ou manualmente:
-cd ~/ai-stack/crew-tui && source .venv/bin/activate && python main.py
+./run.sh                 # uses .venv automatically
+# or manually:
+source .venv/bin/activate && python main.py
 ```
+
+On Windows use `.\run.ps1`.
 
 Type an instruction and press Enter. The flow:
 
@@ -258,3 +388,33 @@ Event kinds: `run_start`, `spec_frozen`, `spec_refined`, `spec_fallback`,
 The whole state lives inside the project directory (`logs/`, `specs/`,
 `workspace/`, `.env`). To migrate to another machine, copy/`rsync` the project
 folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
+
+## Project layout
+
+| Path | What it is |
+|---|---|
+| `main.py` | Config, `LLMPool` (model routing), `Verifier`, `Orchestrator`, Textual TUI, CLI |
+| `factory.py` | 9-step resumable factory + Playwright audit + DOM-contract check |
+| `peak.py` | Pure peak/off-peak window helpers (shared, no I/O) |
+| `power.py` | Platform dispatcher (Linux vs Windows) |
+| `power_linux.py` | `systemd-inhibit` keep-awake + RTC alarm/suspend gate |
+| `power_win.py` | `SetThreadExecutionState` keep-awake + pause-awake gate |
+| `scripts/crew-sleep` | Root helper that arms the RTC alarm / suspends (Linux) |
+| `scripts/install-crew-sleep.sh` | One-time root install + sudoers rule |
+| `setup.ps1`, `run.ps1` | Windows bootstrap and launcher |
+| `tests/` | Regression tests for the power policy (Linux + Windows) |
+
+## Tests & CI
+
+```bash
+.venv/bin/python tests/test_power.py        # Linux backend
+python tests/test_power_win.py              # Windows backend (on Windows)
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) byte-compiles every module and runs
+the power tests on Linux (Python 3.12 and 3.13) and on Windows (Python 3.13).
+The Linux RTC/suspend integration test is skipped on headless CI runners.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

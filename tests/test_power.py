@@ -4,6 +4,7 @@ Run from the repo root with:
     .venv/bin/python tests/test_power.py
 """
 
+import os
 import subprocess
 import sys
 import time
@@ -132,6 +133,8 @@ def test_gate_early_wake_re_suspends():
 def test_idle_guard():
     if shutil.which("systemd-inhibit") is None:
         return  # power integration is Linux/systemd-specific
+    if os.environ.get("CI") and not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return  # no login session / logind in CI runners
     try:
         probe = subprocess.run(["systemd-inhibit", "--list"], capture_output=True,
                                text=True, timeout=5)
@@ -260,7 +263,7 @@ def test_gate_guard_balance():
 def test_run_helper_uses_sudo():
     """The RTC helper must be invoked through `sudo -n` (root-only sysfs)."""
     import tempfile
-    import power as pw
+    import power_linux as pw
 
     with tempfile.NamedTemporaryFile() as tf:
         settings = types.SimpleNamespace(sleep_helper=tf.name)

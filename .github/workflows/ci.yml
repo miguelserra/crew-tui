@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Byte-compile
+        run: python -m py_compile main.py factory.py power.py power_linux.py power_win.py peak.py
+      - name: Power policy tests
+        run: python tests/test_power.py
+
+  windows:
+    name: Windows (py3.13)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Byte-compile
+        run: python -m py_compile main.py factory.py power.py power_linux.py power_win.py peak.py
+      - name: Windows backend tests
+        run: python tests/test_power_win.py
