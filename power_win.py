@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from peak import next_offpeak_start
+from peak import is_peak_at, next_offpeak_start, parse_windows
 
 UTC = timezone.utc
 Emit = Callable[[str, str], None]

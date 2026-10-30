@@ -43,10 +43,10 @@ def test_make_power_type_and_guard():
     gate = power_win.make_power(make_settings(), pool, lambda tag, text: None)
     assert type(gate).__name__ == "WindowsOffpeakGate"
     gate.start()
-    assert gate.guard.depth == 1
+    assert gate.guard.active is True
     gate.before_step("noop")  # sleep_offpeak=False -> return immediately
     gate.stop()
-    assert gate.guard.depth == 0
+    assert gate.guard.active is False
 
 
 def test_guard_execution_state():
