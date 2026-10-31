@@ -25,3 +25,11 @@ Only mandatory fields and BLOCKING interview decisions can block architecture.
 `WorkflowEngine.start_brief()` / `update_brief()` accept partial dictionaries.
 `/brief field=value` (TUI) and `--brief FILE` (CLI) support partial data.
 Saving and loading preserves all supplied values and undecided markers.
+
+
+## TUI initial entry
+
+`/brief {json}` or `/brief field=value; field2=value` before a project starts
+the project with the brief and skips the legacy model requirements draft.
+After initialisation, `/brief`, `/brief show`, `/brief questions`,
+`/answer ID=value`, `/defer ID` and `/approve-spec` manage the interview.

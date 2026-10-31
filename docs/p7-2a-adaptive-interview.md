@@ -39,8 +39,9 @@ survive state reload; answered questions are not repeated.
 
 ## TUI / CLI
 
-TUI commands: `/brief`, `/brief show`, `/brief questions`, `/brief field=value`,
-`/answer ID=value`, `/defer ID`, `/approve-spec`.
+TUI commands: `/brief {json}` or `/brief field=value` to start with a brief,
+then `/brief`, `/brief show`, `/brief questions`, `/answer ID=value`, `/defer ID`
+and `/approve-spec`.
 
 CLI: `--brief FILE`, repeatable `--answer ID=VALUE`, repeatable `--defer ID`,
 `--show-brief` and explicit `--approve-spec`.

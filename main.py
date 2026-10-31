@@ -3746,6 +3746,7 @@ class CrewTUIApp(App):
         self.factory: Optional[Any] = None
         self.engine: Optional[Any] = None
         self._factory_mode = False
+        self._pending_brief: Optional[dict[str, Any]] = None
 
     # -- lifecycle ---------------------------------------------------------- #
 
@@ -4035,6 +4036,12 @@ class CrewTUIApp(App):
         self._factory_mode = True
         self._write(tagged("CREW", f"projeto: {root} · motor: {kind} · estado: {persistence}",
                            bold=True))
+        if self._pending_brief is not None:
+            data = self._pending_brief
+            self._pending_brief = None
+            self.engine.start_brief(data)
+            self._present_factory_brief()
+            return
         if resume and self.factory.state.requirements:
             self._write(tagged("SYSTEM", f"a retomar do passo {self.factory.state.step} …"))
             self._set_phase("BUILD")
@@ -4086,6 +4093,22 @@ class CrewTUIApp(App):
             self._write(tagged("SYSTEM", "responde numa linha, ou 'go' para arrancar já.", bold=True))
         else:
             self._write(tagged("SYSTEM", "sem perguntas. Escreve 'go' para arrancar.", bold=True))
+        self._set_phase("PLAN")
+        self._busy = False
+
+    def _present_factory_brief(self) -> None:
+        summary = self.engine.brief_summary()
+        self._clear_progress()
+        self._write(tagged("BRIEF", f"objetivo: {summary.get('objective', '')}",
+                           bold=True))
+        for blocker in summary.get("blockers") or []:
+            self._write(tagged("SYSTEM", f"bloqueio: {blocker}"))
+        for q in summary.get("questions") or []:
+            if q.get("status") == "OPEN":
+                self._write(tagged("BRIEF", f"{q['question_id']} [{q['priority']}] "
+                                            f"{q['question']}"))
+        self._write(tagged("SYSTEM", "usa /answer ID=texto, /defer ID, /brief show, "
+                                     "e /approve-spec.", bold=True))
         self._set_phase("PLAN")
         self._busy = False
 
@@ -4223,11 +4246,33 @@ class CrewTUIApp(App):
     NEW_PROJECT_RE = re.compile(r"\b(novo projeto|outro projeto|de raiz|from scratch|começa do zero)\b", re.I)
 
     def _brief_command(self, text: str) -> None:
-        if self.engine is None or not self._factory_mode:
-            self._write(tagged("SYSTEM", "inicia um projeto antes de usar /brief."))
-            return
         word, _, rest = text.partition(" ")
         rest = rest.strip()
+        if self.engine is None or not self._factory_mode:
+            if word == "/brief" and rest and not rest.startswith("show") \
+                    and not rest.startswith("questions"):
+                try:
+                    if rest.startswith("{"):
+                        payload = json.loads(rest)
+                    else:
+                        payload = {}
+                        for item in re.split(r"[;,]", rest):
+                            if "=" in item:
+                                key, value = item.split("=", 1)
+                                payload[key.strip()] = value.strip()
+                    goal = (payload.get("main_objective")
+                            or payload.get("project_description")
+                            or payload.get("project_name"))
+                    if goal:
+                        self._pending_brief = payload
+                        self._start_factory(goal)
+                        return
+                except Exception as exc:
+                    self._write(tagged("SYSTEM", f"/brief: {exc}"))
+                    return
+            self._write(tagged("SYSTEM", "usa /brief {json} ou /brief campo=valor "
+                                         "para iniciar, ou inicia um projeto primeiro."))
+            return
         try:
             if word == "/brief" and rest == "":
                 self._write(tagged("BRIEF", json.dumps(
