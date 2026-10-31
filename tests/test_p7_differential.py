@@ -20,15 +20,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import engine
+import native_adapter
+import visual as visual_m
+import state as s
+from registry import ModelRef
+from attempts import AttemptEvent
+from publish import PublishConflict
+
 try:
     import main
-    import engine
-    import native_adapter
-    import visual as visual_m
-    import state as s
-    from registry import ModelRef
-    from attempts import AttemptEvent
-    from publish import PublishConflict
 except Exception as exc:  # pragma: no cover
     DEPS_OK = False
     DEPS_ERR = str(exc)
