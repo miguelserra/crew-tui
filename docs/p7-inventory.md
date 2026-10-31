@@ -43,6 +43,7 @@ Baseline: `p6.1-gate` (`86f2df1`).
 | differential report | generated matrix + uncovered items | `docs/p7-differential-report.md` |
 | publisher recovery | fault injection at each journal/apply/rollback boundary + real os._exit subprocess | rollback-only; COMMITTED/ROLLED_BACK/RECOVERY_REQUIRED; never false COMMITTED; orphans detected/cleaned explicitly |
 | P7.1d gate | D01–D12 matrix | **CLOSED**: 5 COVERED / 29 PARTIAL / 1 MISSING / 13 N/A; no DIVERGENT in executed cells |
+| full pipeline harness | real Router/RouteChain/CallLedger + fake transport | `tests/test_p7_pipeline.py`: 429 fallback, PAYG timeout→UNKNOWN, CONFIRMED replay; shared-component evidence, not adapter parity |
 | `calls.py` | durable PAYG call ledger + result artifacts | PENDING/SUBMITTED/CONFIRMED/UNKNOWN/FAILED; text-only replay with full invocation fingerprint; history dedup; no silent PAYG retry; resume gate |
 | integration fixer | one call + affected task ids + producer | revalidates changed artefacts (oracle+critic), invalidates stale PASS |
 

@@ -64,6 +64,15 @@ PENDING = [
      "retenção) e o envio condicionado a essa declaração."),
 ]
 
+PIPELINE = [
+    ("Real Router+RouteChain 429 -> fallback seguro",
+     "test_d04_429_falls_back_to_next_candidate"),
+    ("Real ledger: timeout PAYG -> UNKNOWN, 1 invocação",
+     "test_d05_timeout_payg_is_unknown_single_invocation"),
+    ("Real ledger: CONFIRMED replay sem nova invocação",
+     "test_d06_confirmed_replays_without_new_invocation"),
+]
+
 PUBLISHER = [
     ("Crash antes do journal (projecto intacto)",
      "test_crash_before_journal_leaves_project_untouched"),
@@ -114,19 +123,19 @@ MATRIX = [
     }),
     ("D04", "Technical fallback", {
         "EXECUTION": ("COVERED", "quota/timeout/all-unavailable differential cassettes"),
-        "MODELS_BILLING_LEDGER": ("PARTIAL", "fallback emulated in fake pool; real classify_error/router not exercised"),
+        "MODELS_BILLING_LEDGER": ("PARTIAL", "real classify_error/RouteChain exercised in test_p7_pipeline; adapter parity still missing"),
         "VERIFICATION": ("PARTIAL", "no verification in fallback scenarios"),
         "PUBLICATION": ("N/A", "no publication required"),
     }),
     ("D05", "PAYG safety and UNKNOWN", {
         "EXECUTION": ("PARTIAL", "P4 RouteChain/engine tests, not adapter differential"),
-        "MODELS_BILLING_LEDGER": ("PARTIAL", "ledger shared logic tested; no adapter ledger parity"),
+        "MODELS_BILLING_LEDGER": ("PARTIAL", "real ledger/UNKNOWN tested in test_p7_pipeline; no adapter ledger parity"),
         "VERIFICATION": ("N/A", "no verification involved"),
         "PUBLICATION": ("N/A", "no publication required"),
     }),
     ("D06", "CONFIRMED replay and recovery", {
         "EXECUTION": ("PARTIAL", "P4 ledger/replay tests, not adapter differential"),
-        "MODELS_BILLING_LEDGER": ("PARTIAL", "shared ledger tested; no adapter ledger parity"),
+        "MODELS_BILLING_LEDGER": ("PARTIAL", "real replay tested in test_p7_pipeline; no adapter ledger parity"),
         "VERIFICATION": ("N/A", "no verification involved"),
         "PUBLICATION": ("N/A", "no publication required"),
     }),
@@ -246,6 +255,14 @@ def run_safety() -> list[tuple[str, str, str, str]]:
     return rows
 
 
+def run_pipeline() -> list[tuple[str, str, str, str]]:
+    rows = []
+    for label, method in PIPELINE:
+        status = _run_one("tests.test_p7_pipeline", "FullPipelineTests", method)
+        rows.append((label, f"FullPipelineTests.{method}", "", status))
+    return rows
+
+
 def run_publisher() -> list[tuple[str, str, str, str]]:
     rows = []
     for label, method in PUBLISHER:
@@ -262,7 +279,7 @@ def matrix_counts():
     return counts
 
 
-def render(rows, safety, publisher) -> str:
+def render(rows, safety, publisher, pipeline) -> str:
     lines = [
         "# P7 differential equivalence report (P7.1d)",
         "",
@@ -349,6 +366,19 @@ def render(rows, safety, publisher) -> str:
         lines.append(f"| {label} | {status} | `{name}` |")
     lines += [
         "",
+        "## Full pipeline (real Router + RouteChain + CallLedger, fake transport)",
+        "",
+        "These exercise the real routing/classification/ledger components with "
+        "only the provider transport simulated. They are shared-component "
+        "evidence, not adapter-level parity.",
+        "",
+        "| Caso | Estado | Teste |",
+        "|---|---|---|",
+    ]
+    for label, name, _dims, status in pipeline:
+        lines.append(f"| {label} | {status} | `{name}` |")
+    lines += [
+        "",
         "## Publisher crash-recovery (P6.1)",
         "",
         "Policy: recovery is **rollback-only**. A crash after every file was "
@@ -401,11 +431,12 @@ def main() -> int:
     rows = run_scenarios()
     safety = run_safety()
     publisher = run_publisher()
+    pipeline = run_pipeline()
     out = ROOT / "docs" / "p7-differential-report.md"
-    out.write_text(render(rows, safety, publisher), encoding="utf-8")
-    failed = [r for r in rows + safety + publisher if r[3] == "Falha"]
+    out.write_text(render(rows, safety, publisher, pipeline), encoding="utf-8")
+    failed = [r for r in rows + safety + publisher + pipeline if r[3] == "Falha"]
     print(f"wrote {out}")
-    for label, _name, _dims, status in rows + safety + publisher:
+    for label, _name, _dims, status in rows + safety + publisher + pipeline:
         print(f"  {status:10} {label}")
     return 1 if failed else 0
 

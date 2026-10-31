@@ -61,15 +61,15 @@ Cell totals: **5 COVERED**, **29 PARTIAL**, **1 MISSING**, **13 N/A**.
 | D03 | VERIFICATION | PARTIAL | no escalation-specific verification comparison |
 | D03 | PUBLICATION | N/A | no publication required |
 | D04 | EXECUTION | COVERED | quota/timeout/all-unavailable differential cassettes |
-| D04 | MODELS_BILLING_LEDGER | PARTIAL | fallback emulated in fake pool; real classify_error/router not exercised |
+| D04 | MODELS_BILLING_LEDGER | PARTIAL | real classify_error/RouteChain exercised in test_p7_pipeline; adapter parity still missing |
 | D04 | VERIFICATION | PARTIAL | no verification in fallback scenarios |
 | D04 | PUBLICATION | N/A | no publication required |
 | D05 | EXECUTION | PARTIAL | P4 RouteChain/engine tests, not adapter differential |
-| D05 | MODELS_BILLING_LEDGER | PARTIAL | ledger shared logic tested; no adapter ledger parity |
+| D05 | MODELS_BILLING_LEDGER | PARTIAL | real ledger/UNKNOWN tested in test_p7_pipeline; no adapter ledger parity |
 | D05 | VERIFICATION | N/A | no verification involved |
 | D05 | PUBLICATION | N/A | no publication required |
 | D06 | EXECUTION | PARTIAL | P4 ledger/replay tests, not adapter differential |
-| D06 | MODELS_BILLING_LEDGER | PARTIAL | shared ledger tested; no adapter ledger parity |
+| D06 | MODELS_BILLING_LEDGER | PARTIAL | real replay tested in test_p7_pipeline; no adapter ledger parity |
 | D06 | VERIFICATION | N/A | no verification involved |
 | D06 | PUBLICATION | N/A | no publication required |
 | D07 | EXECUTION | COVERED | quality recovery differential |
@@ -124,6 +124,16 @@ Regras aplicadas pelo comparador: timestamps/UUIDs são normalizados (ALLOWED_VA
 | Fingerprint inclui contrato de geração | Verde | `RouteChainLedgerTests.test_replay_requires_same_generation_contract` |
 | Resposta estruturada não é replayable | Verde | `RouteChainLedgerTests.test_structured_response_is_not_replayable` |
 | History reconciliada sem duplicar evento | Verde | `EngineCallGateTests.test_history_reconciliation_dedups_critic_event` |
+
+## Full pipeline (real Router + RouteChain + CallLedger, fake transport)
+
+These exercise the real routing/classification/ledger components with only the provider transport simulated. They are shared-component evidence, not adapter-level parity.
+
+| Caso | Estado | Teste |
+|---|---|---|
+| Real Router+RouteChain 429 -> fallback seguro | Verde | `FullPipelineTests.test_d04_429_falls_back_to_next_candidate` |
+| Real ledger: timeout PAYG -> UNKNOWN, 1 invocação | Verde | `FullPipelineTests.test_d05_timeout_payg_is_unknown_single_invocation` |
+| Real ledger: CONFIRMED replay sem nova invocação | Verde | `FullPipelineTests.test_d06_confirmed_replays_without_new_invocation` |
 
 ## Publisher crash-recovery (P6.1)
 
