@@ -92,6 +92,15 @@ SAFETY = [
     ("Resolução incompatível rejeitada",
      "tests.test_p04_calls", "LedgerTests",
      "test_resolve_failed_rejects_persisted_result"),
+    ("Fingerprint inclui contrato de geração",
+     "tests.test_p04_calls", "RouteChainLedgerTests",
+     "test_replay_requires_same_generation_contract"),
+    ("Resposta estruturada não é replayable",
+     "tests.test_p04_calls", "RouteChainLedgerTests",
+     "test_structured_response_is_not_replayable"),
+    ("History reconciliada sem duplicar evento",
+     "tests.test_p04_calls", "EngineCallGateTests",
+     "test_history_reconciliation_dedups_critic_event"),
 ]
 
 

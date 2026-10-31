@@ -35,6 +35,9 @@ The gate is **closed**. Every applicable scenario must be green in both paths wi
 | PENDING/SUBMITTED bloqueiam | Verde | `EngineCallGateTests.test_pending_and_submitted_pause` |
 | Engine marca call consumido | Verde | `EngineCallGateTests.test_engine_marks_call_consumed_from_attempt` |
 | Resolução incompatível rejeitada | Verde | `LedgerTests.test_resolve_failed_rejects_persisted_result` |
+| Fingerprint inclui contrato de geração | Verde | `RouteChainLedgerTests.test_replay_requires_same_generation_contract` |
+| Resposta estruturada não é replayable | Verde | `RouteChainLedgerTests.test_structured_response_is_not_replayable` |
+| History reconciliada sem duplicar evento | Verde | `EngineCallGateTests.test_history_reconciliation_dedups_critic_event` |
 
 ## Comparator
 

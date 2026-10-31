@@ -132,6 +132,7 @@ class WorkflowEngine:
         self.persistence = persistence if persistence in ("crew", "factory") else "crew"
         self._last_ok: dict[str, ModelRef] = {}
         self.call_ledger: Optional[CallLedger] = None
+        self._seen_call_ids: set[str] = set()
 
     # -- pool wiring -------------------------------------------------------- #
 
@@ -148,10 +149,7 @@ class WorkflowEngine:
                 calls_path = (self.store.staging_path(self.state.run_id).parent /
                               "calls.json")
             self.call_ledger = CallLedger(calls_path)
-            referenced = [a.call_id for t in self.state.tasks for a in t.attempts
-                          if a.call_id]
-            if referenced:
-                self.call_ledger.mark_consumed_many(referenced)
+            self._seen_call_ids.update(self._call_ids_from_state())
             if getattr(pool, "router", None) is not None:
                 pool.router.call_ledger = self.call_ledger
         except CallLedgerError as exc:
@@ -171,10 +169,30 @@ class WorkflowEngine:
 
     # -- attempts ----------------------------------------------------------- #
 
+    def _call_ids_from_state(self) -> set[str]:
+        ids = {a.call_id for t in self.state.tasks for a in t.attempts
+               if a.call_id}
+        for entry in self.state.history:
+            attempt = entry.get("attempt") if isinstance(entry, dict) else None
+            if isinstance(attempt, dict) and attempt.get("call_id"):
+                ids.add(str(attempt["call_id"]))
+        return ids
+
+    def _already_persisted(self, attempt: TaskAttempt) -> bool:
+        if attempt.call_id and attempt.call_id in self._seen_call_ids:
+            if self.call_ledger is not None:
+                self.call_ledger.mark_consumed(attempt.call_id)
+            return True
+        return False
+
     def on_attempt(self, event: AttemptEvent) -> None:
         attempt: TaskAttempt = event.attempt
+        if self._already_persisted(attempt):
+            return
         if event.tag in ("CRITIC", "VISUAL", "READER", "ORACLE", "TEST"):
             self.state.history.append({"kind": "attempt", **event.to_dict(), "at": utc_now()})
+            if attempt.call_id:
+                self._seen_call_ids.add(attempt.call_id)
             self.save()
             if attempt.call_id and self.call_ledger is not None:
                 self.call_ledger.mark_consumed(attempt.call_id)
@@ -188,6 +206,8 @@ class WorkflowEngine:
                 self._last_ok[task.id] = attempt.model
                 task.delivered_by = attempt.model
                 self.adapter.on_last_ok(task.id, attempt.model)
+        if attempt.call_id:
+            self._seen_call_ids.add(attempt.call_id)
         self.save()
         if attempt.call_id and self.call_ledger is not None:
             self.call_ledger.mark_consumed(attempt.call_id)

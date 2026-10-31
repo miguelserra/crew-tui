@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from budget import BudgetSuspended
-from calls import (CallOutcomeUnknown, request_fingerprint,
+from calls import (CallOutcomeUnknown, invocation_fingerprint,
                    set_call_context)
 from registry import (
     BILLING_LOCAL,
@@ -627,7 +627,7 @@ class RouteChain:
         last_error: Optional[BaseException] = None
         denied_paid = False
         ledger = getattr(self.router, "call_ledger", None)
-        fingerprint = request_fingerprint(messages)
+        fingerprint = invocation_fingerprint(messages, self.request)
         if ledger is not None and self.request.run_id:
             replay = ledger.find_replay(
                 self.request.run_id, self.request.task_id,
@@ -688,9 +688,14 @@ class RouteChain:
                     break
                 self.router.breaker.record_success(identity)
                 if record is not None:
+                    raw_content = getattr(response, "content", None)
+                    tool_calls = (getattr(response, "tool_calls", None)
+                                  or (getattr(response, "additional_kwargs", {}) or {})
+                                  .get("tool_calls"))
+                    replayable = isinstance(raw_content, str) and not tool_calls
                     set_call_context(record.call_id, candidate.ref)
                     ledger.confirm(record.call_id, served=candidate.ref,
-                                   text=content)
+                                   text=content, replayable=replayable)
                 self.router.charge(self.request, candidate, response)
                 return response
         if denied_paid:

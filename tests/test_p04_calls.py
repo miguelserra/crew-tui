@@ -64,12 +64,14 @@ class Header429(Exception):
     status_code = 429
 
 
-def chain_for(led, handlers, *, task="t", tag="DEV", run="r"):
+def chain_for(led, handlers, *, task="t", tag="DEV", run="r",
+              max_tokens=8192, thinking=False):
     ident = identity(BILLING_PAYG)
     candidates = [candidate(ident, h) for h in handlers]
     result = RouteResult(
         request=RouteRequest(role="programming", run_id=run,
-                             task_id=task, tag=tag),
+                             task_id=task, tag=tag,
+                             max_tokens=max_tokens, thinking=thinking),
         candidates=candidates, router=FakeRouter(led))
     return result.chain
 
@@ -128,7 +130,7 @@ class LedgerTests(unittest.TestCase):
                              ref=ref_for(identity(BILLING_PAYG)),
                              task="t", tag="DEV", request_sha256="fp")
             led.submitted(rec.call_id)
-            led._write_result(rec, "survived")
+            led._write_result(rec, "survived", True)
             self.assertEqual(led.get(rec.call_id).state, SUBMITTED)
             again = CallLedger(path)
             self.assertEqual(again.get(rec.call_id).state, CONFIRMED)
@@ -236,6 +238,53 @@ class RouteChainLedgerTests(unittest.TestCase):
             self.assertTrue(response.response_metadata.get("replayed"))
             self.assertEqual(calls["n"], 0)
 
+    def test_replay_requires_same_generation_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            led = CallLedger(Path(td) / "calls.json")
+
+            def first(messages):
+                return types.SimpleNamespace(content="one")
+
+            chain1 = chain_for(led, [first], max_tokens=1000, thinking=False)
+            self.assertEqual(chain1.invoke(["hello"]).content, "one")
+
+            calls = {"n": 0}
+
+            def second(messages):
+                calls["n"] += 1
+                return types.SimpleNamespace(content="two")
+
+            chain2 = chain_for(led, [second], max_tokens=8000, thinking=True)
+            self.assertEqual(chain2.invoke(["hello"]).content, "two")
+            self.assertEqual(calls["n"], 1)
+
+    def test_structured_response_is_not_replayable(self):
+        with tempfile.TemporaryDirectory() as td:
+            led = CallLedger(Path(td) / "calls.json")
+
+            def structured(messages):
+                return types.SimpleNamespace(
+                    content=[{"type": "text", "text": "x"}],
+                    tool_calls=[{"name": "tool", "args": {}}])
+
+            chain1 = chain_for(led, [structured])
+            chain1.invoke(["hello"])
+            rec = led.all()[0]
+            self.assertFalse(rec.replayable)
+            self.assertIsNone(led.result_text(rec.call_id))
+            self.assertIsNone(led.find_replay("r", "t", "DEV",
+                                              rec.request_sha256))
+
+            calls = {"n": 0}
+
+            def text(messages):
+                calls["n"] += 1
+                return types.SimpleNamespace(content="plain")
+
+            chain2 = chain_for(led, [text])
+            self.assertEqual(chain2.invoke(["hello"]).content, "plain")
+            self.assertEqual(calls["n"], 1)
+
 
 class DummyAdapter:
     def step(self, phase):
@@ -312,6 +361,43 @@ class EngineCallGateTests(unittest.TestCase):
             from attempts import AttemptEvent
             eng.on_attempt(AttemptEvent(attempt=event, task="t", tag="DEV"))
             self.assertTrue(led.get(rec.call_id).consumed)
+
+    def test_history_reconciliation_dedups_critic_event(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = base / "proj"; proj.mkdir()
+            path = proj / ".crew" / "calls.json"
+            led = CallLedger(path)
+            rec = led.intent(run_id="r", role="critic",
+                             ref=ref_for(identity(BILLING_PAYG)),
+                             task="t", tag="CRITIC")
+            led.submitted(rec.call_id)
+            led.confirm(rec.call_id, text="crit")
+
+            store = StateManager(base / "ws", base / "logs")
+            st = s.ProjectState(run_id="r", goal="x", phase="BUILD",
+                                project_root=str(proj),
+                                engine_kind=s.ENGINE_UNIFIED)
+            st.history = [{
+                "kind": "attempt",
+                "attempt": {"call_id": rec.call_id, "attempt_id": "att_old",
+                            "model": ref_for(identity(BILLING_PAYG)).to_dict(),
+                            "outcome": "ok"},
+                "task": "t", "tag": "CRITIC", "at": "2026-01-01T00:00:00Z",
+            }]
+            eng = engine.WorkflowEngine(st, store, DummyAdapter())
+            pool = types.SimpleNamespace(
+                router=types.SimpleNamespace(), telemetry=None,
+                attempt_sink=None, dispatch_guard=None)
+            eng.apply_pool(pool)
+
+            from attempts import AttemptEvent
+            event = s.TaskAttempt(attempt_id="att_new",
+                                  model=ref_for(identity(BILLING_PAYG)),
+                                  outcome="ok", call_id=rec.call_id)
+            eng.on_attempt(AttemptEvent(attempt=event, task="t", tag="CRITIC"))
+            self.assertEqual(len(st.history), 1)
+            self.assertTrue(eng.call_ledger.get(rec.call_id).consumed)
 
 
 if __name__ == "__main__":

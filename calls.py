@@ -80,6 +80,24 @@ def request_fingerprint(messages: Iterable[Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
 
 
+def invocation_fingerprint(messages: Iterable[Any], request: Any = None) -> str:
+    """Fingerprint of the messages plus every generation parameter that changes
+    the semantic contract of the response (not routing/bookkeeping fields)."""
+    payload: dict[str, Any] = {"messages": [message_text(m) for m in messages]}
+    if request is not None:
+        payload["contract"] = {
+            "role": getattr(request, "role", ""),
+            "max_tokens": getattr(request, "max_tokens", None),
+            "thinking": bool(getattr(request, "thinking", False)),
+            "capabilities": sorted(getattr(request, "required_capabilities", ()) or ()),
+            "escalation": bool(getattr(request, "escalation", False)),
+            "response_format": getattr(request, "response_format", None),
+            "tools": getattr(request, "tools", None),
+        }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
+
+
 class CallLedgerError(Exception):
     """The ledger/result store is corrupt or the requested operation is invalid."""
 
@@ -109,6 +127,7 @@ class CallRecord:
     served: dict[str, Any] = field(default_factory=dict)
     result_sha256: str = ""
     result_chars: int = 0
+    replayable: bool = True
     consumed: bool = False
     error: str = ""
     error_kind: str = ""
@@ -140,6 +159,7 @@ class CallRecord:
             served=dict(data.get("served") or {}),
             result_sha256=str(data.get("result_sha256") or ""),
             result_chars=int(data.get("result_chars") or 0),
+            replayable=bool(data.get("replayable", True)),
             consumed=bool(data.get("consumed") or False),
             error=str(data.get("error") or ""),
             error_kind=str(data.get("error_kind") or ""),
@@ -188,16 +208,18 @@ class CallLedger:
     def _result_path(self, call_id: str) -> Path:
         return self.result_dir / f"{call_id}.json"
 
-    def _write_result(self, rec: CallRecord, text: str) -> None:
+    def _write_result(self, rec: CallRecord, text: str,
+                      replayable: bool) -> None:
         atomic_write_json(self._result_path(rec.call_id), {
-            "version": 1,
+            "version": 2,
             "call_id": rec.call_id,
             "request_sha256": rec.request_sha256,
+            "replayable": bool(replayable),
             "sha256": hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest(),
             "text": text,
         })
 
-    def result_text(self, call_id: str) -> Optional[str]:
+    def _read_result(self, call_id: str) -> Optional[tuple[str, bool]]:
         path = self._result_path(call_id)
         if not path.is_file():
             return None
@@ -215,7 +237,15 @@ class CallLedger:
         if rec is not None and rec.request_sha256 and data.get("request_sha256") \
                 and data.get("request_sha256") != rec.request_sha256:
             return None
-        return text
+        return text, bool(data.get("replayable", True))
+
+    def result_text(self, call_id: str) -> Optional[str]:
+        """Text available for replay; structured responses are explicit non-goals."""
+        raw = self._read_result(call_id)
+        if raw is None:
+            return None
+        text, replayable = raw
+        return text if replayable else None
 
     # -- lifecycle ---------------------------------------------------------- #
 
@@ -250,15 +280,16 @@ class CallLedger:
         return self._transition(call_id, SUBMITTED)
 
     def confirm(self, call_id: str, *, served: Any = None,
-                text: str = "") -> CallRecord:
+                text: str = "", replayable: bool = True) -> CallRecord:
         with self._lock:
             rec = self._require(call_id)
             if served is not None:
                 rec.served = (served.to_dict() if hasattr(served, "to_dict")
                               else dict(served))
+            rec.replayable = bool(replayable)
             if text:
                 try:
-                    self._write_result(rec, text)
+                    self._write_result(rec, text, rec.replayable)
                 except Exception as exc:
                     rec.state = UNKNOWN
                     rec.error = f"resultado não persistido: {exc}"[:500]
@@ -300,9 +331,9 @@ class CallLedger:
                 raise CallLedgerError(
                     "não posso confirmar sem o resultado persistido; "
                     "resolve como failed ou repõe o artefacto")
-            if outcome == "failed" and self._result_path(call_id).is_file():
+            if outcome == "failed" and self.result_text(call_id) is not None:
                 raise CallLedgerError(
-                    "existe resultado persistido; 'failed' contradiz a evidência")
+                    "existe resultado replayable; 'failed' contradiz a evidência")
             rec.state = CONFIRMED if outcome == "confirmed" else FAILED
             rec.resolved_by = "manual"
             rec.updated = utc_now()
@@ -316,10 +347,12 @@ class CallLedger:
             for rec in self._records.values():
                 if rec.state not in (SUBMITTED, UNKNOWN):
                     continue
-                text = self.result_text(rec.call_id)
-                if text is None:
+                raw = self._read_result(rec.call_id)
+                if raw is None:
                     continue
+                text, replayable = raw
                 rec.state = CONFIRMED
+                rec.replayable = replayable
                 rec.result_sha256 = hashlib.sha256(
                     text.encode("utf-8", "ignore")).hexdigest()
                 rec.result_chars = len(text)

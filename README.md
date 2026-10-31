@@ -315,10 +315,15 @@ clones. `calls.py` adds a durable PAYG call ledger (`PENDING`, `SUBMITTED`,
 instead of retrying/falling back, unresolved calls block resume, and
 `--resolve-call ID --call-outcome` provides manual resolution. Result text is
 persisted atomically under `.crew/call_results` before `CONFIRMED`; a resumed
-workflow replays a confirmed result whose request fingerprint matches, without
-contacting the provider, and marks the call consumed only when the attempt is
-committed to state. Interrupted `SUBMITTED` calls with a surviving result are
-reconciled to `CONFIRMED`. The machine-generated report lives in
+workflow replays a confirmed result whose invocation fingerprint matches
+(messages plus max_tokens, thinking, capabilities, escalation, response format
+and tools), without contacting the provider, and marks the call consumed only
+when the attempt is committed to state. The replay contract is explicitly
+text-only: a structured/tool-call response is persisted for audit but not
+replayable, and blocks recovery until resolved. Interrupted `SUBMITTED` calls
+with a surviving result are reconciled to `CONFIRMED`; `history` call ids are
+reconciled at startup so a replayed critic/visual call cannot duplicate an
+event. The machine-generated report lives in
 `docs/p7-differential-report.md` (`tools/p7_differential_report.py`). Still
 pending before the gate opens: provider-declared idempotency headers and full
 crash-recovery journal replay. The runtime still uses `FactoryAdapter` and
