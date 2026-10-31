@@ -51,6 +51,48 @@ def canon_attempts(task) -> list:
     return [(canon_model(a.model), a.outcome) for a in task.attempts]
 
 
+EQUIVALENT = "EQUIVALENT"
+ALLOWED_VARIANCE = "ALLOWED_VARIANCE"
+DIVERGENT = "DIVERGENT"
+
+
+def semantic_verdicts(ref, native, ws_f, ws_n):
+    """Classify each compared dimension: EQUIVALENT / ALLOWED_VARIANCE / DIVERGENT."""
+    rows = []
+
+    def add(dimension, verdict, detail=""):
+        rows.append({"dimension": dimension, "verdict": verdict,
+                     "detail": detail})
+
+    for name in ("app.py", "util.py"):
+        a = (ws_f / name).read_text()
+        b = (ws_n / name).read_text()
+        add("artefacto", EQUIVALENT if a == b else DIVERGENT, name)
+
+    for a, b in zip(ref.project.tasks, native.project.tasks):
+        if (a.id, a.status, a.target_file) == (b.id, b.status, b.target_file):
+            add("tarefa", EQUIVALENT, a.id)
+        else:
+            add("tarefa", DIVERGENT, a.id)
+        am = [(canon_model(x.model), x.outcome) for x in a.attempts]
+        bm = [(canon_model(x.model), x.outcome) for x in b.attempts]
+        add("tentativas", EQUIVALENT if am == bm else DIVERGENT, a.id)
+        add("tentativas.ids", ALLOWED_VARIANCE,
+            "uuid/timestamps normalizados por tarefa")
+        add("produtor", EQUIVALENT
+            if canon_model(a.delivered_by) == canon_model(b.delivered_by)
+            else DIVERGENT, a.id)
+        cv = canon_verification(ref.project, a.id)
+        dv = canon_verification(native.project, b.id)
+        add("verificação", EQUIVALENT if cv == dv else DIVERGENT, a.id)
+
+    ri = ref.project.integration.get("verdict")
+    ni = native.project.integration.get("verdict")
+    add("integração", EQUIVALENT if ri == ni else DIVERGENT,
+        f"{ri} vs {ni}")
+    return rows
+
+
 def canon_verification(project, task_id) -> dict:
     rec = project.verifications[task_id]
     critic = rec.critic or {}
@@ -279,6 +321,20 @@ class DifferentialSmokeTests(unittest.TestCase):
             self.assertEqual(ref.project.integration.get("verdict"),
                              native.project.integration.get("verdict"))
             self.assertFalse((ws_n / ".factory").exists())
+
+    def test_semantic_classification_no_divergence(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            ref, native, (ws_f, ws_n) = self._pair(base)
+            for phase in ("BUILD", "INTEGRATE", "SIGNOFF"):
+                self.assertTrue(ref.step(phase), phase)
+                self.assertTrue(native.step(phase), phase)
+            ref.sync_to_project()
+            rows = semantic_verdicts(ref, native, ws_f, ws_n)
+            divergent = [r for r in rows if r["verdict"] == DIVERGENT]
+            self.assertFalse(divergent, divergent)
+            self.assertTrue(any(r["verdict"] == EQUIVALENT for r in rows))
+            self.assertTrue(any(r["verdict"] == ALLOWED_VARIANCE for r in rows))
 
     def test_build_quality_recovery_fail_then_fix(self):
         with tempfile.TemporaryDirectory() as td:

@@ -20,6 +20,17 @@ The gate is **closed**. Differential equivalence must be green in both paths wit
 | Resume após BUILD | Verde | `test_resume_after_build_preserves_evidence` | evidência preservada, sem tentativas duplicadas |
 | Publicação normal (sandboxes) | Verde | `test_publication_parity` | manifest, hashes, ficheiros publicados, journal |
 | Publicação com conflito | Verde | `test_publication_conflict_parity` | detecção de conflito e recusa |
+| Classificação semântica (sem DIVERGENTE) | Verde | `test_semantic_classification_no_divergence` | artefactos/tarefas/tentativas/produtor/verificação/integração; uuid/timestamps como ALLOWED_VARIANCE |
+
+## Semantic classification
+
+| Veredicto | Significado |
+|---|---|
+| EQUIVALENT | Mesmo valor semântico (conteúdo, ModelRef, veredicto, evidência). |
+| ALLOWED_VARIANCE | Diferença irrelevante: UUIDs, timestamps, caminhos temporários, ordem de escrita; relações entre entidades preservadas. |
+| DIVERGENT | Diferença material: artefacto/hash diferente, uma chamada PAYG adicional, uma tentativa de fallback extra, um PASS sem a mesma evidência, um projecto publicado com hashes diferentes. |
+
+Regras aplicadas pelo comparador: timestamps/UUIDs são normalizados (ALLOWED_VARIANCE); chamadas efectivas, tentativas, produtores e evidência de verificação são comparadas e qualquer diferença material é DIVERGENT. A equivalência de facturação/ledger entre motores é demonstrada pela suite P4 (a mesma lógica de ledger/RouteChain é partilhada); a matriz diferencial compara execução, artefactos, tentativas e verificação.
 
 ## Billing safety (PAYG ledger)
 

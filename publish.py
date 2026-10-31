@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -112,21 +113,36 @@ def _safe_path(root: Path, rel: str) -> Path:
     return target
 
 
-def _fsync_dir(path: Path) -> None:
-    """Persist a directory entry after replace on POSIX. Windows has no portable
-    directory fsync; process-death recovery still applies there."""
+_UNSUPPORTED_ERRNOS = {errno.EINVAL, errno.ENOTSUP, errno.EBADF, errno.EROFS,
+                        errno.EISDIR, errno.EOPNOTSUPP}
+
+
+def _fsync_dir(path: Path) -> str:
+    """Persist a directory entry after replace.
+
+    Returns "ok" on success, "unsupported" when the filesystem cannot fsync a
+    directory (documented best-effort), and raises on a real I/O error such as
+    EIO so the publisher never overstates durability. Windows has no portable
+    directory fsync and is reported as "unsupported".
+    """
     if os.name == "nt":
-        return
+        return "unsupported"
     try:
         fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
-        return
+    except OSError as exc:
+        if exc.errno in _UNSUPPORTED_ERRNOS:
+            return "unsupported"
+        raise
     try:
-        os.fsync(fd)
-    except OSError:
-        pass
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            if exc.errno in _UNSUPPORTED_ERRNOS:
+                return "unsupported"
+            raise
     finally:
         os.close(fd)
+    return "ok"
 
 
 def _atom_write_from(src: Path, dest: Path) -> None:
@@ -144,12 +160,13 @@ def _atom_write_from(src: Path, dest: Path) -> None:
         if sha256_file(tmp) != sha256_file(src):
             raise PublishError(f"cópia divergente: {dest}")
         os.replace(tmp, dest)
-        _fsync_dir(dest.parent)
+        durability = _fsync_dir(dest.parent)
     finally:
         try:
             tmp.unlink()
         except Exception:
             pass
+    return durability
 
 
 class PublishManager:
@@ -167,6 +184,7 @@ class PublishManager:
         self.deletions = list(deletions or ())
         self.manifest = manifest
         self.fault = fault
+        self.durability_unconfirmed = False
         self.root = self.state_dir / "publish"
         self.marker = self.root / "RECOVERY_REQUIRED.json"
         self.lock_path = self.state_dir / "publish.lock"
@@ -203,12 +221,13 @@ class PublishManager:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, target)
-            _fsync_dir(path)
+            durability = _fsync_dir(path)
         finally:
             try:
                 tmp.unlink()
             except Exception:
                 pass
+        return durability
 
     def _mark_recovery(self, journal_id: str, reason: str) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -285,14 +304,23 @@ class PublishManager:
     # -- public API --------------------------------------------------------- #
 
     def publish(self) -> dict[str, Any]:
+        self.durability_unconfirmed = False
         with ProjectLock(self.lock_path):
             if self.recovery_required() is not None:
                 raise RecoveryRequired("publicação bloqueada: recuperação pendente")
-            recovered = self._recover_locked()
-            if recovered and recovered.get("status") in (STATUS_RECOVERY_REQUIRED,
-                                                          STATUS_REVALIDATION):
-                raise RecoveryRequired("publicação bloqueada: recuperação pendente")
-            return self._publish_locked()
+            try:
+                recovered = self._recover_locked()
+                if recovered and recovered.get("status") in (
+                        STATUS_RECOVERY_REQUIRED, STATUS_REVALIDATION):
+                    raise RecoveryRequired("publicação bloqueada: recuperação pendente")
+                result = self._publish_locked()
+            except PublishError:
+                raise
+            except OSError as exc:
+                raise PublishError(f"falha de persistência: {exc}") from exc
+            result["durability"] = ("unconfirmed" if self.durability_unconfirmed
+                                    else "confirmed")
+            return result
 
     def _publish_locked(self) -> dict[str, Any]:
         plan = plan_publish(self.project, self.workspace, self.origin,
@@ -343,23 +371,28 @@ class PublishManager:
                    "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                    "manifest": plan.manifest.to_dict() if plan.manifest else None,
                    "entries": entries}
-        self._write_journal(run_dir, journal)
+        if self._write_journal(run_dir, journal) == "unsupported":
+            self.durability_unconfirmed = True
         self._checkpoint("after_journal", run_dir=run_dir.name)
         journal["status"] = STATUS_PUBLISHING
-        self._write_journal(run_dir, journal)
+        if self._write_journal(run_dir, journal) == "unsupported":
+            self.durability_unconfirmed = True
         self._checkpoint("after_publishing", run_dir=run_dir.name)
         try:
             for item in journal["entries"]:
                 item["status"] = "applying"
-                self._write_journal(run_dir, journal)
+                if self._write_journal(run_dir, journal) == "unsupported":
+                    self.durability_unconfirmed = True
                 self._checkpoint("before_apply", rel=item["rel"])
                 self._apply(item)
                 item["status"] = "done"
-                self._write_journal(run_dir, journal)
+                if self._write_journal(run_dir, journal) == "unsupported":
+                    self.durability_unconfirmed = True
                 self._checkpoint("after_apply", rel=item["rel"])
             self._checkpoint("before_commit", run_dir=run_dir.name)
             journal["status"] = STATUS_COMMITTED
-            self._write_journal(run_dir, journal)
+            if self._write_journal(run_dir, journal) == "unsupported":
+                self.durability_unconfirmed = True
             self._clear_marker()
             self._checkpoint("after_commit", run_dir=run_dir.name)
             return {"id": run_dir.name, "status": STATUS_COMMITTED,
@@ -394,7 +427,8 @@ class PublishManager:
             src = Path(item["generated"])
             if not src.is_file() or sha256_file(src) != item["new_sha"]:
                 raise PublishError(f"artefacto gerado em falta/divergente: {rel}")
-            _atom_write_from(src, dest)
+            if _atom_write_from(src, dest) == "unsupported":
+                self.durability_unconfirmed = True
         new_current = sha256_file(dest) if dest.is_file() else ""
         expected = item["new_sha"] if item["action"] != "delete" else ""
         if new_current != expected:
@@ -535,9 +569,14 @@ class PublishManager:
             return self._orphans_locked()
 
     def clean_orphans(self, ids: Optional[Iterable[str]] = None,
-                      *, dry_run: bool = False) -> dict[str, Any]:
-        """Remove orphan run dirs only when explicitly named (or all if None)."""
+                      *, dry_run: bool = True) -> dict[str, Any]:
+        """Report orphans; remove only when explicit ids are given and dry_run
+        is False. A call without ids and with dry_run=False is rejected."""
         with ProjectLock(self.lock_path):
+            if ids is None and not dry_run:
+                raise PublishError(
+                    "clean_orphans: sem ids não removo; indica os ids ou "
+                    "mantém dry_run=True")
             orphans = {o["id"]: o for o in self._orphans_locked()}
             selected = sorted(orphans) if ids is None else [
                 _safe_rel(i) for i in ids]

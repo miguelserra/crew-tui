@@ -233,9 +233,50 @@ class RecoveryTests(unittest.TestCase):
             preview = mgr.clean_orphans(dry_run=True)
             self.assertEqual(preview["removed"], [])
             self.assertTrue(orphan.is_dir())
-            result = mgr.clean_orphans(["lonely"])
+            result = mgr.clean_orphans(["lonely"], dry_run=False)
             self.assertEqual(result["removed"], ["lonely"])
             self.assertFalse(orphan.exists())
+
+    def test_clean_orphans_default_never_removes(self):
+        with tempfile.TemporaryDirectory() as td:
+            project, work, state, origin = _setup(Path(td))
+            mgr = pub.PublishManager(project, work, state, origin)
+            orphan = mgr.root / "lonely"
+            orphan.mkdir(parents=True)
+            (orphan / "x").write_text("x", encoding="utf-8")
+            result = mgr.clean_orphans()
+            self.assertEqual(result["removed"], [])
+            self.assertTrue(orphan.exists())
+            with self.assertRaises(pub.PublishError):
+                mgr.clean_orphans(dry_run=False)
+
+    def test_durability_unconfirmed_is_reported(self):
+        with tempfile.TemporaryDirectory() as td:
+            project, work, state, origin = _setup(Path(td))
+            orig = pub._fsync_dir
+            pub._fsync_dir = lambda path: "unsupported"
+            try:
+                mgr = pub.PublishManager(project, work, state, origin)
+                result = mgr.publish()
+            finally:
+                pub._fsync_dir = orig
+            self.assertEqual(result["status"], "COMMITTED")
+            self.assertEqual(result["durability"], "unconfirmed")
+
+    def test_fsync_io_error_is_not_silently_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            project, work, state, origin = _setup(Path(td))
+            orig = pub._fsync_dir
+            import errno
+            def failing(path):
+                raise OSError(errno.EIO, "input/output error")
+            pub._fsync_dir = failing
+            try:
+                mgr = pub.PublishManager(project, work, state, origin)
+                with self.assertRaises(pub.PublishError):
+                    mgr.publish()
+            finally:
+                pub._fsync_dir = orig
 
     def test_orphan_cleanup_does_not_touch_journals(self):
         with tempfile.TemporaryDirectory() as td:
