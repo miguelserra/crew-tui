@@ -3235,7 +3235,8 @@ class Orchestrator:
                                      "file": str(written) if written else "",
                                      "chars": len(new_artifact),
                                      "critic": critic.get("verdict", "?"),
-                                     "escalated": True}
+                                     "escalated": True,
+                                     "verification": details.get("verification")}
             self._record("task_verified", task=task.id,
                          delivered=str(written) if written else None, escalated=True)
             self.emit("SYSTEM", f"✓ {task.id} verified (via escalação)")
