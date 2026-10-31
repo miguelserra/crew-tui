@@ -547,7 +547,7 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `scripts/crew-sleep` | Root helper that arms the RTC alarm / suspends (Linux) |
 | `scripts/install-crew-sleep.sh` | One-time root install + sudoers rule |
 | `setup.ps1`, `run.ps1` | Windows bootstrap and launcher |
-| `tests/` | Power, budget, P0/P1 foundation, P2 contracts and P3 registry tests |
+| `tests/` | Power, budget, P0/P1 foundation, P2 contracts, P3 registry and P4 router tests |
 
 ## Tests & CI
 
