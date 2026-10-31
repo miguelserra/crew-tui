@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Byte-compile
-        run: python -m py_compile main.py budget.py factory.py power.py power_linux.py power_win.py peak.py registry.py state.py store.py attempts.py engine.py router.py
+        run: python -m py_compile main.py budget.py factory.py power.py power_linux.py power_win.py peak.py registry.py state.py store.py attempts.py engine.py router.py verify.py
       - name: Power policy tests
         run: python tests/test_power.py
       - name: Budget breaker tests
@@ -35,6 +35,8 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p03_*.py"
       - name: P4 core tests
         run: python -m unittest discover -s tests -p "test_p04_*.py"
+      - name: P5 core tests
+        run: python -m unittest discover -s tests -p "test_p05_*.py"
 
   integration:
     name: Integration (py3.13)
@@ -62,7 +64,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Byte-compile
-        run: python -m py_compile main.py budget.py factory.py power.py power_linux.py power_win.py peak.py registry.py state.py store.py attempts.py engine.py router.py
+        run: python -m py_compile main.py budget.py factory.py power.py power_linux.py power_win.py peak.py registry.py state.py store.py attempts.py engine.py router.py verify.py
       - name: Windows backend tests
         run: python tests/test_power_win.py
       - name: Budget breaker tests
@@ -75,3 +77,5 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p03_*.py"
       - name: P4 core tests
         run: python -m unittest discover -s tests -p "test_p04_*.py"
+      - name: P5 core tests
+        run: python -m unittest discover -s tests -p "test_p05_*.py"

@@ -38,7 +38,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from main import (LANG_SUFFIX, LLMPool, Settings, Verifier,
                   extract_code_blocks_typed, extract_json_block, guess_lang)
-from state import StateCorruptError
+import verify as verify_policy
+from registry import ModelRef
+from state import StateCorruptError, VerificationRecord
 from power import make_power
 
 ROLES = ("ANALYST", "SCAFFOLD", "ARCHITECT", "DEV", "TEST", "INTEG", "VISUAL", "SIGN")
@@ -119,6 +121,7 @@ class TaskState:
     # Historical per-call identity (schema-compatible, optional).
     attempt_log: list[dict[str, Any]] = field(default_factory=list)
     delivered_by: Optional[dict[str, Any]] = None
+    verification: Optional[dict[str, Any]] = None
     requirement_ids: list[str] = field(default_factory=list)
     legacy_extra: dict[str, Any] = field(default_factory=dict)
 
@@ -192,6 +195,7 @@ class Factory:
         (self.dir / "backups").mkdir(exist_ok=True)
         self.state_path = self.dir / "state.json"
         self.state = self._load()
+        self.verifier = Verifier(settings, pool, emit, telemetry)
         self.run_id = getattr(self.state, "run_id", "") or (
             telemetry.new_run() if telemetry is not None else "")
         if self.run_id and not getattr(self.state, "run_id", ""):
@@ -275,7 +279,14 @@ class Factory:
         return routed.chain, tag
 
     def on_attempt(self, event: Any) -> None:
-        """Record every candidate call in the legacy factory state."""
+        """Record generation attempts; verifier calls are evidence, not producers."""
+        if getattr(event, "tag", "") in ("CRITIC", "VISUAL", "READER", "ORACLE", "TEST"):
+            self.state.history.append({"kind": "attempt", **event.to_dict(), "at": _now()})
+            try:
+                self.save()
+            except Exception:
+                pass
+            return
         task_id = getattr(event, "task", "")
         if task_id:
             for ts in self.state.tasks:
@@ -600,19 +611,58 @@ No prose, no placeholders, no elided sections.
             if fixed is None:
                 return False
             cand, code = fixed
-        # optional unit test (python only, deterministic)
+        # Local Qwen test is advisory: it may inform a fix, never block alone.
+        test_result: dict[str, Any] = {"verdict": "SKIP", "advisory": True}
         if lang == "python" and self.settings.test_oracle:
             test_ok, test_err = self._unit_test(task, cand)
+            test_result = {"verdict": "PASS" if test_ok else "FAIL",
+                           "advisory": True, "note": test_err[:400]}
             if not test_ok:
-                task.errors.append(test_err)
-                self.log("test", f"{task.id} teste falhou:\n{test_err}")
-                fixed = self._fix(task, cand, test_err, attempts=2)
-                if fixed is None:
-                    return False
-                cand, code = fixed
-        self._install(task, cand, code)
-        self.log("build", f"{task.id} entregue em {task.target_file}")
-        return True
+                self.emit("TEST", f"{task.id}: teste local FAIL (advisory)")
+                self.log("test", f"{task.id} teste advisory falhou:\n{test_err}")
+
+        # Mandatory critic / delivery gate before installing the file.
+        for gate_attempt in range(2):
+            producer = self.pool.last_attempt_model.get(task.id)
+            if producer is None and task.delivered_by:
+                producer = ModelRef.from_dict(task.delivered_by)
+            critic = self.verifier.run_critic(producer, task, code, self.run_id)
+            decision = verify_policy.decide_build(
+                True, critic, visual={"verdict": verify_policy.NA},
+                tests=test_result,
+                allow_unverified=self.settings.allow_unverified)
+            record = VerificationRecord(
+                verdict=decision.verdict,
+                criterion_ids=list(task.requirement_ids),
+                oracle={"passed": True, "kind": "static"},
+                critic=critic if isinstance(critic, dict) else {},
+                visual={"verdict": verify_policy.NA},
+                tests=test_result,
+                reason="; ".join(decision.reasons),
+                at=_now(),
+            )
+            task.verification = record.to_dict()
+            self.save()
+            if decision.deliver:
+                self._install(task, cand, code)
+                self.log("build", f"{task.id} entregue em {task.target_file} "
+                                  f"(verdict {decision.verdict})")
+                if decision.verdict == verify_policy.UNVERIFIED:
+                    self.emit("SYSTEM", f"{task.id}: entregue UNVERIFIED por autorização explícita")
+                return True
+            if decision.verdict == verify_policy.UNVERIFIED:
+                self.emit("SYSTEM", f"{task.id}: UNVERIFIED — não entregue")
+                return False
+            objections = "\n".join(
+                str(o.get("claim") or o.get("why_wrong") or o)
+                for o in (critic.get("objections") or []) if isinstance(critic, dict))
+            feedback = objections or (critic.get("note") if isinstance(critic, dict) else "")
+            self.emit("CRITIC", f"{task.id}: FAIL — correção antes da entrega")
+            fixed = self._fix(task, cand, feedback or "critic FAIL", attempts=2)
+            if fixed is None:
+                return False
+            cand, code = fixed
+        return False
 
     def _fix(self, task: TaskState, cand: Path, error: str,
              attempts: int = 2) -> Optional[tuple[Path, str]]:
@@ -839,38 +889,43 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
 
     def step_visual(self) -> bool:
         if not (self.root / "index.html").is_file():
-            self.state.visual = {"verdict": "SKIP", "note": "projeto sem index.html"}
-            self.log("visual", "SKIP (sem index.html)")
+            self.state.visual = {"verdict": verify_policy.NA,
+                                 "note": "projeto sem index.html"}
+            self.log("visual", "N/A (sem index.html)")
             return True
         if not self.settings.visual_check:
-            self.state.visual = {"verdict": "SKIP", "note": "visual_check desligado"}
+            self.state.visual = {"verdict": verify_policy.NA,
+                                 "note": "visual_check desligado"}
             return True
         report = self.playwright_audit(self.root)
         png = report.get("screenshot")
-        if png and self.pool.gemini is not None:
+        vision: dict[str, Any] = {"verdict": verify_policy.NA}
+        if png:
             self.power.before_step("visual review")
-            verdict = self._vision_review(Path(png))
-            report["vision"] = verdict
-            if verdict.get("verdict") == "FAIL" and verdict.get("objections"):
+            vision = self._vision_review(Path(png))
+            report["vision"] = vision
+            if vision.get("verdict") == verify_policy.FAIL and vision.get("objections"):
                 self.power.before_step("visual fix")
-                self._visual_fix(verdict)
+                self._visual_fix(vision)
                 report = self.playwright_audit(self.root)
-                report["vision_retry"] = verdict
+                report["vision_retry"] = vision
         self.state.visual = report
         self.log("visual", json.dumps(report, ensure_ascii=False)[:8000])
         self.save()
-        ok = report.get("verdict") != "FAIL"
-        self.emit("VISUAL", f"verdict {report.get('verdict')}"
-                            + (f" ({len(report.get('console_errors', []))} console, "
-                               f"{len(report.get('page_errors', []))} page errors)"
-                               if ok else ""))
+        audit_ok = report.get("verdict") != "FAIL"
+        vverdict = verify_policy.normalize_verdict(
+            vision.get("verdict", verify_policy.NA))
+        ok = audit_ok and vverdict in (verify_policy.PASS, verify_policy.NA)
+        if vverdict == verify_policy.UNVERIFIED:
+            ok = bool(self.settings.allow_unverified) and audit_ok
+        self.emit("VISUAL", f"audit {report.get('verdict')} · vision {vverdict}")
         return ok
 
     def _vision_review(self, png: Path) -> dict[str, Any]:
         try:
             img = base64.b64encode(png.read_bytes()).decode()
         except Exception as e:
-            return {"verdict": "UNAVAILABLE", "note": str(e)}
+            return {"verdict": verify_policy.UNVERIFIED, "note": str(e)}
         acceptance = self.state.requirements.get("acceptance", [])
         prompt = f"""ACCEPTANCE CRITERIA:
 {chr(10).join(f'- {a}' for a in acceptance) or '- the UI matches the goal'}
@@ -880,16 +935,32 @@ GOAL: {self.state.goal}
 Check this screenshot. STRICT JSON:
 {{"verdict": "PASS"|"FAIL",
   "objections": [{{"claim": str, "evidence": str, "fix": str}}]}}"""
+        from router import RouteRequest
+        request = RouteRequest(
+            role="visual", required_capabilities=frozenset({"vision"}),
+            run_id=self.run_id or "", tag="VISUAL", max_tokens=8192,
+        )
+        routed = self.pool.router.route(request)
+        if not routed.candidates:
+            return {"verdict": verify_policy.UNVERIFIED,
+                    "note": "sem modelo multimodal disponível"}
         try:
-            llm = self.pool.gemini
             msg = HumanMessage(content=[{"type": "text", "text": prompt},
                                         {"type": "image_url",
                                          "image_url": {"url": f"data:image/png;base64,{img}"}}])
-            raw = self.pool.complete(llm, [SystemMessage(VISION_SYSTEM), msg],
-                                     meta={"run": None, "tag": "VISUAL"})
-            return _json_or_raise(raw, "vision")
+            raw = self.pool.complete(routed.chain, [SystemMessage(VISION_SYSTEM), msg],
+                                     meta={"run": self.run_id or None, "tag": "VISUAL"})
+            data = _json_or_raise(raw, "vision")
+            if routed.candidates:
+                data["vision"] = routed.candidates[0].ref.to_dict()
+            verdict = verify_policy.normalize_verdict(data.get("verdict"))
+            if verdict not in (verify_policy.PASS, verify_policy.FAIL):
+                return {"verdict": verify_policy.UNVERIFIED,
+                        "note": f"vision verdict inválido: {data.get('verdict')!r}"}
+            data["verdict"] = verdict
+            return data
         except Exception as e:
-            return {"verdict": "UNAVAILABLE", "note": str(e)[:300]}
+            return {"verdict": verify_policy.UNVERIFIED, "note": str(e)[:300]}
 
     def _visual_fix(self, verdict: dict[str, Any]) -> None:
         objections = json.dumps(verdict.get("objections", []), ensure_ascii=False)[:4000]

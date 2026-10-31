@@ -89,11 +89,13 @@ from engine import (
     migrate_state, new_unified_state, open_execution, resolve_engine,
 )
 from store import StateManager
-from state import (ProjectState, StateCorruptError, StateError, from_legacy_factory,
-                   new_id)
+from state import (ProjectState, StateCorruptError, StateError, VerificationRecord,
+                   from_legacy_factory, new_id)
+import verify as verify_policy
+from verify import UNVERIFIED, FAIL, NA, PASS as VERIFY_PASS
 from router import (
     CircuitBreaker, GrantStore, PaidGrant, RouteRequest, RouteResult, RouteChain,
-    Router, RouterExhausted, UnknownModelError, classify_error,
+    Router, RouterExhausted, UnknownModelError, classify_error, identity_key,
 )
 
 
@@ -183,6 +185,7 @@ class Settings:
     # the interactive override modal.
     allow_paid: bool = False
     allow_unknown: bool = False  # authorize models whose billing cannot be proved
+    allow_unverified: bool = False  # explicit delivery exception for UNVERIFIED
     payg_models: str = ""      # extra comma-separated ids that bill per token
     # Cost policy: during a peak UTC window, skip pay-as-you-go DeepSeek and
     # fall back to the already-paid Gemini Plus subscription.
@@ -289,6 +292,7 @@ class Settings:
             deepseek_model=env.get("DEEPSEEK_MODEL", "deepseek-v4-pro"),
             allow_paid=_env_bool(env, "ALLOW_PAID", False),
             allow_unknown=_env_bool(env, "ALLOW_UNKNOWN", False),
+            allow_unverified=_env_bool(env, "ALLOW_UNVERIFIED", False),
             payg_models=env.get("PAYG_MODELS", ""),
             peak_policy=_env_bool(env, "PEAK_POLICY", True),
             peak_windows=env.get("PEAK_WINDOWS_UTC", "01:00-04:00,06:00-10:00"),
@@ -722,6 +726,7 @@ class LLMPool:
         self.openrouter_pricing: dict[str, dict[str, Any]] = {}
         self.probes: dict[tuple[str, str], bool] = {}
         self._handle_cache: dict[tuple[Any, ...], Any] = {}
+        self.last_attempt_model: dict[str, ModelRef] = {}
         self.router = Router(
             self.registry, self._handle_for_identity,
             breaker=CircuitBreaker(Path(settings.log_dir) / "router_state.json"),
@@ -1287,6 +1292,13 @@ class LLMPool:
                                      _error_kind(e), error=str(e))
             raise
         finally:
+            ok_event = collector.last_ok(str(meta.get("task") or "") or None)
+            verifier_tags = {"CRITIC", "VISUAL", "READER", "ORACLE", "TEST"}
+            if ok_event is not None and tag not in verifier_tags:
+                if not hasattr(self, "last_attempt_model"):
+                    self.last_attempt_model = {}
+                self.last_attempt_model[ok_event.task or str(meta.get("task") or "")] = (
+                    ok_event.attempt.model)
             _ATTEMPT_CTX.reset(token)
             if self.attempt_sink is not None:
                 for event in collector.events():
@@ -1446,6 +1458,38 @@ class LLMPool:
             return "low"
         return "medium"
 
+    def critic_candidates(self, producer: Optional[ModelRef]) -> list[tuple[Any, ModelRef]]:
+        """Strong critics from a different family than the effective producer."""
+        if (producer is None or not producer.family
+                or producer.credential_profile in ("", "unknown")):
+            return []
+        specs = [
+            ("gemini-plus", "gemini-3.1-pro-preview"),
+            ("opencode-go", "kimi-k3.1-pro"),
+            ("openrouter", "nvidia/nemotron-3-ultra"),
+            ("opencode-go", "gemini-4-argon"),
+        ]
+        out: list[tuple[Any, ModelRef]] = []
+        seen: set[str] = set()
+        for profile, model_id in specs:
+            identity = self.registry.identity_for(profile, model_id)
+            if not identity.defined:
+                continue
+            if identity.family == producer.family:
+                continue
+            if not {"text"}.issubset(identity.capabilities):
+                continue
+            key = identity_key(identity)
+            if key in seen:
+                continue
+            seen.add(key)
+            handle = self._handle_for_identity(identity, "CRITIC", 16384, False)
+            if handle is None:
+                continue
+            ref = self.registry.ref_for_identity(identity)
+            out.append((handle, ref))
+        return out
+
     def team_llm(self, task: Any, run_id: str = "") -> tuple[Any, str]:
         """Route a task through the central policy (fallback inside RouteChain)."""
         team = getattr(task, "team", "programming")
@@ -1596,6 +1640,7 @@ class TaskSpec(BaseModel):
     status: str = "pending"
     attempts: list[dict] = Field(default_factory=list)
     delivered_by: Optional[dict] = None
+    verification: Optional[dict] = None
 
 
 class SpecContract(BaseModel):
@@ -1858,25 +1903,32 @@ class Verifier:
             return False
         return out_png.exists() and out_png.stat().st_size > 1500
 
-    def run_visual(self, task: TaskSpec, html_path: Path,
+    def run_visual(self, task: Any, html_path: Path,
                    run_id: Optional[str] = None) -> dict[str, Any]:
-        """Screenshot an HTML deliverable and ask a vision model if it makes sense."""
+        """Screenshot an HTML deliverable and use only a vision-capable model."""
         if html_path is None or not html_path.is_file():
-            return {"verdict": "SKIP", "objections": [], "note": "no html to render"}
+            return {"verdict": verify_policy.NA, "objections": [],
+                    "note": "no html to render"}
         ws = html_path.parent
         png = ws / f"{html_path.stem}_preview.png"
         ok = self.screenshot(html_path, png)
         if not ok:
-            return {"verdict": "UNAVAILABLE", "objections": [],
+            return {"verdict": verify_policy.UNVERIFIED, "objections": [],
                     "note": "screenshot failed (sem Firefox headless?)", "png": str(png)}
-        if self.pool.gemini is None:
-            self.emit("VISUAL", f"screenshot guardado: {png}")
-            return {"verdict": "UNAVAILABLE", "objections": [],
-                    "note": "sem Gemini para avaliar a imagem", "png": str(png)}
+        request = RouteRequest(role="visual", tag="VISUAL",
+                               required_capabilities=frozenset({"vision"}),
+                               task_id=str(task.id), run_id=run_id or "",
+                               max_tokens=8192)
+        routed = self.pool.router.route(request)
+        if not routed.candidates:
+            self.emit("VISUAL", f"screenshot guardado: {png} (sem modelo de visão)")
+            return {"verdict": verify_policy.UNVERIFIED, "objections": [],
+                    "note": "sem modelo multimodal disponível", "png": str(png)}
         try:
             img = base64.b64encode(png.read_bytes()).decode()
         except Exception as e:
-            return {"verdict": "UNAVAILABLE", "objections": [], "note": str(e), "png": str(png)}
+            return {"verdict": verify_policy.UNVERIFIED, "objections": [],
+                    "note": str(e), "png": str(png)}
         criteria = "; ".join(task.acceptance) if task.acceptance else "looks right"
         prompt = f"""You are reviewing a screenshot of a web deliverable to decide if it renders correctly.
 
@@ -1891,16 +1943,22 @@ PASS means the page rendered and visibly satisfies the acceptance criteria. FAIL
 concrete visual problems (broken layout, missing elements, blank canvas, overflow, errors)."""
         self.emit("VISUAL", f"{task.id}: a pedir ao modelo de visão para avaliar {png.name} …")
         try:
-            raw = self.pool.complete(self.pool.gemini, [
+            raw = self.pool.complete(routed.chain, [
                 HumanMessage(content=[
                     {"type": "text", "text": prompt},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}},
                 ]),
-            ])
+            ], meta={"run": run_id, "tag": "VISUAL", "task": task.id} if run_id else None)
             data = json.loads(extract_json_block(raw))
+            verdict = verify_policy.normalize_verdict(data.get("verdict"))
+            if verdict not in (verify_policy.PASS, verify_policy.FAIL):
+                raise ValueError(f"visual verdict inválido: {data.get('verdict')!r}")
+            data["verdict"] = verdict
             data["png"] = str(png)
+            if routed.candidates:
+                data["vision"] = routed.candidates[0].ref.to_dict()
         except Exception as e:
-            data = {"verdict": "UNAVAILABLE", "objections": [],
+            data = {"verdict": verify_policy.UNVERIFIED, "objections": [],
                     "note": f"vision check failed: {str(e)[:200]}", "png": str(png)}
         if self.telemetry and run_id:
             objs = data.get("objections", []) if isinstance(data, dict) else []
@@ -1952,26 +2010,25 @@ concrete visual problems (broken layout, missing elements, blank canvas, overflo
 
     # -- cross-model critic ------------------------------------------------- #
 
-    def run_critic(self, producer_tag: str, task: TaskSpec, artifact: str,
+    def run_critic(self, producer: Optional[ModelRef], task: Any, artifact: str,
                    run_id: Optional[str] = None, review: bool = False) -> dict[str, Any]:
-        primary = self.pool.critic_for(producer_tag)
-        # A rate-limited cloud critic must NOT mean "no review": fall back to the
-        # other model family so every artifact is still reviewed by someone else.
-        # Fallback chain is STRONG models only (never the weak local Qwen).
-        chain = [(primary, "primary"),
-                 (self.pool.critic_cloud, "cloud"),
-                 (self.pool.critic_gemini, "gemini"),
-                 (self.pool.critic_argon, "argon"),
-                 (self.pool.critic_openrouter, "openrouter")]
-        if review:
-            # review reports need a fast, non-reasoning critic: Argon first
-            chain.sort(key=lambda c: 0 if c[0] is self.pool.critic_argon else 1)
-        critics: list[tuple[Any, str]] = []
-        for cand, label in chain:
-            if cand is not None and all(cand is not c[0] for c in critics):
-                critics.append((cand, label))
+        """Mandatory critic, selected by the effective producer identity."""
+        producer_known = bool(producer and producer.family
+                              and producer.credential_profile not in ("", "unknown"))
+        base: dict[str, Any] = {
+            "verdict": "UNAVAILABLE", "objections": [], "critic": None,
+            "critic_family": "",
+            "producer": producer.to_dict() if producer else None,
+            "producer_family": producer.family if producer else "",
+            "producer_known": producer_known,
+            "note": "no cross-family critic available",
+        }
+        if not producer_known:
+            base["note"] = "effective producer identity unknown"
+            return base
+        critics = self.pool.critic_candidates(producer)
         if not critics:
-            return {"verdict": "UNAVAILABLE", "objections": [], "note": "no critic available"}
+            return base
 
         self.emit("CRITIC", f"cross-model review of {task.id} …")
         criteria = "\n".join(f"- {c}" for c in (task.acceptance or ["correctness", "safety"]))
@@ -1985,6 +2042,7 @@ concrete visual problems (broken layout, missing elements, blank canvas, overflo
             artifact_block = f"```{fence}\n{artifact[:8000]}\n```"
         prompt = f"""You are a ruthless critic of deliverables. You are FORBIDDEN to praise.
 
+Producer identity: {producer.model_id} (family {producer.family})
 Task: {task.title}
 {task.description}
 {f"Deliverable file: {task.target_file}" if task.target_file else ""}
@@ -2005,29 +2063,44 @@ an objection must name the exact line/section that is wrong and how a reviewer
 could falsify it. Style preferences, hypotheticals and "could be better" are NOT
 objections — omit them. If the artifact satisfies every acceptance criterion,
 answer PASS."""
-        data: dict[str, Any] = {"verdict": "UNAVAILABLE", "objections": [],
-                                "note": "no critic answered"}
-        for critic, label in critics:
+        last_note = "no critic answered"
+        for critic, ref in critics:
+            if not verify_policy.critic_is_valid(producer.family, ref.family, True):
+                continue
             try:
                 raw = self.pool.complete(critic, [
                     SystemMessage("You output valid JSON only."),
                     HumanMessage(prompt),
                 ], meta={"run": run_id, "tag": "CRITIC", "task": task.id} if run_id else None)
                 data = json.loads(extract_json_block(raw))
-                if label != "primary":
-                    self.emit("CRITIC", f"{task.id}: reviewed by {label} critic (primary unavailable)")
-                    data["critic_degraded"] = label
-                break
-            except Exception as e:
-                data = {"verdict": "UNAVAILABLE", "objections": [],
-                        "note": f"critic unavailable: {str(e)[:200]}"}
+                verdict = verify_policy.normalize_verdict(data.get("verdict"))
+                if verdict not in (verify_policy.PASS, verify_policy.FAIL):
+                    raise ValueError(f"critic verdict inválido: {data.get('verdict')!r}")
+                data.update({
+                    "verdict": verdict,
+                    "critic": ref.to_dict(),
+                    "critic_family": ref.family,
+                    "producer": producer.to_dict(),
+                    "producer_family": producer.family,
+                    "producer_known": True,
+                })
+                if self.telemetry and run_id:
+                    self.telemetry.record(run_id, "critic", task=task.id,
+                                          verdict=verdict,
+                                          critic_family=ref.family,
+                                          producer_family=producer.family,
+                                          critic_model=ref.model_id,
+                                          objections=len(data.get("objections") or []))
+                return data
+            except Exception as exc:
+                last_note = f"critic unavailable: {str(exc)[:200]}"
                 continue
+        base["note"] = last_note
         if self.telemetry and run_id:
-            objs = data.get("objections", []) if isinstance(data, dict) else []
             self.telemetry.record(run_id, "critic", task=task.id,
-                                  verdict=data.get("verdict") if isinstance(data, dict) else "?",
-                                  objections=len(objs))
-        return data
+                                  verdict="UNAVAILABLE", note=last_note,
+                                  producer_family=producer.family)
+        return base
 
 
 # --------------------------------------------------------------------------- #
@@ -2415,7 +2488,10 @@ class Orchestrator:
     # -- spec --------------------------------------------------------------- #
 
     def on_attempt(self, event: AttemptEvent) -> None:
-        """Record every candidate call in the legacy orchestrator run."""
+        """Record generation attempts; verifier calls are evidence, not producers."""
+        if event.tag in ("CRITIC", "VISUAL", "READER", "ORACLE", "TEST"):
+            self.history.append({"kind": "attempt", **event.to_dict()})
+            return
         if self.spec is not None and event.task:
             for task in self.spec.tasks:
                 if task.id == event.task:
@@ -2792,6 +2868,7 @@ class Orchestrator:
             producer = producer_tags[task.id]
             last_objections: list[Any] = []
             last_reason = ""
+            last_verdict = "FAIL"
 
             for attempt in range(1, self.settings.max_verify_loops + 1):
                 self.power.before_step(f"verify {task.id}")
@@ -2800,13 +2877,14 @@ class Orchestrator:
                 oracle = details.get("oracle") if isinstance(details, dict) else None
                 critic = details.get("critic", {}) if isinstance(details, dict) else {}
                 verdict = details.get("verdict", "FAIL") if isinstance(details, dict) else "FAIL"
+                last_verdict = verdict
                 if objections:
                     last_objections = objections
                 if oracle is not None and not oracle.passed:
                     last_reason = f"oracle: {oracle.stderr.strip()[:160]}"
                 elif verdict == "FAIL" and objections:
                     last_reason = f"critic: {str(objections[0].get('claim',''))[:160]}" if isinstance(objections[0], dict) else "critic FAIL"
-                elif verdict == "UNAVAILABLE":
+                elif verdict == verify_policy.UNVERIFIED:
                     last_reason = str(critic.get("note", ""))[:160] if isinstance(critic, dict) else ""
                 if isinstance(details, dict) and details.get("visual", {}).get("verdict") == "FAIL":
                     vobjs = details["visual"].get("objections", []) or []
@@ -2815,20 +2893,27 @@ class Orchestrator:
                     last_reason = "teste local FAIL: " + str(details["test_oracle"].get("note", ""))[:160]
 
                 if passed:
+                    status = "unverified" if verdict == verify_policy.UNVERIFIED else "verified"
                     task.status = "verified"
                     written = self._deliver(task, artifact)
                     self.results[task.id] = {
-                        "status": "verified", "team": task.team,
+                        "status": status, "team": task.team,
                         "file": str(written) if written else "",
                         "chars": len(artifact),
-                        "critic": verdict,
-                        "degraded": bool(isinstance(critic, dict) and critic.get("critic_degraded")),
+                        "critic": critic.get("verdict") if isinstance(critic, dict) else verdict,
+                        "verification": details.get("verification"),
+                        "unverified_override": verdict == verify_policy.UNVERIFIED,
                     }
                     self._record("task_verified", task=task.id,
-                                 delivered=str(written) if written else None)
-                    self.emit("SYSTEM", f"✓ {task.id} verified")
+                                 delivered=str(written) if written else None,
+                                 verdict=verdict)
+                    self.emit("SYSTEM", f"✓ {task.id} {status}")
                     if written:
                         self.emit("SYSTEM", f"{task.id} -> {written}")
+                    break
+
+                if verdict == verify_policy.UNVERIFIED:
+                    self.emit("SYSTEM", f"{task.id}: UNVERIFIED — sem entrega")
                     break
 
                 self.emit("SYSTEM", f"↻ feedback loop {attempt}/{self.settings.max_verify_loops} for {task.id}")
@@ -2852,9 +2937,10 @@ class Orchestrator:
                     self.emit("SYSTEM", f"fix failed: {e}")
                     break
             else:
-                if self.spec is not None and self.spec.review:
-                    # a review is advisory: deliver the report even if the critic
-                    # still objects (the objections are listed in the report header)
+                if (self.spec is not None and self.spec.review
+                        and last_verdict != verify_policy.UNVERIFIED):
+                    # review report can be delivered with documented objections,
+                    # but a missing/invalid critic is UNVERIFIED (no delivery).
                     task.status = "verified"
                     written = self._deliver(task, artifact)
                     self.results[task.id] = {
@@ -2869,6 +2955,16 @@ class Orchestrator:
                                         f"({len(last_objections)} objeção(ões) do crítico)")
                     if written:
                         self.emit("SYSTEM", f"{task.id} -> {written}")
+                    continue
+                if last_verdict == verify_policy.UNVERIFIED:
+                    task.status = "unverified"
+                    self.results[task.id] = {
+                        "status": "unverified", "team": task.team,
+                        "reason": last_reason or "crítico indisponível/não cross-family",
+                        "verification": task.verification,
+                    }
+                    self._record("task_unverified", task=task.id,
+                                 reason=last_reason[:200])
                     continue
                 escalated = self._escalate(task, artifact, producer, last_reason, last_objections)
                 if not escalated:
@@ -2886,6 +2982,16 @@ class Orchestrator:
                         self.emit("SYSTEM", f"  motivo: {last_reason[:200]}")
                     self._record("task_unverified", task=task.id, candidate=cand,
                                  reason=last_reason[:200])
+
+            if task.status == "built" and last_verdict == verify_policy.UNVERIFIED:
+                task.status = "unverified"
+                self.results[task.id] = {
+                    "status": "unverified", "team": task.team,
+                    "reason": last_reason or "UNVERIFIED sem entrega",
+                    "verification": task.verification,
+                }
+                self._record("task_unverified", task=task.id,
+                             reason=last_reason[:200])
 
         statuses: dict[str, int] = {}
         for t in self.spec.tasks:
@@ -2989,72 +3095,97 @@ class Orchestrator:
                          "correct language tag.")
         return "\n\n".join(parts)
 
+    def _producer_ref(self, task: TaskSpec) -> Optional[ModelRef]:
+        if getattr(task, "delivered_by", None):
+            return ModelRef.from_dict(task.delivered_by)
+        for attempt in reversed(getattr(task, "attempts", []) or []):
+            if attempt.get("outcome") == "ok" and attempt.get("model"):
+                return ModelRef.from_dict(attempt["model"])
+        return self.pool.last_attempt_model.get(task.id)
+
     def _check_artifact(self, task: TaskSpec, artifact: str, producer: str,
                         run_id: Optional[str]) -> tuple[bool, str, dict[str, Any]]:
-        """Run the full verification battery once and report. Returns (passed, feedback, details)."""
+        """Run evidence collection and the P5 delivery gate once."""
         target = self._target_for(task)
         suffix = Path(target).suffix if target else ""
         review = bool(self.spec is not None and self.spec.review)
+        producer_ref = self._producer_ref(task)
         if review:
             oracle = OracleResult(True, 0, stdout="review report — external oracle skipped")
         else:
             oracle = self.verifier.run_oracle(task.id, artifact, run_id, suffix=suffix)
-        critic = self.verifier.run_critic(producer, task, artifact, run_id, review=review)
+        critic = self.verifier.run_critic(producer_ref, task, artifact, run_id,
+                                          review=review)
         objections = critic.get("objections", []) if isinstance(critic, dict) else []
-        verdict = critic.get("verdict", "FAIL") if isinstance(critic, dict) else "FAIL"
 
-        visual: dict[str, Any] = {"verdict": "SKIP"}
+        visual: dict[str, Any] = {"verdict": verify_policy.NA}
         html_file = next((f for f in oracle.files if f.suffix in (".html", ".htm")), None)
         if html_file is not None and self.settings.visual_check:
             visual = self.verifier.run_visual(task, html_file, run_id)
-            vverdict = visual.get("verdict", "SKIP") if isinstance(visual, dict) else "SKIP"
-            vobjs = visual.get("objections", []) if isinstance(visual, dict) else []
-            if vverdict == "PASS":
-                self.emit("VISUAL", f"{task.id}: visual PASS")
-            elif vverdict == "FAIL":
-                self.emit("VISUAL", f"{task.id}: visual FAIL ({len(vobjs)} problema(s))")
-                for ob in vobjs[:3]:
-                    self.emit("VISUAL", f"  · {str(ob.get('claim',''))[:160]}" if isinstance(ob, dict) else f"  · {str(ob)[:160]}")
-            elif vverdict == "UNAVAILABLE":
-                self.emit("VISUAL", f"{task.id}: visual UNAVAILABLE ({visual.get('note','')})")
-            png = visual.get("png") if isinstance(visual, dict) else None
-            if png:
-                self.emit("VISUAL", f"{task.id}: screenshot em {png}")
+        vverdict = verify_policy.normalize_verdict(
+            visual.get("verdict", verify_policy.NA) if isinstance(visual, dict) else verify_policy.NA)
+        if vverdict == verify_policy.PASS:
+            self.emit("VISUAL", f"{task.id}: visual PASS")
+        elif vverdict == verify_policy.FAIL:
+            self.emit("VISUAL", f"{task.id}: visual FAIL ({len(visual.get('objections', []))} problema(s))")
+        elif vverdict == verify_policy.UNVERIFIED:
+            self.emit("VISUAL", f"{task.id}: visual UNVERIFIED ({visual.get('note','')})")
 
-        test_oracle: dict[str, Any] = {"verdict": "SKIP"}
+        test_oracle: dict[str, Any] = {"verdict": "SKIP", "advisory": True}
         if suffix in (".py",) and self.settings.test_oracle:
             test_oracle = self.verifier.run_test_oracle(task, artifact, run_id)
-            tv = test_oracle.get("verdict", "SKIP") if isinstance(test_oracle, dict) else "SKIP"
+            test_oracle["advisory"] = True
+            tv = str(test_oracle.get("verdict") or "SKIP")
             if tv == "PASS":
-                self.emit("TEST", f"{task.id}: teste local PASS")
+                self.emit("TEST", f"{task.id}: teste local PASS (advisory)")
             elif tv == "FAIL":
-                self.emit("TEST", f"{task.id}: teste local FAIL — {test_oracle.get('note','')[:160]}")
+                self.emit("TEST", f"{task.id}: teste local FAIL advisory — {test_oracle.get('note','')[:160]}")
             elif tv == "UNAVAILABLE":
                 self.emit("TEST", f"{task.id}: teste local UNAVAILABLE ({test_oracle.get('note','')})")
 
-        visual_fail = isinstance(visual, dict) and visual.get("verdict") == "FAIL"
-        test_fail = isinstance(test_oracle, dict) and test_oracle.get("verdict") == "FAIL"
-        passed = (oracle.passed and verdict in ("PASS", "UNAVAILABLE")
-                  and not objections and not visual_fail and not test_fail)
+        if review:
+            decision = verify_policy.decide_review(
+                critic, allow_unverified=self.settings.allow_unverified)
+        else:
+            decision = verify_policy.decide_build(
+                oracle.passed, critic, visual=visual, tests=test_oracle,
+                allow_unverified=self.settings.allow_unverified)
+        verdict = decision.verdict
+        passed = decision.deliver
 
         self.emit("ORACLE", oracle.render())
-        if verdict == "PASS":
-            self.emit("CRITIC", f"{task.id}: critic PASS")
-        elif verdict == "UNAVAILABLE":
-            note = critic.get("note", "") if isinstance(critic, dict) else ""
-            self.emit("CRITIC", f"{task.id}: critic UNAVAILABLE ({note}) — oracle-only verdict")
-            self._record("critic_unavailable", task=task.id, note=note[:200])
-        else:
+        cverdict = verify_policy.normalize_verdict(
+            critic.get("verdict") if isinstance(critic, dict) else "UNAVAILABLE")
+        if cverdict == verify_policy.PASS:
+            self.emit("CRITIC", f"{task.id}: critic PASS ({critic.get('critic_family','?')})")
+        elif cverdict == verify_policy.FAIL:
             self.emit("CRITIC", f"{task.id}: critic FAIL ({len(objections)} objection(s))")
             for ob in objections[:4]:
-                if isinstance(ob, dict):
-                    self.emit("CRITIC", f"  · {str(ob.get('claim',''))[:160]}")
-                else:
-                    self.emit("CRITIC", f"  · {str(ob)[:160]}")
+                self.emit("CRITIC", f"  · {str(ob.get('claim',''))[:160]}" if isinstance(ob, dict) else f"  · {str(ob)[:160]}")
+        else:
+            note = critic.get("note", "") if isinstance(critic, dict) else ""
+            self.emit("CRITIC", f"{task.id}: critic UNVERIFIED ({note})")
+            self._record("critic_unavailable", task=task.id, note=note[:200])
 
+        record = VerificationRecord(
+            verdict=verdict, criterion_ids=[],
+            oracle={"passed": oracle.passed, "exit_code": oracle.exit_code},
+            critic=critic if isinstance(critic, dict) else {},
+            visual=visual if isinstance(visual, dict) else {},
+            tests=test_oracle if isinstance(test_oracle, dict) else {},
+            reason="; ".join(decision.reasons),
+            at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
+        task.verification = record.to_dict()
+        self._record("verification", task=task.id, verdict=verdict,
+                     deliver=passed, reasons=decision.reasons[:4])
         feedback = self._feedback_text(oracle, critic, visual, test_oracle)
+        if decision.reasons:
+            feedback += "\nDELIVERY: " + "; ".join(decision.reasons)
         details = {"oracle": oracle, "critic": critic, "visual": visual,
-                   "test_oracle": test_oracle, "objections": objections, "verdict": verdict}
+                   "test_oracle": test_oracle, "objections": objections,
+                   "verdict": verdict, "decision": decision.to_dict(),
+                   "verification": record.to_dict()}
         return passed, feedback, details
 
     def _escalate(self, task: TaskSpec, artifact: str, producer: str,
@@ -4181,6 +4312,8 @@ def _legacy_factory_cli(args: Any, settings: Any = None, store: Any = None) -> i
         settings.allow_paid = True
     if getattr(args, "allow_unknown", False):
         settings.allow_unknown = True
+    if getattr(args, "allow_unverified", False):
+        settings.allow_unverified = True
     if settings.unattended:
         settings.sleep_if_active = True
     telemetry = Telemetry(settings)
@@ -4332,6 +4465,8 @@ def _factory_cli(args: Any) -> int:
         settings.allow_paid = True
     if getattr(args, "allow_unknown", False):
         settings.allow_unknown = True
+    if getattr(args, "allow_unverified", False):
+        settings.allow_unverified = True
     if settings.unattended:
         settings.sleep_if_active = True
     store = StateManager(settings.workspace_dir, settings.log_dir)
@@ -4418,6 +4553,8 @@ def main() -> None:
                         help="autoriza pay-as-you-go (DeepSeek direto / OpenRouter pago)")
     parser.add_argument("--allow-unknown", action="store_true",
                         help="autoriza billing desconhecido (nunca por omissão)")
+    parser.add_argument("--allow-unverified", action="store_true",
+                        help="entrega explicitamente artefacts UNVERIFIED")
     parser.add_argument("--approve-architecture", action="store_true",
                         help="aprova a arquitetura (o --yes não a aprova)")
     parser.add_argument("--migrate-state", action="store_true",

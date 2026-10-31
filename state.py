@@ -966,6 +966,11 @@ def from_legacy_factory(data: dict[str, Any],
         "schema_version", "run_id", "history", "created", "updated",
         "approvals", "verifications", "extensions",
     }
+    for raw_task in data.get("tasks") or []:
+        vid = str(raw_task.get("id") or "")
+        if vid and raw_task.get("verification"):
+            st.verifications[vid] = VerificationRecord.from_dict(
+                raw_task["verification"])
     st.extensions.setdefault("legacy_factory", {
         k: v for k, v in data.items() if k not in known_factory
     })
@@ -1036,7 +1041,8 @@ PHASE_TO_LEGACY_STEP = {
 }
 
 
-def task_compat_dict(task: Task) -> dict[str, Any]:
+def task_compat_dict(task: Task,
+                     verification: Optional["VerificationRecord"] = None) -> dict[str, Any]:
     """Task shape consumed by the legacy FactoryState."""
     return {
         "id": task.id,
@@ -1054,6 +1060,7 @@ def task_compat_dict(task: Task) -> dict[str, Any]:
         "delivered_by": task.delivered_by.to_dict() if task.delivered_by else None,
         "requirement_ids": list(task.requirement_ids),
         "legacy_extra": dict(task.legacy_extra),
+        "verification": verification.to_dict() if verification else None,
     }
 
 
@@ -1071,7 +1078,8 @@ def factory_compat_dict(state: ProjectState) -> dict[str, Any]:
         "answers": list(state.requirements.answers),
         "scaffold": dict(state.scaffold),
         "architecture": state.architecture.to_dict(),
-        "tasks": [task_compat_dict(t) for t in state.tasks],
+        "tasks": [task_compat_dict(t, state.verifications.get(t.id))
+                  for t in state.tasks],
         "integration": dict(state.integration),
         "visual": dict(state.visual),
         "signoff": dict(state.signoff),

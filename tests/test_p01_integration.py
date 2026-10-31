@@ -215,12 +215,14 @@ class KnownLaterDefectsTests(unittest.TestCase):
 
     def _fake_orchestrator(self, critic, test_oracle=None):
         obj = main.Orchestrator.__new__(main.Orchestrator)
-        obj.settings = types.SimpleNamespace(visual_check=False, test_oracle=True)
+        obj.settings = types.SimpleNamespace(visual_check=False, test_oracle=True,
+                                              allow_unverified=False)
         obj.spec = types.SimpleNamespace(review=False)
         obj.emit = lambda *a, **k: None
         obj._record = lambda *a, **k: None
         obj._target_for = lambda task: getattr(task, "target_file", "")
         obj.project_root = None
+        obj.pool = types.SimpleNamespace(last_attempt_model={})
         obj.verifier = types.SimpleNamespace(
             run_oracle=lambda *a, **k: main.OracleResult(True, 0, stdout=""),
             run_critic=lambda *a, **k: critic,
@@ -228,7 +230,6 @@ class KnownLaterDefectsTests(unittest.TestCase):
         )
         return obj
 
-    @unittest.expectedFailure
     def test_critic_unavailable_should_not_pass(self):
         obj = self._fake_orchestrator({"verdict": "UNAVAILABLE", "objections": [],
                                        "note": "no critic"})
@@ -237,22 +238,41 @@ class KnownLaterDefectsTests(unittest.TestCase):
         passed, _feedback, _details = obj._check_artifact(task, "x", "GEMINI", None)
         self.assertFalse(passed)
 
-    @unittest.expectedFailure
     def test_local_llm_test_should_be_advisory(self):
-        obj = self._fake_orchestrator({"verdict": "PASS", "objections": []},
-                                      {"verdict": "FAIL", "note": "weak test"})
+        obj = self._fake_orchestrator({"verdict": "PASS", "objections": [],
+                                       "producer_family": "gemini",
+                                       "critic_family": "kimi",
+                                       "critic": {"model_id": "kimi"}},
+                                      {"verdict": "FAIL", "note": "weak test",
+                                       "advisory": True})
         task = types.SimpleNamespace(id="t1", target_file="a.py",
                                      acceptance=["x"], title="t")
         passed, _feedback, _details = obj._check_artifact(task, "x", "GEMINI", None)
         self.assertTrue(passed)
 
-    @unittest.expectedFailure
     def test_gemini_producer_should_get_cross_family_critic(self):
+        import registry as reg_mod
         pool = object.__new__(main.LLMPool)
-        pool.critic_gemini = object()
-        pool.critic_cloud = object()
-        self.assertIsNot(main.LLMPool.critic_for(pool, "GEMINI"),
-                         pool.critic_gemini)
+        pool.registry = reg_mod.ModelRegistry()
+        pool._handle_for_identity = lambda *a, **k: object()
+        producer = pool.registry.ref_for_identity(
+            pool.registry.identity_for("gemini-plus", "gemini-3.5-flash"))
+        critics = main.LLMPool.critic_candidates(pool, producer)
+        self.assertTrue(critics)
+        for _handle, ref in critics:
+            self.assertNotEqual(ref.family, producer.family)
+
+    def test_fixer_identity_drives_critic_family(self):
+        import registry as reg_mod
+        pool = object.__new__(main.LLMPool)
+        pool.registry = reg_mod.ModelRegistry()
+        pool._handle_for_identity = lambda *a, **k: object()
+        producer = pool.registry.ref_for_identity(
+            pool.registry.identity_for("opencode-free", "big-pickle"))
+        critics = main.LLMPool.critic_candidates(pool, producer)
+        self.assertTrue(critics)
+        for _handle, ref in critics:
+            self.assertNotEqual(ref.family, "opencode")
 
 
 if __name__ == "__main__":

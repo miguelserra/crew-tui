@@ -29,6 +29,7 @@ from state import (
     RequirementContract,
     StateValidationError,
     Task,
+    VerificationRecord,
     sha256_json,
     TaskAttempt,
     new_id,
@@ -148,6 +149,10 @@ class WorkflowEngine:
 
     def on_attempt(self, event: AttemptEvent) -> None:
         attempt: TaskAttempt = event.attempt
+        if event.tag in ("CRITIC", "VISUAL", "READER", "ORACLE", "TEST"):
+            self.state.history.append({"kind": "attempt", **event.to_dict(), "at": utc_now()})
+            self.save()
+            return
         task = next((t for t in self.state.tasks if t.id == event.task), None)
         if task is None:
             self.state.history.append({"kind": "attempt", **event.to_dict(), "at": utc_now()})
@@ -478,6 +483,8 @@ class FactoryAdapter:
                 delivered_by=t.delivered_by.to_dict() if t.delivered_by else None,
                 requirement_ids=list(t.requirement_ids),
                 legacy_extra=dict(t.legacy_extra),
+                verification=(project.verifications[t.id].to_dict()
+                              if t.id in project.verifications else None),
             ))
         return self._FactoryState(
             project=str(project.project_root), goal=project.goal,
@@ -526,6 +533,13 @@ class FactoryAdapter:
         validate_dependencies(self.project.tasks)
         link_traceability(self.project.requirements, self.project.tasks)
         validate_traceability(self.project.requirements, self.project.tasks)
+        for task in self.project.tasks:
+            raw = getattr(next((ts for ts in fs.tasks if ts.id == task.id), None),
+                          "verification", None)
+            if raw:
+                rec = VerificationRecord.from_dict(raw)
+                rec.criterion_ids = list(task.requirement_ids)
+                self.project.verifications[task.id] = rec
         self.project.integration = dict(fs.integration)
         self.project.visual = dict(fs.visual)
         self.project.signoff = dict(fs.signoff)

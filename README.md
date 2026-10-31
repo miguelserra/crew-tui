@@ -218,6 +218,33 @@ Routing is a central policy over Registry identities, not a chain of
 The Router returns ordered candidates with reasons; it never constructs
 LangChain clients (the provider/LLMPool layer does).
 
+## Verification engine (P5)
+
+Delivery requires independent evidence, not just a successful model call:
+
+- **Critic is mandatory and cross-family**: the producer comes from
+  `Task.delivered_by` (or the last generation attempt), never from the role
+  label; every critic candidate must have a different model family. A
+  same-family critic is invalid, and critic fallbacks are also cross-family.
+- **Critic unavailable → UNVERIFIED**, not PASS. Build tasks are not delivered
+  unless `ALLOW_UNVERIFIED=1`/`--allow-unverified` is explicitly set; the
+  exception is recorded in the verification evidence and run result.
+- **Oracle**: compile/static checks are deterministic evidence.
+- **Qwen local test is advisory**: it can inform a fix but cannot be the sole
+  reason to reject or accept a delivery.
+- **Visual** uses only Registry identities with the `vision` capability.
+  `N/A` means visual review is not applicable; `UNVERIFIED` means it was
+  required but no vision model was available. Text-only models never receive
+  images.
+- **Review exception**: a review report may be delivered with documented
+  objections if the critic actually ran; the code verification remains FAIL,
+  not PASS.
+- Evidence is stored in `VerificationRecord` (oracle, critic identity/family,
+  visual, advisory tests, verdict, reasons) and surfaced in results.
+
+`verify.py` owns the delivery policy; `main.Verifier` collects evidence and
+the Factory/Orchestrator call the same gate.
+
 ## Financial circuit breaker
 
 Pay-as-you-go models are **never** called implicitly:
@@ -540,6 +567,7 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `attempts.py` | Per-candidate attempt scoreboard (stdlib) |
 | `engine.py` | Engine selection, approvals, dispatch guard, workflow adapters |
 | `router.py` | Route contracts, error classification, circuit breaker, PAYG grants |
+| `verify.py` | Critic validity, UNVERIFIED semantics and delivery gate |
 | `peak.py` | Pure peak/off-peak window helpers (shared, no I/O) |
 | `power.py` | Platform dispatcher (Linux vs Windows) |
 | `power_linux.py` | `systemd-inhibit` keep-awake + RTC alarm/suspend gate |
@@ -547,7 +575,7 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `scripts/crew-sleep` | Root helper that arms the RTC alarm / suspends (Linux) |
 | `scripts/install-crew-sleep.sh` | One-time root install + sudoers rule |
 | `setup.ps1`, `run.ps1` | Windows bootstrap and launcher |
-| `tests/` | Power, budget, P0/P1 foundation, P2 contracts, P3 registry and P4 router tests |
+| `tests/` | Power, budget, P0/P1 foundation, P2 contracts, P3 registry, P4 router and P5 verification tests |
 
 ## Tests & CI
 
@@ -556,6 +584,7 @@ python -m unittest discover -s tests -p "test_p01_*.py"   # core, no deps
 python -m unittest discover -s tests -p "test_p02_*.py"   # core, no deps
 python -m unittest discover -s tests -p "test_p03_*.py"   # registry, no deps
 python -m unittest discover -s tests -p "test_p04_*.py"   # router, no deps
+python -m unittest discover -s tests -p "test_p05_*.py"   # verification, no deps
 .venv/bin/python -m unittest discover -s tests -p "test_p0*_integration.py"
 python tests/test_power.py
 python tests/test_budget.py
