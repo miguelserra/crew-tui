@@ -10,7 +10,6 @@ D06: CONFIRMED result replay after crash boundaries, fingerprint changes,
 missing/non-replayable artifacts, and history deduplication.
 """
 
-import hashlib
 import json
 import sys
 import tempfile
@@ -1075,6 +1074,7 @@ class AdapterPipelineTests(unittest.TestCase):
             self.assertFalse(resumed["ledger"].get(rec.call_id).consumed)
 
 
+@unittest.skipUnless(DEPS_OK, f"runtime deps missing: {DEPS_ERR}")
 class D09SignoffPipelineTests(unittest.TestCase):
     """D09: integration, fixer revalidation, sign-off approval/rejection and
     gate prevention through the real WorkflowEngine and both adapters."""
@@ -1138,7 +1138,7 @@ class D09SignoffPipelineTests(unittest.TestCase):
 
     def _file_hash(self, run, rel):
         root = Path(run["state"].extensions["workspace_root"])
-        return hashlib.sha256((root / rel).read_bytes()).hexdigest()
+        return s.artifact_hash((root / rel).read_text(encoding="utf-8"))
 
     def _canon_fixes(self, st):
         out = []

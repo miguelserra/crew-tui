@@ -87,6 +87,13 @@ def sha256_json(value: Any) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def artifact_hash(text: str) -> str:
+    """Canonical content hash independent of platform newline translation."""
+    normalized = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalized.rstrip("\n") + "\n"
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 # --------------------------------------------------------------------------- #
 #  Attempts
 # --------------------------------------------------------------------------- #
@@ -823,7 +830,8 @@ class ProjectState:
             if not path.is_file():
                 hashes[task.id] = "<missing>"
                 continue
-            hashes[task.id] = hashlib.sha256(path.read_bytes()).hexdigest()
+            text = path.read_text(encoding="utf-8", errors="replace")
+            hashes[task.id] = artifact_hash(text)
         return hashes
 
     @staticmethod

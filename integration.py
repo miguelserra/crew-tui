@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import subprocess
 import sys
@@ -12,7 +11,8 @@ from typing import Any, Optional
 import native_util
 import verify as verify_policy
 from router import RouteRequest
-from state import ProjectState, Task, TaskAttempt, VerificationRecord, new_id
+from state import (ProjectState, Task, TaskAttempt, VerificationRecord,
+                   artifact_hash, new_id)
 from registry import unknown_ref
 from visual import playwright_audit
 
@@ -245,7 +245,7 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
         record = VerificationRecord(
             verdict=decision.verdict, criterion_ids=list(task.requirement_ids),
             oracle={"passed": oracle.passed, "exit_code": oracle.exit_code,
-                    "artifact_sha256": hashlib.sha256((code.rstrip("\n") + "\n").encode("utf-8")).hexdigest()},
+                    "artifact_sha256": artifact_hash(code)},
             critic=critic if isinstance(critic, dict) else {},
             visual={"verdict": verify_policy.NA}, tests=tests,
             reason="; ".join(decision.reasons),

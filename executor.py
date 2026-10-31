@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Optional
 
 import verify as verify_policy
-from state import ProjectState, Task, VerificationRecord
+from state import ProjectState, Task, VerificationRecord, artifact_hash
 from state import normalize_target_file, validate_dependencies
 from registry import ModelRef
 
@@ -248,7 +247,7 @@ Output the COMPLETE corrected file in ONE fenced block."""
         record = VerificationRecord(
             verdict=decision.verdict, criterion_ids=list(task.requirement_ids),
             oracle={"passed": oracle.passed, "exit_code": oracle.exit_code,
-                    "artifact_sha256": hashlib.sha256((code.rstrip("\n") + "\n").encode("utf-8")).hexdigest()},
+                    "artifact_sha256": artifact_hash(code)},
             critic=critic if isinstance(critic, dict) else {},
             visual={"verdict": verify_policy.NA}, tests=tests,
             reason="; ".join(decision.reasons),

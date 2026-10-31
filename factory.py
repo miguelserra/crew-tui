@@ -19,7 +19,6 @@ candidates/ + backups/ + tests/), so an interrupted run can be resumed with
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import os
 import re
@@ -41,7 +40,7 @@ from main import (LANG_SUFFIX, LLMPool, Settings, Verifier,
                   extract_code_blocks_typed, extract_json_block, guess_lang)
 import verify as verify_policy
 from registry import ModelRef, unknown_ref
-from state import (StateCorruptError, validate_dependencies,
+from state import (StateCorruptError, artifact_hash, validate_dependencies,
                    TaskAttempt, VerificationRecord, new_id)
 from power import make_power
 
@@ -636,7 +635,7 @@ No prose, no placeholders, no elided sections.
                 verdict=verify_policy.FAIL,
                 criterion_ids=list(task.requirement_ids),
                 oracle={"passed": False, "kind": "static", "error": error,
-                        "artifact_sha256": hashlib.sha256((code.rstrip("\n") + "\n").encode("utf-8")).hexdigest()},
+                        "artifact_sha256": artifact_hash(code)},
                 critic={},
                 visual={"verdict": verify_policy.NA},
                 tests={"verdict": "SKIP", "advisory": True},
@@ -674,7 +673,7 @@ No prose, no placeholders, no elided sections.
                 verdict=decision.verdict,
                 criterion_ids=list(task.requirement_ids),
                 oracle={"passed": True, "kind": "static",
-                        "artifact_sha256": hashlib.sha256((code.rstrip("\n") + "\n").encode("utf-8")).hexdigest()},
+                        "artifact_sha256": artifact_hash(code)},
                 critic=critic if isinstance(critic, dict) else {},
                 visual={"verdict": verify_policy.NA},
                 tests=test_result,
@@ -922,7 +921,7 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
             verdict=decision.verdict,
             criterion_ids=list(task.requirement_ids),
             oracle={"passed": oracle.passed, "exit_code": oracle.exit_code,
-                    "artifact_sha256": hashlib.sha256((code.rstrip("\n") + "\n").encode("utf-8")).hexdigest()},
+                    "artifact_sha256": artifact_hash(code)},
             critic=critic if isinstance(critic, dict) else {},
             visual={"verdict": verify_policy.NA},
             tests=tests,
