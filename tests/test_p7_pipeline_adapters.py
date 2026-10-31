@@ -2181,6 +2181,10 @@ class D11PublicationPipelineTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
         st.extensions["workspace_root"] = str(ws)
+        if deletion is not None and (project / deletion.target_file).is_file():
+            import hashlib
+            deletion.expected_sha256 = hashlib.sha256(
+                (project / deletion.target_file).read_bytes()).hexdigest()
         st.approve_architecture()
         cfg = settings(base)
         store = StateManager(cfg.workspace_dir, cfg.log_dir)
