@@ -133,9 +133,25 @@ class GrantTests(unittest.TestCase):
         req1 = r.RouteRequest("programming", task_id="t1", run_id="run")
         req2 = r.RouteRequest("programming", task_id="t2", run_id="run")
         self.assertFalse(grants.allows(req1, ident))
-        grants.approve_task(req1, {"deepseek-v4-pro"})
+        grants.approve_task(req1, {r.identity_key(ident)})
         self.assertTrue(grants.allows(req1, ident))
         self.assertFalse(grants.allows(req2, ident))
+
+    def test_same_model_id_on_two_endpoints_needs_two_grants(self):
+        reg_ = reg.ModelRegistry()
+        id1 = reg_.identity_for("deepseek-api", "deepseek-v4-pro")
+        id2 = reg_.identity_for("opencode-go", "deepseek-v4-pro")
+        # Synthesize a second PAYG identity with the same model id/endpoint variant.
+        import dataclasses
+        id2 = dataclasses.replace(id2, billing=reg.BILLING_PAYG,
+                                  price=id1.price)
+        self.assertEqual(id1.model_id, id2.model_id)
+        self.assertNotEqual(r.identity_key(id1), r.identity_key(id2))
+        grants = r.GrantStore()
+        req = r.RouteRequest("programming", task_id="t1", run_id="r")
+        grants.approve_task(req, {r.identity_key(id1)})
+        self.assertTrue(grants.allows(req, id1))
+        self.assertFalse(grants.allows(req, id2))
 
     def test_allow_paid_is_run_scope(self):
         grants = r.GrantStore(allow_paid=True)
@@ -290,7 +306,8 @@ class RouteChainTests(unittest.TestCase):
         grants = r.GrantStore()
         router = make_router(handles=handles, grants=grants)
         req1 = r.RouteRequest("programming", complexity="high", task_id="t1")
-        grants.approve_task(req1, {"deepseek-v4-pro"})
+        ident = reg.ModelRegistry().identity_for("deepseek-api", "deepseek-v4-pro")
+        grants.approve_task(req1, {r.identity_key(ident)})
         self.assertEqual(router.route(req1).chain.invoke([]).content, "ok")
         req2 = r.RouteRequest("programming", complexity="high", task_id="t2")
         with self.assertRaises(BudgetSuspended):

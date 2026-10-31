@@ -131,6 +131,12 @@ def breaker_key(identity: ModelIdentity) -> str:
     return f"{identity.provider}|{identity.endpoint}|{identity.credential_profile}"
 
 
+def identity_key(identity: ModelIdentity) -> str:
+    """Unambiguous PAYG identity: provider + endpoint + profile + model."""
+    return (f"{identity.provider}|{identity.endpoint}|"
+            f"{identity.credential_profile}|{identity.model_id}")
+
+
 @dataclass
 class BreakerEntry:
     state: str = "closed"        # closed|open|half_open
@@ -292,7 +298,7 @@ class CircuitBreaker:
 class PaidGrant:
     scope: str                 # "task" | "run"
     scope_id: str
-    models: frozenset[str]     # {"*"} for any
+    keys: frozenset[str]       # identity_key values; {"*"} for any
     max_cost: Optional[Decimal] = None
     spent: Decimal = Decimal("0")
     created: float = 0.0
@@ -312,17 +318,17 @@ class GrantStore:
         if allow_paid:
             self.add("run", "*", {"*"})
 
-    def add(self, scope: str, scope_id: str, models: Iterable[str],
+    def add(self, scope: str, scope_id: str, keys: Iterable[str],
             max_cost: Optional[Decimal] = None) -> PaidGrant:
         grant = PaidGrant(scope=scope, scope_id=scope_id,
-                          models=frozenset(models or {"*"}),
+                          keys=frozenset(keys or {"*"}),
                           max_cost=max_cost, created=time.time())
         self._grants.append(grant)
         return grant
 
-    def approve_task(self, request: "RouteRequest", models: Iterable[str],
+    def approve_task(self, request: "RouteRequest", keys: Iterable[str],
                      max_cost: Optional[Decimal] = None) -> PaidGrant:
-        return self.add("task", request_scope_id(request), models, max_cost)
+        return self.add("task", request_scope_id(request), keys, max_cost)
 
     def allows(self, request: "RouteRequest", identity: ModelIdentity) -> bool:
         if identity.billing != BILLING_PAYG:
@@ -338,7 +344,7 @@ class GrantStore:
                     continue
             else:
                 continue
-            if "*" in grant.models or identity.model_id in grant.models:
+            if "*" in grant.keys or identity_key(identity) in grant.keys:
                 return True
         return False
 
@@ -355,7 +361,7 @@ class GrantStore:
                     continue
             else:
                 continue
-            if "*" in grant.models or identity.model_id in grant.models:
+            if "*" in grant.keys or identity_key(identity) in grant.keys:
                 grant.spent += cost.total
                 return
 
@@ -480,8 +486,6 @@ class Router:
             return SPEC_CHAIN
         if role in ("review", "reviewer"):
             return REVIEW_CHAIN
-        if compplexity := None:
-            pass
         if complexity in ("low", "tiny") or role in ("tiny", "local"):
             return LOCAL_CHAIN + NORMAL_CHAIN
         if complexity in ("high", "complex", "hard"):
@@ -552,7 +556,19 @@ class Router:
         chosen = self.request_grant(request, candidate) if self.request_grant else None
         if not chosen:
             return False
-        self.grants.approve_task(request, {chosen})
+        key = None
+        if chosen == "*" or chosen == identity_key(identity):
+            key = identity_key(identity)
+        elif chosen == identity.model_id:
+            key = identity_key(identity)
+        else:
+            matches = [i for i in self.registry.models.values()
+                       if i.model_id == chosen and i.billing == BILLING_PAYG]
+            if len(matches) == 1:
+                key = identity_key(matches[0])
+        if key is None:
+            return False
+        self.grants.approve_task(request, {key})
         return self.grants.allows(request, identity)
 
     def charge(self, request: RouteRequest, candidate: RouteCandidate,
