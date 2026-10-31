@@ -291,11 +291,12 @@ P7.0 inventories the remaining execution dependency in `docs/p7-inventory.md`.
 P7.1 has started extracting native services over canonical `ProjectState`:
 
 - `requirements.py` (SPEC/answers) — extracted;
-- `architecture.py` (architecture + tasks) — extracted;
+- `architecture.py` (architecture + tasks) — extracted, atomic validation;
+- `executor.py` (BUILD/FIX) — extracted, critic/verification gate reused;
 - scaffold/verification/workspace/publish were already native from P5/P6.
 
-BUILD, INTEGRATE, VISUAL and SIGN-OFF still run through the legacy
-`FactoryAdapter` until their native services demonstrate equivalence. P7 is not
+INTEGRATE, VISUAL and SIGN-OFF still run through the legacy `FactoryAdapter`
+until their native services demonstrate equivalence. P7 is not
 a closed gate; legacy migration/conversion remains readable and no silent
 conversion is performed. No prompt/routing/verification policy was changed in
 this extraction.
@@ -625,6 +626,8 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `verify.py` | Critic validity, UNVERIFIED semantics and delivery gate |
 | `requirements.py` | Native SPEC/requirements service (P7.1, in progress) |
 | `architecture.py` | Native architecture decomposition (P7.1, in progress) |
+| `executor.py` | Native BUILD/FIX over ProjectState (P7.1b) |
+| `context_reader.py` | Bounded, ignore-aware project context |
 | `profiles.py` | Workflow profiles, auto resolution and phase sets |
 | `scaffold.py` | Deterministic scaffold from the approved architecture |
 | `workspace.py` | Workspace seeding and publish planning |

@@ -32,8 +32,9 @@ Baseline: `p6.1-gate` (`86f2df1`).
 | `verify.py` | critic/gate policy | extracted (P5) |
 | `workspace.py` / `publish.py` | isolation/publish | extracted (P6/P6.1) |
 | `requirements.py` | SPEC + answers | P7.1 first extraction |
-| `architecture.py` | architecture + tasks | P7.1 first extraction |
-| executor | BUILD + fix loop | pending |
+| `architecture.py` | architecture + tasks | P7.1 extraction (hardened) |
+| `executor.py` | BUILD + fix loop | P7.1b extraction |
+| `context_reader.py` | bounded project context | P7.1a extraction |
 | integration | runtime/integration | pending |
 | visual | multimodal | pending |
 | signoff | final sign-off | pending |
