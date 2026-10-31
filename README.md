@@ -285,6 +285,21 @@ New unified runs separate **production** from **delivery**:
 - P6/P6.1 applies to the unified engine; the legacy Factory path remains for
   compatibility until P7.
 
+## P7 consolidation status (in progress)
+
+P7.0 inventories the remaining execution dependency in `docs/p7-inventory.md`.
+P7.1 has started extracting native services over canonical `ProjectState`:
+
+- `requirements.py` (SPEC/answers) — extracted;
+- `architecture.py` (architecture + tasks) — extracted;
+- scaffold/verification/workspace/publish were already native from P5/P6.
+
+BUILD, INTEGRATE, VISUAL and SIGN-OFF still run through the legacy
+`FactoryAdapter` until their native services demonstrate equivalence. P7 is not
+a closed gate; legacy migration/conversion remains readable and no silent
+conversion is performed. No prompt/routing/verification policy was changed in
+this extraction.
+
 ## Financial circuit breaker
 
 Pay-as-you-go models are **never** called implicitly:
@@ -608,6 +623,8 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `engine.py` | Engine selection, approvals, dispatch guard, workflow adapters |
 | `router.py` | Route contracts, error classification, circuit breaker, PAYG grants |
 | `verify.py` | Critic validity, UNVERIFIED semantics and delivery gate |
+| `requirements.py` | Native SPEC/requirements service (P7.1, in progress) |
+| `architecture.py` | Native architecture decomposition (P7.1, in progress) |
 | `profiles.py` | Workflow profiles, auto resolution and phase sets |
 | `scaffold.py` | Deterministic scaffold from the approved architecture |
 | `workspace.py` | Workspace seeding and publish planning |
@@ -631,6 +648,7 @@ python -m unittest discover -s tests -p "test_p04_*.py"   # router, no deps
 python -m unittest discover -s tests -p "test_p05_*.py"   # verification, no deps
 python -m unittest discover -s tests -p "test_p06_*.py"   # profiles/scaffold/workspace, no deps
 python -m unittest discover -s tests -p "test_p061_*.py"  # publish safety/recovery, no deps
+python -m unittest discover -s tests -p "test_p7_*.py"    # P7 baseline/native, no deps
 .venv/bin/python -m unittest discover -s tests -p "test_p0*_integration.py"
 python tests/test_power.py
 python tests/test_budget.py
