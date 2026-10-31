@@ -313,12 +313,16 @@ resume-after-BUILD continuity, and publication parity/conflict in disposable
 clones. `calls.py` adds a durable PAYG call ledger (`PENDING`, `SUBMITTED`,
 `CONFIRMED`, `UNKNOWN`, `FAILED`): an ambiguous PAYG outcome stops the call
 instead of retrying/falling back, unresolved calls block resume, and
-`--resolve-call ID --call-outcome` provides manual resolution. The
-machine-generated report lives in `docs/p7-differential-report.md`
-(`tools/p7_differential_report.py`). Still pending before the gate opens:
-idempotency-header use when a provider declares support, reuse/blocking of a
-CONFIRMED-but-not-committed result, and full crash-recovery journal replay.
-The runtime still uses `FactoryAdapter` and removal is not authorized. P7 is not
+`--resolve-call ID --call-outcome` provides manual resolution. Result text is
+persisted atomically under `.crew/call_results` before `CONFIRMED`; a resumed
+workflow replays a confirmed result whose request fingerprint matches, without
+contacting the provider, and marks the call consumed only when the attempt is
+committed to state. Interrupted `SUBMITTED` calls with a surviving result are
+reconciled to `CONFIRMED`. The machine-generated report lives in
+`docs/p7-differential-report.md` (`tools/p7_differential_report.py`). Still
+pending before the gate opens: provider-declared idempotency headers and full
+crash-recovery journal replay. The runtime still uses `FactoryAdapter` and
+removal is not authorized. P7 is not
 a closed gate; legacy migration/conversion remains readable and no silent
 conversion is performed. No prompt/routing/verification policy was changed in
 this extraction.

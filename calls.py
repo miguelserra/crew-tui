@@ -1,27 +1,32 @@
-"""Durable ledger for external model calls, with an explicit outcome contract.
+"""Durable ledger + result artifacts for external model calls.
 
 States:
   PENDING    intent persisted, call not yet dispatched
   SUBMITTED  request is being dispatched (may have reached the provider)
-  CONFIRMED  response received and identity/result metadata persisted
+  CONFIRMED  response received and its result artifact persisted
   UNKNOWN    ambiguous outcome; never auto-retry, requires human resolution
   FAILED     confirmed failure without a usable result (safe to fall back)
 
-The ledger is metadata only: result text is hashed, never stored. It does not
-pretend that idempotency keys guarantee exactly-once execution; a key is
-recorded for providers that may use it, but the UNKNOWN state is the real
-guard when the provider may have processed and charged the request.
+Result artifacts live under ``.crew/call_results`` (excluded from publication
+by the existing ``.crew`` rule). They are local-only and may contain generated
+code; remove ``.crew`` when discarding a run. The ledger records only metadata,
+a request fingerprint and a result hash.
+
+The ledger does not claim exactly-once execution. A recorded idempotency key is
+not sent unless the provider declares support; ``UNKNOWN`` plus manual
+resolution is the actual guard when a request may have been charged.
 """
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from store import atomic_write_json
 from state import utc_now
@@ -34,9 +39,49 @@ FAILED = "FAILED"
 
 UNRESOLVED = {PENDING, SUBMITTED, UNKNOWN}
 
+_LAST_CALL: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "crew_last_call", default="")
+_LAST_SERVED: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "crew_last_served", default=None)
+
+
+def set_call_context(call_id: str, served: Any = None) -> None:
+    _LAST_CALL.set(call_id or "")
+    if served is not None:
+        _LAST_SERVED.set(served)
+
+
+def last_call_id() -> str:
+    return _LAST_CALL.get()
+
+
+def last_served_ref() -> Any:
+    return _LAST_SERVED.get()
+
+
+def clear_call_context() -> None:
+    _LAST_CALL.set("")
+    _LAST_SERVED.set(None)
+
+
+def message_text(message: Any) -> str:
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return json.dumps(content, ensure_ascii=False, sort_keys=True,
+                          default=str)
+    return str(content)
+
+
+def request_fingerprint(messages: Iterable[Any]) -> str:
+    payload = [message_text(m) for m in messages]
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
+
 
 class CallLedgerError(Exception):
-    """The ledger is corrupt or the requested operation is invalid."""
+    """The ledger/result store is corrupt or the requested operation is invalid."""
 
 
 class CallOutcomeUnknown(Exception):
@@ -58,11 +103,13 @@ class CallRecord:
     billing: str = ""
     credential_profile: str = ""
     idempotency_key: str = ""
+    request_sha256: str = ""
     created: str = ""
     updated: str = ""
     served: dict[str, Any] = field(default_factory=dict)
     result_sha256: str = ""
     result_chars: int = 0
+    consumed: bool = False
     error: str = ""
     error_kind: str = ""
     resolved_by: str = ""
@@ -87,11 +134,13 @@ class CallRecord:
             billing=str(data.get("billing") or ""),
             credential_profile=str(data.get("credential_profile") or ""),
             idempotency_key=str(data.get("idempotency_key") or ""),
+            request_sha256=str(data.get("request_sha256") or ""),
             created=str(data.get("created") or ""),
             updated=str(data.get("updated") or ""),
             served=dict(data.get("served") or {}),
             result_sha256=str(data.get("result_sha256") or ""),
             result_chars=int(data.get("result_chars") or 0),
+            consumed=bool(data.get("consumed") or False),
             error=str(data.get("error") or ""),
             error_kind=str(data.get("error_kind") or ""),
             resolved_by=str(data.get("resolved_by") or ""),
@@ -99,15 +148,20 @@ class CallRecord:
 
 
 class CallLedger:
-    """One JSON ledger per run/project, written atomically."""
+    """One JSON ledger + result directory per project/run, written atomically."""
 
-    VERSION = 1
+    VERSION = 2
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, result_dir: str | Path | None = None):
         self.path = Path(path).expanduser()
+        self.result_dir = (Path(result_dir).expanduser() if result_dir is not None
+                           else self.path.parent / "call_results")
         self._lock = threading.RLock()
         self._records: dict[str, CallRecord] = {}
         self._load()
+        self.reconcile()
+
+    # -- persistence -------------------------------------------------------- #
 
     def _load(self) -> None:
         if not self.path.is_file():
@@ -131,8 +185,43 @@ class CallLedger:
             "calls": [r.to_dict() for r in self._records.values()],
         })
 
+    def _result_path(self, call_id: str) -> Path:
+        return self.result_dir / f"{call_id}.json"
+
+    def _write_result(self, rec: CallRecord, text: str) -> None:
+        atomic_write_json(self._result_path(rec.call_id), {
+            "version": 1,
+            "call_id": rec.call_id,
+            "request_sha256": rec.request_sha256,
+            "sha256": hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest(),
+            "text": text,
+        })
+
+    def result_text(self, call_id: str) -> Optional[str]:
+        path = self._result_path(call_id)
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        text = data.get("text")
+        if not isinstance(text, str):
+            return None
+        digest = hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
+        if data.get("sha256") and data.get("sha256") != digest:
+            return None
+        rec = self.get(call_id)
+        if rec is not None and rec.request_sha256 and data.get("request_sha256") \
+                and data.get("request_sha256") != rec.request_sha256:
+            return None
+        return text
+
+    # -- lifecycle ---------------------------------------------------------- #
+
     def intent(self, *, run_id: str, role: str, ref: Any,
-               task: str = "", tag: str = "") -> CallRecord:
+               task: str = "", tag: str = "",
+               request_sha256: str = "") -> CallRecord:
         with self._lock:
             now = utc_now()
             rec = CallRecord(
@@ -149,6 +238,7 @@ class CallLedger:
                 billing=str(getattr(ref, "billing", "") or ""),
                 credential_profile=str(getattr(ref, "credential_profile", "") or ""),
                 idempotency_key="crew-" + uuid.uuid4().hex,
+                request_sha256=str(request_sha256 or ""),
                 created=now,
                 updated=now,
             )
@@ -163,17 +253,27 @@ class CallLedger:
                 text: str = "") -> CallRecord:
         with self._lock:
             rec = self._require(call_id)
-            rec.state = CONFIRMED
-            rec.updated = utc_now()
-            rec.error = ""
-            rec.error_kind = ""
             if served is not None:
                 rec.served = (served.to_dict() if hasattr(served, "to_dict")
                               else dict(served))
             if text:
+                try:
+                    self._write_result(rec, text)
+                except Exception as exc:
+                    rec.state = UNKNOWN
+                    rec.error = f"resultado não persistido: {exc}"[:500]
+                    rec.error_kind = "persist"
+                    rec.updated = utc_now()
+                    self._save()
+                    raise CallLedgerError(
+                        f"resultado de {call_id} não persistido") from exc
                 rec.result_sha256 = hashlib.sha256(
                     text.encode("utf-8", "ignore")).hexdigest()
                 rec.result_chars = len(text)
+            rec.state = CONFIRMED
+            rec.updated = utc_now()
+            rec.error = ""
+            rec.error_kind = ""
             self._save()
             return rec
 
@@ -196,11 +296,86 @@ class CallLedger:
             rec = self._require(call_id)
             if rec.state not in UNRESOLVED:
                 return rec
+            if outcome == "confirmed" and self.result_text(call_id) is None:
+                raise CallLedgerError(
+                    "não posso confirmar sem o resultado persistido; "
+                    "resolve como failed ou repõe o artefacto")
+            if outcome == "failed" and self._result_path(call_id).is_file():
+                raise CallLedgerError(
+                    "existe resultado persistido; 'failed' contradiz a evidência")
             rec.state = CONFIRMED if outcome == "confirmed" else FAILED
             rec.resolved_by = "manual"
             rec.updated = utc_now()
             self._save()
             return rec
+
+    def reconcile(self) -> list[str]:
+        """Promote SUBMITTED/UNKNOWN records whose result artifact survived."""
+        promoted: list[str] = []
+        with self._lock:
+            for rec in self._records.values():
+                if rec.state not in (SUBMITTED, UNKNOWN):
+                    continue
+                text = self.result_text(rec.call_id)
+                if text is None:
+                    continue
+                rec.state = CONFIRMED
+                rec.result_sha256 = hashlib.sha256(
+                    text.encode("utf-8", "ignore")).hexdigest()
+                rec.result_chars = len(text)
+                rec.updated = utc_now()
+                promoted.append(rec.call_id)
+            if promoted:
+                self._save()
+        return promoted
+
+    def mark_consumed(self, call_id: str) -> Optional[CallRecord]:
+        with self._lock:
+            rec = self._records.get(call_id)
+            if rec is None or rec.consumed:
+                return rec
+            rec.consumed = True
+            rec.updated = utc_now()
+            self._save()
+            return rec
+
+    def mark_consumed_many(self, call_ids: Iterable[str]) -> None:
+        with self._lock:
+            changed = False
+            for call_id in call_ids:
+                rec = self._records.get(call_id)
+                if rec is not None and not rec.consumed:
+                    rec.consumed = True
+                    changed = True
+            if changed:
+                self._save()
+
+    # -- queries ------------------------------------------------------------ #
+
+    def find_replay(self, run_id: str, task: str, tag: str,
+                    request_sha256: str) -> Optional[CallRecord]:
+        with self._lock:
+            for rec in self._records.values():
+                if (rec.state == CONFIRMED and not rec.consumed
+                        and rec.run_id == str(run_id or "")
+                        and rec.task == str(task or "")
+                        and rec.tag == str(tag or "")
+                        and rec.request_sha256 == str(request_sha256 or "")):
+                    if self.result_text(rec.call_id) is not None:
+                        return rec
+        return None
+
+    def recovery_required(self, run_id: Optional[str] = None) -> list[CallRecord]:
+        with self._lock:
+            out = []
+            for rec in self._records.values():
+                if rec.state != CONFIRMED or rec.consumed:
+                    continue
+                if run_id is not None and rec.run_id != run_id:
+                    continue
+                if self.result_text(rec.call_id) is None:
+                    out.append(rec)
+            return out
 
     def all(self) -> list[CallRecord]:
         with self._lock:

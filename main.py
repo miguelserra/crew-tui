@@ -84,7 +84,8 @@ from registry import (
     ModelRegistry, RegistryError, normalize_billing, ref_from_handle,
 )
 from publish import PublishError, PublishManager, RecoveryRequired
-from calls import CallLedger, CallLedgerError
+from calls import (CallLedger, CallLedgerError, clear_call_context,
+                   last_call_id, last_served_ref)
 from workspace import IgnoreRules, default_workspace
 from engine import (
     ENGINE_LEGACY, ENGINE_UNIFIED, ENGINE_VERSION, EngineError, EngineFacade,
@@ -1269,6 +1270,7 @@ class LLMPool:
             raise RuntimeError("model unavailable (missing key/endpoint)")
         meta = meta or {}
         tag = meta.get("tag") or "OVERRIDE"
+        clear_call_context()
         is_route = bool(getattr(llm, "is_route_chain", False))
         refs = iter_model_refs(llm)
         dispatch_refs = refs or [ref_from_handle(llm)]
@@ -1289,7 +1291,8 @@ class LLMPool:
         try:
             result = self._invoke(llm, messages, meta, tag, allow_breaker=True)
             if not collector.events():
-                collector.synthesize(refs[0] if refs else ref_from_handle(llm), "ok")
+                served = last_served_ref() or (refs[0] if refs else ref_from_handle(llm))
+                collector.synthesize(served, "ok")
             return result
         except Exception as e:
             if not collector.events():
@@ -1298,6 +1301,9 @@ class LLMPool:
             raise
         finally:
             ok_event = collector.last_ok(str(meta.get("task") or "") or None)
+            call_id = last_call_id()
+            if ok_event is not None and call_id:
+                ok_event.attempt.call_id = call_id
             verifier_tags = {"CRITIC", "VISUAL", "READER", "ORACLE", "TEST"}
             if ok_event is not None and tag not in verifier_tags:
                 if not hasattr(self, "last_attempt_model"):
@@ -1311,6 +1317,7 @@ class LLMPool:
                         self.attempt_sink(event)
                     except Exception:
                         pass
+            clear_call_context()
 
     def _ensure_paid(self, llm: Any, meta: Optional[dict[str, Any]],
                      tag: str) -> None:

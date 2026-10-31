@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from budget import BudgetSuspended
-from calls import CallOutcomeUnknown
+from calls import (CallOutcomeUnknown, request_fingerprint,
+                   set_call_context)
 from registry import (
     BILLING_LOCAL,
     BILLING_PAYG,
@@ -592,6 +593,18 @@ def _content(response: Any) -> str:
     return str(content or "")
 
 
+class ReplayedResponse:
+    """A previously confirmed response, replayed without contacting a provider."""
+
+    def __init__(self, text: str, served: Any = None):
+        self.content = text
+        self.usage_metadata: dict[str, Any] = {}
+        self.response_metadata = {
+            "model_name": getattr(served, "model_id", "") or "",
+            "replayed": True,
+        }
+
+
 class RouteChain:
     """Executes candidates candidate-by-candidate (fallback only)."""
 
@@ -614,6 +627,18 @@ class RouteChain:
         last_error: Optional[BaseException] = None
         denied_paid = False
         ledger = getattr(self.router, "call_ledger", None)
+        fingerprint = request_fingerprint(messages)
+        if ledger is not None and self.request.run_id:
+            replay = ledger.find_replay(
+                self.request.run_id, self.request.task_id,
+                self.request.tag or self.request.role, fingerprint)
+            if replay is not None:
+                text = ledger.result_text(replay.call_id)
+                if text is not None:
+                    served = (ModelRef.from_dict(replay.served)
+                              if replay.served else None)
+                    set_call_context(replay.call_id, served)
+                    return ReplayedResponse(text, served)
         for candidate in self.result.candidates:
             identity = candidate.identity
             if self.router is not None and not self.router.breaker.allow(identity):
@@ -635,6 +660,7 @@ class RouteChain:
                         ref=candidate.ref,
                         task=self.request.task_id,
                         tag=self.request.tag or self.request.role,
+                        request_sha256=fingerprint,
                     )
                     ledger.submitted(record.call_id)
                 try:
@@ -662,6 +688,7 @@ class RouteChain:
                     break
                 self.router.breaker.record_success(identity)
                 if record is not None:
+                    set_call_context(record.call_id, candidate.ref)
                     ledger.confirm(record.call_id, served=candidate.ref,
                                    text=content)
                 self.router.charge(self.request, candidate, response)

@@ -100,6 +100,7 @@ class TaskAttempt:
     completed_at: Optional[str] = None
     outcome: str = "unknown"  # ok|error|timeout|quota|historical|rejected
     errors: list[str] = field(default_factory=list)
+    call_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -109,6 +110,7 @@ class TaskAttempt:
             "completed_at": self.completed_at,
             "outcome": self.outcome,
             "errors": list(self.errors),
+            "call_id": self.call_id,
         }
 
     @classmethod
@@ -121,6 +123,7 @@ class TaskAttempt:
             completed_at=data.get("completed_at"),
             outcome=str(data.get("outcome") or "unknown"),
             errors=[str(e) for e in (data.get("errors") or [])],
+            call_id=str(data.get("call_id") or ""),
         )
 
 

@@ -51,13 +51,10 @@ SCENARIOS = [
 ]
 
 PENDING = [
-    ("PAYG ledger — idempotency + CONFIRMED-unconsumed",
-     "Implementado: estados PENDING/SUBMITTED/CONFIRMED/UNKNOWN/FAILED, "
-     "persistência atómica, bloqueio de resume em PENDING/SUBMITTED/UNKNOWN e "
-     "recusa de retry automático de PAYG ambíguo. Em falta: enviar "
-     "idempotency keys quando o endpoint o declara, e tratar/reutilizar um "
-     "CONFIRMED cujo resultado ainda não foi commitado no estado (janela "
-     "entre confirmação e persistência do engine)."),
+    ("Idempotency header por provider",
+     "A chave é gerada e registada, mas ainda não é enviada. Falta uma "
+     "capacidade explícita no contrato do provider (suporte, header, âmbito e "
+     "retenção) e o envio condicionado a essa declaração."),
     ("Crash-recovery completo de publicação",
      "Replay de journals interrompidos a meio de PUBLISHING/ROLLING_BACK e "
      "comparação da recuperação entre motores. O teste actual cobre publish "
@@ -71,12 +68,30 @@ SAFETY = [
     ("PAYG 429 -> FAILED e fallback seguro",
      "tests.test_p04_calls", "RouteChainLedgerTests",
      "test_payg_429_is_failed_then_fallback"),
-    ("UNKNOWN bloqueia o resume",
+    ("UNKNOWN bloqueia e resolução desbloqueia",
      "tests.test_p04_calls", "EngineCallGateTests",
-     "test_unresolved_call_pauses_run"),
-    ("Ledger durável após reload",
+     "test_unknown_pauses_and_manual_resolution_unblocks"),
+    ("Ledger durável + resultado após reload",
      "tests.test_p04_calls", "LedgerTests",
-     "test_state_machine_and_reload"),
+     "test_confirmed_persists_result_and_reloads"),
+    ("SUBMITTED + resultado reconciliado",
+     "tests.test_p04_calls", "LedgerTests",
+     "test_reconcile_promotes_submitted_with_result"),
+    ("CONFIRMED recuperado sem nova chamada",
+     "tests.test_p04_calls", "RouteChainLedgerTests",
+     "test_confirmed_result_replays_without_new_call"),
+    ("CONFIRMED sem artefacto bloqueia",
+     "tests.test_p04_calls", "EngineCallGateTests",
+     "test_confirmed_without_result_pauses_recovery"),
+    ("PENDING/SUBMITTED bloqueiam",
+     "tests.test_p04_calls", "EngineCallGateTests",
+     "test_pending_and_submitted_pause"),
+    ("Engine marca call consumido",
+     "tests.test_p04_calls", "EngineCallGateTests",
+     "test_engine_marks_call_consumed_from_attempt"),
+    ("Resolução incompatível rejeitada",
+     "tests.test_p04_calls", "LedgerTests",
+     "test_resolve_failed_rejects_persisted_result"),
 ]
 
 

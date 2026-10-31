@@ -148,6 +148,10 @@ class WorkflowEngine:
                 calls_path = (self.store.staging_path(self.state.run_id).parent /
                               "calls.json")
             self.call_ledger = CallLedger(calls_path)
+            referenced = [a.call_id for t in self.state.tasks for a in t.attempts
+                          if a.call_id]
+            if referenced:
+                self.call_ledger.mark_consumed_many(referenced)
             if getattr(pool, "router", None) is not None:
                 pool.router.call_ledger = self.call_ledger
         except CallLedgerError as exc:
@@ -172,6 +176,8 @@ class WorkflowEngine:
         if event.tag in ("CRITIC", "VISUAL", "READER", "ORACLE", "TEST"):
             self.state.history.append({"kind": "attempt", **event.to_dict(), "at": utc_now()})
             self.save()
+            if attempt.call_id and self.call_ledger is not None:
+                self.call_ledger.mark_consumed(attempt.call_id)
             return
         task = next((t for t in self.state.tasks if t.id == event.task), None)
         if task is None:
@@ -183,6 +189,8 @@ class WorkflowEngine:
                 task.delivered_by = attempt.model
                 self.adapter.on_last_ok(task.id, attempt.model)
         self.save()
+        if attempt.call_id and self.call_ledger is not None:
+            self.call_ledger.mark_consumed(attempt.call_id)
 
     def mark_delivered(self, task_id: str) -> None:
         task = next((t for t in self.state.tasks if t.id == task_id), None)
@@ -317,6 +325,13 @@ class WorkflowEngine:
                 ids = ", ".join(r.call_id for r in pending[:3])
                 self._pause("call_unknown_failed",
                             f"{len(pending)} chamada(s) externa(s) por confirmar: {ids}")
+                return "paused"
+            unrecoverable = self.call_ledger.recovery_required(self.state.run_id)
+            if unrecoverable:
+                ids = ", ".join(r.call_id for r in unrecoverable[:3])
+                self._pause("call_recovery_failed",
+                            f"{len(unrecoverable)} resultado(s) confirmado(s) sem "
+                            f"artefacto recuperável: {ids}")
                 return "paused"
         if (phase == "SPEC" and self.state.requirements.objective
                 and self._has_approval("spec")):

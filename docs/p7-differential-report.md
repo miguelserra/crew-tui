@@ -27,8 +27,14 @@ The gate is **closed**. Every applicable scenario must be green in both paths wi
 |---|---|---|
 | PAYG timeout -> UNKNOWN, sem retry | Verde | `RouteChainLedgerTests.test_payg_timeout_is_unknown_and_not_retried` |
 | PAYG 429 -> FAILED e fallback seguro | Verde | `RouteChainLedgerTests.test_payg_429_is_failed_then_fallback` |
-| UNKNOWN bloqueia o resume | Verde | `EngineCallGateTests.test_unresolved_call_pauses_run` |
-| Ledger durável após reload | Verde | `LedgerTests.test_state_machine_and_reload` |
+| UNKNOWN bloqueia e resolução desbloqueia | Verde | `EngineCallGateTests.test_unknown_pauses_and_manual_resolution_unblocks` |
+| Ledger durável + resultado após reload | Verde | `LedgerTests.test_confirmed_persists_result_and_reloads` |
+| SUBMITTED + resultado reconciliado | Verde | `LedgerTests.test_reconcile_promotes_submitted_with_result` |
+| CONFIRMED recuperado sem nova chamada | Verde | `RouteChainLedgerTests.test_confirmed_result_replays_without_new_call` |
+| CONFIRMED sem artefacto bloqueia | Verde | `EngineCallGateTests.test_confirmed_without_result_pauses_recovery` |
+| PENDING/SUBMITTED bloqueiam | Verde | `EngineCallGateTests.test_pending_and_submitted_pause` |
+| Engine marca call consumido | Verde | `EngineCallGateTests.test_engine_marks_call_consumed_from_attempt` |
+| Resolução incompatível rejeitada | Verde | `LedgerTests.test_resolve_failed_rejects_persisted_result` |
 
 ## Comparator
 
@@ -45,7 +51,7 @@ The gate is **closed**. Every applicable scenario must be green in both paths wi
 
 | Item | Requisito em falta |
 |---|---|
-| PAYG ledger — idempotency + CONFIRMED-unconsumed | Implementado: estados PENDING/SUBMITTED/CONFIRMED/UNKNOWN/FAILED, persistência atómica, bloqueio de resume em PENDING/SUBMITTED/UNKNOWN e recusa de retry automático de PAYG ambíguo. Em falta: enviar idempotency keys quando o endpoint o declara, e tratar/reutilizar um CONFIRMED cujo resultado ainda não foi commitado no estado (janela entre confirmação e persistência do engine). |
+| Idempotency header por provider | A chave é gerada e registada, mas ainda não é enviada. Falta uma capacidade explícita no contrato do provider (suporte, header, âmbito e retenção) e o envio condicionado a essa declaração. |
 | Crash-recovery completo de publicação | Replay de journals interrompidos a meio de PUBLISHING/ROLLING_BACK e comparação da recuperação entre motores. O teste actual cobre publish normal e conflito, não a recuperação após crash. |
 
 ## Regenerar
