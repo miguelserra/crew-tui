@@ -285,6 +285,20 @@ class WorkflowEngine:
             self.state.phase = self.next_phase("ARCHITECTURE")
         self.save()
 
+    def approve_signoff(self, actor: str = "human",
+                        detail: str = "") -> Approval:
+        approval = self.state.approve_signoff(actor=actor, detail=detail)
+        if self.state.pause.reason in ("signoff_approval", "signoff_rejected"):
+            self.state.pause = PauseState()
+        self.save()
+        return approval
+
+    def reject_signoff(self, actor: str = "human",
+                       reason: str = "") -> Approval:
+        approval = self.state.reject_signoff(actor=actor, reason=reason)
+        self._pause("signoff_rejected", reason or "sign-off rejeitado")
+        return approval
+
     def approve_unknown_billing(self, ref: ModelRef, actor: str = "human") -> None:
         self.state.approve_unknown_billing(ref, actor=actor)
         self.save()
@@ -310,6 +324,9 @@ class WorkflowEngine:
                     self.state.phase = self.next_phase("ARCHITECTURE")
         elif self.state.pause.reason == "publish_conflict":
             self.state.pause = PauseState()
+        elif self.state.pause.reason in ("signoff_approval", "signoff_rejected"):
+            if self.state.signoff_approved():
+                self.state.pause = PauseState()
         elif self.state.pause.reason.endswith("_failed"):
             self.state.pause = PauseState()
         self.save()
@@ -409,6 +426,16 @@ class WorkflowEngine:
         if not ok:
             self._pause(f"{phase.lower()}_failed")
             return "failed"
+        if phase == "SIGNOFF" and not self.state.signoff_approved():
+            decision = self.state.signoff_decision()
+            if decision and decision.decision == "rejected":
+                self._pause("signoff_rejected",
+                            decision.detail or "sign-off rejeitado")
+            else:
+                blockers = self.state.signoff_blockers()
+                self._pause("signoff_approval",
+                            "; ".join(blockers) or self.state.signoff_hash())
+            return "paused"
         if phase == "SIGNOFF" and hasattr(self.adapter, "publish"):
             try:
                 published = self.adapter.publish()
@@ -717,7 +744,13 @@ class FactoryAdapter:
             return "DONE"
         return self.order[idx + 1] if idx + 1 < len(self.order) else "DONE"
 
+    def _ensure_ready(self) -> None:
+        if self.recovery_error:
+            raise EngineError(
+                f"recuperação de publicação pendente: {self.recovery_error}")
+
     def step(self, phase: str) -> bool:
+        self._ensure_ready()
         self.factory.power.start()
         try:
             if phase == "ARCHITECTURE":

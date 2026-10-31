@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -229,7 +230,11 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
         artifact = f"```{fence or 'text'}\n{code}\n```"
         oracle = self.verifier.run_oracle(task.id, artifact, self.run_id,
                                           suffix=target.suffix)
-        critic = self.verifier.run_critic(model, task, code, self.run_id)
+        if not oracle.passed:
+            critic: dict[str, Any] = {"verdict": verify_policy.NA,
+                                      "note": "oracle falhou — crítico não executado"}
+        else:
+            critic = self.verifier.run_critic(model, task, code, self.run_id)
         tests: dict[str, Any] = {"verdict": "SKIP", "advisory": True}
         if target.suffix == ".py" and self.settings.test_oracle:
             tests = self.verifier.run_test_oracle(task, artifact, self.run_id)
@@ -239,7 +244,8 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
             tests=tests, allow_unverified=self.settings.allow_unverified)
         record = VerificationRecord(
             verdict=decision.verdict, criterion_ids=list(task.requirement_ids),
-            oracle={"passed": oracle.passed, "exit_code": oracle.exit_code},
+            oracle={"passed": oracle.passed, "exit_code": oracle.exit_code,
+                    "artifact_sha256": hashlib.sha256((code.rstrip("\n") + "\n").encode("utf-8")).hexdigest()},
             critic=critic if isinstance(critic, dict) else {},
             visual={"verdict": verify_policy.NA}, tests=tests,
             reason="; ".join(decision.reasons),

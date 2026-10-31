@@ -137,6 +137,8 @@ CREW_ENGINE=unified   # new canonical state + corrected phase order
   `engine_kind` transactionally. The old files are preserved for rollback.
 - The architecture gate is independent from `--yes`: headless runs need
   `--approve-architecture`. `--yes` only answers questions/assumptions.
+- The final sign-off gate is also independent from `--yes`: headless runs need
+  `--approve-signoff`, and approval is bound to the verification/artifact hash.
 - Models whose billing cannot be proven are blocked unless
   `--allow-unknown`/`ALLOW_UNKNOWN=1` is explicit.
 - Corrupt state raises and is preserved; it is never replaced by an empty state.

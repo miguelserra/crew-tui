@@ -101,6 +101,42 @@ ADAPTER_PIPELINE = [
      "test_d07_allow_unverified_cannot_bypass_oracle_fail"),
     ("Adapteres D07: paridade de evidência de falha",
      "test_d07_failure_evidence_parity"),
+    ("Adapteres D09: integração e aprovação de sign-off",
+     "test_d09_01a_successful_integration_and_approval"),
+    ("Adapteres D09: falha de integração bloqueia sign-off",
+     "test_d09_01b_integration_failure_blocks_signoff"),
+    ("Adapteres D09: fixer revalida um ficheiro",
+     "test_d09_02a_fixer_revalidates_single_file"),
+    ("Adapteres D09: fixer revalida todos os ficheiros alterados",
+     "test_d09_02b_fixer_revalidates_every_changed_file"),
+    ("Adapteres D09: revalidação falha bloqueia integração",
+     "test_d09_02c_revalidation_failure_blocks_integration"),
+    ("Adapteres D09: oracle FAIL na revalidação não chama crítico",
+     "test_d09_02c_oracle_fail_in_revalidation_skips_critic"),
+    ("Adapteres D09: fixer esgotado nunca passa",
+     "test_d09_02d_fixer_exhaustion_never_passes"),
+    ("Adapteres D09: aprovação persiste e recarrega",
+     "test_d09_03a_approval_persists_and_reloads"),
+    ("Adapteres D09: evidência incompleta bloqueia aprovação",
+     "test_d09_03b_missing_evidence_blocks_approval"),
+    ("Adapteres D09: alteração de artefacto invalida aprovação",
+     "test_d09_03c_artifact_change_invalidates_approval"),
+    ("Adapteres D09: rejeição persiste e bloqueia DONE",
+     "test_d09_04a_rejection_is_persisted_and_blocks_done"),
+    ("Adapteres D09: rejeição seguida de aprovação mantém ambas",
+     "test_d09_04b_rejection_then_approval_keeps_both"),
+    ("Adapteres D09: bloqueio técnico não é rejeição humana",
+     "test_d09_04c_technical_block_is_not_human_rejection"),
+    ("Adapteres D09: oracle/critic FAIL bloqueiam sign-off",
+     "test_d09_05a_oracle_and_critic_fail_block_signoff"),
+    ("Adapteres D09: PAYG UNKNOWN bloqueia sem repetir chamada",
+     "test_d09_05c_payg_unknown_blocks_without_repeat"),
+    ("Adapteres D09: recuperação de publicação bloqueia ambos",
+     "test_d09_05d_publisher_recovery_blocks_both_adapters"),
+    ("Adapteres D09: integração incompleta bloqueia aprovação",
+     "test_d09_05e_incomplete_integration_blocks_approval"),
+    ("Adapteres D09: sem aprovação não há DONE nem publicação",
+     "test_d09_05f_missing_approval_prevents_done_and_publish"),
     ("Adapteres D04: 429 -> fallback seguro",
      "test_d04_429_fallback_matches_across_adapters"),
     ("Adapteres D04: auth/connection/server -> fallback",
@@ -225,10 +261,10 @@ MATRIX = [
         "PUBLICATION": ("N/A", "no publication required"),
     }),
     ("D09", "Integration and sign-off", {
-        "EXECUTION": ("PARTIAL", "success path only"),
-        "MODELS_BILLING_LEDGER": ("PARTIAL", "fake pool; no ledger parity"),
-        "VERIFICATION": ("PARTIAL", "integration fixer revalidation is single-path"),
-        "PUBLICATION": ("PARTIAL", "publication parity separate from sign-off flow"),
+        "EXECUTION": ("COVERED", "WorkflowEngine integration success/failure, fixer attempts, sign-off approval/rejection and DONE gate through both adapters"),
+        "MODELS_BILLING_LEDGER": ("COVERED", "same real Router/RouteChain call and transport sequence; PAYG UNKNOWN blocks with one invocation and identical ledger state"),
+        "VERIFICATION": ("COVERED", "every fixer-changed file is revalidated with oracle+critic and an artifact hash; failed/stale evidence blocks integration and sign-off"),
+        "PUBLICATION": ("COVERED", "no publish before approval; approved run publishes COMMITTED with equal status/entries/durability and approval bound to the evidence/artifact hash"),
     }),
     ("D10", "Interruption and resume", {
         "EXECUTION": ("PARTIAL", "resume after BUILD only"),
@@ -331,9 +367,12 @@ def run_safety() -> list[tuple[str, str, str, str]]:
 def run_adapter_pipeline() -> list[tuple[str, str, str, str]]:
     rows = []
     for label, method in ADAPTER_PIPELINE:
+        class_name = ("D09SignoffPipelineTests"
+                      if method.startswith("test_d09_")
+                      else "AdapterPipelineTests")
         status = _run_one("tests.test_p7_pipeline_adapters",
-                          "AdapterPipelineTests", method)
-        rows.append((label, f"AdapterPipelineTests.{method}", "", status))
+                          class_name, method)
+        rows.append((label, f"{class_name}.{method}", "", status))
     return rows
 
 

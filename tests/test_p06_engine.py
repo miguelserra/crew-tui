@@ -36,6 +36,13 @@ class FakeAdapter:
         if phase == "BUILD":
             self.project.tasks[0].status = "done"
             self.project.verifications["t1"] = s.VerificationRecord(verdict="PASS")
+            (Path(self.project.project_root) / "app.py").write_text("print('ok')\n",
+                                                                    encoding="utf-8")
+        if phase == "INTEGRATE":
+            self.project.integration = {"verdict": "PASS", "kind": "python",
+                                        "exit": 0}
+        if phase == "SIGNOFF":
+            self.project.signoff = {"goal": self.project.goal}
         return True
 
     def sync_to_project(self):
@@ -72,7 +79,10 @@ class ProfileWorkflowTests(unittest.TestCase):
         tmp, state, adapter, eng = self._engine("auto")
         try:
             eng.step(); eng.approve_spec(); eng.step(); eng.approve_architecture()
-            eng.run()
+            self.assertEqual(eng.run(), "paused")
+            self.assertEqual(state.pause.reason, "signoff_approval")
+            eng.approve_signoff()
+            self.assertEqual(eng.run(), "done")
             self.assertEqual(state.profile, "script")
             self.assertNotIn("VISUAL", adapter.calls)
             self.assertEqual(adapter.published, 1)

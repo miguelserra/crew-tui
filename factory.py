@@ -19,6 +19,7 @@ candidates/ + backups/ + tests/), so an interrupted run can be resumed with
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -39,9 +40,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from main import (LANG_SUFFIX, LLMPool, Settings, Verifier,
                   extract_code_blocks_typed, extract_json_block, guess_lang)
 import verify as verify_policy
-from registry import ModelRef
+from registry import ModelRef, unknown_ref
 from state import (StateCorruptError, validate_dependencies,
-                   VerificationRecord)
+                   TaskAttempt, VerificationRecord, new_id)
 from power import make_power
 
 ROLES = ("ANALYST", "SCAFFOLD", "ARCHITECT", "DEV", "TEST", "INTEG", "VISUAL", "SIGN")
@@ -634,7 +635,8 @@ No prose, no placeholders, no elided sections.
             record = VerificationRecord(
                 verdict=verify_policy.FAIL,
                 criterion_ids=list(task.requirement_ids),
-                oracle={"passed": False, "kind": "static", "error": error},
+                oracle={"passed": False, "kind": "static", "error": error,
+                        "artifact_sha256": hashlib.sha256((code.rstrip("\n") + "\n").encode("utf-8")).hexdigest()},
                 critic={},
                 visual={"verdict": verify_policy.NA},
                 tests={"verdict": "SKIP", "advisory": True},
@@ -671,7 +673,8 @@ No prose, no placeholders, no elided sections.
             record = VerificationRecord(
                 verdict=decision.verdict,
                 criterion_ids=list(task.requirement_ids),
-                oracle={"passed": True, "kind": "static"},
+                oracle={"passed": True, "kind": "static",
+                        "artifact_sha256": hashlib.sha256((code.rstrip("\n") + "\n").encode("utf-8")).hexdigest()},
                 critic=critic if isinstance(critic, dict) else {},
                 visual={"verdict": verify_policy.NA},
                 tests=test_result,
@@ -795,7 +798,9 @@ Output only the test file in one fenced block tagged python."""
         max_attempts = self.settings.max_verify_loops + 1
         while attempts < max_attempts:
             attempts += 1
+            fixes = list(self.state.integration.get("fix_records") or [])
             report = self._run_entry(kind, path)
+            report["fix_records"] = fixes
             self.state.integration = report
             self.log("integrate", json.dumps(report, ensure_ascii=False)[:8000])
             if report.get("verdict") == "PASS":
@@ -844,11 +849,15 @@ CURRENT FILES:
 
 Output each corrected file with `### FILE: <relative path>` then a fenced block."""
         try:
-            raw = self._ask(role, system, prompt, "DEV")
+            raw = self._ask(role, system, prompt, "DEV", "__integration_fix__")
         except Exception as e:
             self.log("integrate", f"correção ({role}) falhou: {e}")
             return False
+        model = self.pool.last_attempt_model.get("__integration_fix__") or unknown_ref()
+        call_id = new_id("intfix_")
         written = 0
+        touched_ids: set[str] = set()
+        touched_files: list[str] = []
         for rel, code in _multi_file_blocks(raw):
             dest = self._safe(rel)
             if dest is None or not code.strip():
@@ -858,11 +867,79 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(code.rstrip("\n") + "\n", encoding="utf-8")
             if task is not None:
-                task.status = "done"
+                touched_ids.add(task.id)
+                task.attempt_log.append(TaskAttempt(
+                    attempt_id=call_id, model=model,
+                    started_at=_now(), completed_at=_now(),
+                    outcome="ok").to_dict())
+            touched_files.append(rel)
             written += 1
             self.log("integrate", f"corrigido por {role}: {rel}")
+        revalidations = []
+        for task in self.state.tasks:
+            if task.id in touched_ids:
+                revalidations.append(self._revalidate_integration(task, model))
+        if written:
+            self.state.integration.setdefault("fix_records", []).append({
+                "call_id": call_id, "model": model.to_dict(),
+                "task_ids": sorted(touched_ids), "files": sorted(set(touched_files)),
+                "outcome": "ok", "revalidations": revalidations,
+                "at": _now(),
+            })
         self.emit("INTEG", f"{written} ficheiro(s) corrigido(s) por {role}")
+        if revalidations and not all(r.get("delivered") for r in revalidations):
+            self.emit("INTEG", "revalidação do fixer falhou — integração bloqueada")
+            return False
         return written > 0
+
+    def _revalidate_integration(self, task: TaskState,
+                                model: ModelRef) -> dict[str, Any]:
+        """Re-run oracle + critic on a file changed by the integration fixer."""
+        path = self._safe(task.target_file)
+        if path is None or not path.is_file():
+            task.status = "failed"
+            return {"task_id": task.id, "verdict": verify_policy.FAIL,
+                    "delivered": False, "note": "ficheiro ausente"}
+        code = path.read_text(encoding="utf-8")
+        lang = guess_lang(path)
+        fence = "" if lang in ("html", "css", "text", "") else lang
+        artifact = f"```{fence or 'text'}\n{code}\n```"
+        oracle = self.verifier.run_oracle(task.id, artifact, self.run_id,
+                                          suffix=path.suffix)
+        if not oracle.passed:
+            critic: dict[str, Any] = {"verdict": verify_policy.NA,
+                                      "note": "oracle falhou — crítico não executado"}
+        else:
+            critic = self.verifier.run_critic(model, task, code, self.run_id)
+        tests: dict[str, Any] = {"verdict": "SKIP", "advisory": True}
+        if path.suffix == ".py" and self.settings.test_oracle:
+            tests = self.verifier.run_test_oracle(task, artifact, self.run_id)
+            tests["advisory"] = True
+        decision = verify_policy.decide_build(
+            oracle.passed, critic, visual={"verdict": verify_policy.NA},
+            tests=tests, allow_unverified=self.settings.allow_unverified)
+        record = VerificationRecord(
+            verdict=decision.verdict,
+            criterion_ids=list(task.requirement_ids),
+            oracle={"passed": oracle.passed, "exit_code": oracle.exit_code,
+                    "artifact_sha256": hashlib.sha256((code.rstrip("\n") + "\n").encode("utf-8")).hexdigest()},
+            critic=critic if isinstance(critic, dict) else {},
+            visual={"verdict": verify_policy.NA},
+            tests=tests,
+            reason="; ".join(decision.reasons),
+            authorized_unverified=(decision.verdict == verify_policy.UNVERIFIED
+                                   and decision.deliver),
+            at=_now(),
+        )
+        task.verification = record.to_dict()
+        if decision.deliver:
+            task.status = "done"
+            task.delivered_by = model.to_dict()
+        else:
+            task.status = "failed"
+        self.save()
+        return {"task_id": task.id, "verdict": decision.verdict,
+                "delivered": decision.deliver}
 
     def _runtime_files(self, report: dict[str, Any]) -> list[TaskState]:
         touched: list[TaskState] = []

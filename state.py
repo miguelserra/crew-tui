@@ -800,6 +800,219 @@ class ProjectState:
             return True
         return False
 
+    # -- sign-off approval ------------------------------------------------- #
+
+    def _signoff_artifacts(self) -> dict[str, str]:
+        root_raw = self.extensions.get("workspace_root") or self.project_root
+        root = Path(root_raw).expanduser().resolve() if root_raw else None
+        hashes: dict[str, str] = {}
+        for task in sorted((t for t in self.tasks if t.kind == "build"),
+                           key=lambda t: t.id):
+            if not task.target_file:
+                hashes[task.id] = "<no-target>"
+                continue
+            if root is None:
+                hashes[task.id] = "<no-root>"
+                continue
+            path = (root / task.target_file).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError:
+                hashes[task.id] = "<escape>"
+                continue
+            if not path.is_file():
+                hashes[task.id] = "<missing>"
+                continue
+            hashes[task.id] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return hashes
+
+    @staticmethod
+    def _verification_payload(record: Optional["VerificationRecord"]) -> Any:
+        if record is None:
+            return None
+        oracle = record.oracle or {}
+        critic = record.critic or {}
+        critic_ref = critic.get("critic") if isinstance(critic, dict) else None
+        critic_model = ""
+        if isinstance(critic_ref, dict):
+            critic_model = str(critic_ref.get("model_id") or "")
+        objections = []
+        if isinstance(critic, dict):
+            for item in critic.get("objections") or []:
+                if isinstance(item, dict):
+                    objections.append(str(item.get("claim")
+                                          or item.get("why_wrong")
+                                          or item.get("evidence") or ""))
+                else:
+                    objections.append(str(item))
+        return {
+            "verdict": record.verdict,
+            "criterion_ids": sorted(record.criterion_ids),
+            "oracle_passed": bool(oracle.get("passed")),
+            "critic_verdict": (critic.get("verdict")
+                               if isinstance(critic, dict) else ""),
+            "producer_family": (critic.get("producer_family")
+                                if isinstance(critic, dict) else ""),
+            "critic_family": (critic.get("critic_family")
+                              if isinstance(critic, dict) else ""),
+            "critic_model": critic_model,
+            "objections": sorted(objections),
+            "visual_verdict": (record.visual or {}).get("verdict", ""),
+            "tests_verdict": (record.tests or {}).get("verdict", ""),
+            "reason": record.reason,
+            "authorized_unverified": record.authorized_unverified,
+        }
+
+    def _integration_payload(self) -> dict[str, Any]:
+        integration = self.integration or {}
+        fixes = []
+        for item in integration.get("fix_records") or []:
+            if not isinstance(item, dict):
+                continue
+            revalidations = []
+            for row in item.get("revalidations") or []:
+                if not isinstance(row, dict):
+                    continue
+                revalidations.append({
+                    "task_id": row.get("task_id"),
+                    "verdict": row.get("verdict"),
+                    "delivered": bool(row.get("delivered")),
+                })
+            fixes.append({
+                "task_ids": sorted(str(x) for x in item.get("task_ids") or []),
+                "files": sorted(str(x) for x in item.get("files") or []),
+                "outcome": item.get("outcome"),
+                "revalidations": sorted(revalidations,
+                                        key=lambda r: str(r.get("task_id"))),
+            })
+        fixes.sort(key=lambda x: (x["files"], x["task_ids"]))
+        return {
+            "verdict": integration.get("verdict"),
+            "kind": integration.get("kind"),
+            "exit": integration.get("exit"),
+            "note": integration.get("note"),
+            "fix_records": fixes,
+        }
+
+    @staticmethod
+    def _visual_payload(visual: dict[str, Any] | None) -> dict[str, Any]:
+        visual = visual or {}
+        vision = visual.get("vision") or {}
+        objections = []
+        if isinstance(vision, dict):
+            for item in vision.get("objections") or []:
+                if isinstance(item, dict):
+                    objections.append(str(item.get("claim")
+                                          or item.get("evidence") or ""))
+                else:
+                    objections.append(str(item))
+        return {
+            "verdict": visual.get("verdict"),
+            "note": visual.get("note"),
+            "vision_verdict": (vision.get("verdict")
+                               if isinstance(vision, dict) else ""),
+            "vision_objections": sorted(objections),
+        }
+
+    def signoff_evidence(self) -> dict[str, Any]:
+        tasks = []
+        for task in sorted(self.tasks, key=lambda t: t.id):
+            if task.kind != "build":
+                continue
+            tasks.append({
+                "id": task.id,
+                "target_file": task.target_file,
+                "status": task.status,
+                "verification": self._verification_payload(
+                    self.verifications.get(task.id)),
+            })
+        return {
+            "architecture_hash": self.architecture_hash(),
+            "tasks": tasks,
+            "integration": self._integration_payload(),
+            "visual": self._visual_payload(self.visual),
+            "artifacts": self._signoff_artifacts(),
+            "signoff_generated": bool(self.signoff),
+        }
+
+    def signoff_hash(self) -> str:
+        return sha256_json(self.signoff_evidence())
+
+    def signoff_blockers(self) -> list[str]:
+        blockers: list[str] = []
+        if not self.architecture_approved():
+            blockers.append("arquitetura não aprovada")
+        artifacts = self._signoff_artifacts()
+        build_tasks = [t for t in self.tasks if t.kind == "build"]
+        for task in sorted(build_tasks, key=lambda t: t.id):
+            if task.status not in ("done", "verified"):
+                blockers.append(f"tarefa incompleta: {task.id}")
+            record = self.verifications.get(task.id)
+            if record is None:
+                blockers.append(f"verificação ausente: {task.id}")
+            elif record.verdict == "FAIL":
+                blockers.append(f"verificação falhou: {task.id}")
+            elif (record.verdict == "UNVERIFIED"
+                  and not record.authorized_unverified):
+                blockers.append(f"verificação não autorizada: {task.id}")
+            artifact = artifacts.get(task.id)
+            if artifact in (None, "<missing>", "<escape>", "<no-root>",
+                            "<no-target>"):
+                blockers.append(f"artefacto ausente: {task.id}")
+            elif record is not None:
+                expected = (record.oracle or {}).get("artifact_sha256")
+                if expected and str(expected) != str(artifact):
+                    blockers.append(f"evidência desatualizada: {task.id}")
+        integration = self.integration or {}
+        verdict = integration.get("verdict")
+        if not integration or not verdict:
+            blockers.append("integração incompleta")
+        elif verdict == "FAIL":
+            blockers.append("integração falhou")
+        elif verdict == "UNVERIFIED":
+            blockers.append("integração não verificada")
+        elif verdict not in ("PASS", "SKIP", "NA"):
+            blockers.append(f"integração incompleta: {verdict}")
+        visual_verdict = (self.visual or {}).get("verdict")
+        if visual_verdict == "FAIL":
+            blockers.append("visual falhou")
+        elif visual_verdict == "UNVERIFIED":
+            blockers.append("visual não verificado")
+        if not self.signoff:
+            blockers.append("sign-off não gerado")
+        return blockers
+
+    def signoff_decision(self) -> Optional[Approval]:
+        h = self.signoff_hash()
+        for approval in reversed(self.approvals):
+            if approval.kind == "signoff" and approval.artifact_hash == h:
+                return approval
+        return None
+
+    def signoff_approved(self) -> bool:
+        decision = self.signoff_decision()
+        return bool(decision and decision.decision == "approved")
+
+    def approve_signoff(self, actor: str = "human",
+                        detail: str = "") -> Approval:
+        blockers = self.signoff_blockers()
+        if blockers:
+            raise StateValidationError(
+                "sign-off bloqueado: " + "; ".join(blockers))
+        approval = Approval(kind="signoff", artifact_hash=self.signoff_hash(),
+                            actor=actor, decision="approved",
+                            timestamp=utc_now(), detail=detail)
+        self.approvals.append(approval)
+        return approval
+
+    def reject_signoff(self, actor: str = "human",
+                       reason: str = "") -> Approval:
+        approval = Approval(kind="signoff", artifact_hash=self.signoff_hash(),
+                            actor=actor, decision="rejected",
+                            timestamp=utc_now(), detail=reason)
+        self.approvals.append(approval)
+        return approval
+
     # -- serialization ----------------------------------------------------- #
 
     def to_dict(self) -> dict[str, Any]:

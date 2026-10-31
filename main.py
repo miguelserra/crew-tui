@@ -4471,6 +4471,22 @@ def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
             print("gate fechado: usa --approve-architecture (--yes não o contorna)",
                   flush=True)
             return 4
+        if reason == "signoff_approval":
+            print(f"[GATE] sign-off pronto: {state.signoff_hash()}", flush=True)
+            if getattr(args, "approve_signoff", False):
+                try:
+                    eng.approve_signoff()
+                except StateError as exc:
+                    print(f"gate bloqueado: {exc}", flush=True)
+                    return 4
+                print("[GATE] sign-off aprovado", flush=True)
+                continue
+            print("gate fechado: usa --approve-signoff (--yes não o contorna)",
+                  flush=True)
+            return 4
+        if reason == "signoff_rejected":
+            print(f"[GATE] sign-off rejeitado: {state.pause.detail}", flush=True)
+            return 4
         print(f"PAUSED · {reason}: {state.pause.detail}", flush=True)
         return 4
     print("PAUSED · limite de iterações do motor", flush=True)
@@ -4639,6 +4655,8 @@ def main() -> None:
                         help="workflow: auto|web|library|script|review")
     parser.add_argument("--approve-architecture", action="store_true",
                         help="aprova a arquitetura (o --yes não a aprova)")
+    parser.add_argument("--approve-signoff", action="store_true",
+                        help="aprova o sign-off final (o --yes não o aprova)")
     parser.add_argument("--resolve-publish-conflict", action="store_true",
                         help="resolve/recover a pending transactional publish")
     parser.add_argument("--journal", metavar="ID",

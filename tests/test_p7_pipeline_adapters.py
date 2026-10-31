@@ -10,6 +10,8 @@ D06: CONFIRMED result replay after crash boundaries, fingerprint changes,
 missing/non-replayable artifacts, and history deduplication.
 """
 
+import hashlib
+import json
 import sys
 import tempfile
 import types
@@ -60,11 +62,12 @@ class Http500(Exception):
 class FakeVerifier:
     """Deterministic critic with explicit quality-rejection modes."""
 
-    def __init__(self, mode="pass"):
+    def __init__(self, mode="pass", critic_verdicts=None):
         self.mode = mode
         self.critic_calls = []
         self._calls = {}
         self.oracle_calls = []
+        self.critic_verdicts = list(critic_verdicts or [])
 
     def run_oracle(self, task_id, artifact, run_id=None, suffix=""):
         # Fail if artifact contains syntactically invalid Python pattern
@@ -85,9 +88,13 @@ class FakeVerifier:
         key = getattr(task, "id", task)
         n = self._calls.get(key, 0) + 1
         self._calls[key] = n
-        reject = self.mode == "always_fail" or (
-            self.mode == "fail_first" and n == 1)
-        verdict = "FAIL" if reject else "PASS"
+        if self.critic_verdicts:
+            verdict = self.critic_verdicts.pop(0)
+            reject = verdict == "FAIL"
+        else:
+            reject = self.mode == "always_fail" or (
+                self.mode == "fail_first" and n == 1)
+            verdict = "FAIL" if reject else "PASS"
         objections = ([{"claim": "missing acceptance behaviour",
                         "evidence": "critic rejected first artifact"}]
                       if reject else [])
@@ -147,6 +154,14 @@ class FakeHandle:
     def invoke(self, messages):
         self.log.append(self.behavior)
         self.owner.transport.append((self.ref.model_id, self.behavior))
+        responder = getattr(self.owner, "responder", None)
+        if responder is not None:
+            reply = responder(self.ref, messages)
+            if isinstance(reply, BaseException):
+                raise reply
+            self.owner.last_served = self.ref
+            return types.SimpleNamespace(
+                content=str(reply), usage_metadata={}, response_metadata={})
         if self.behavior == "429":
             raise Http429("rate limited")
         if self.behavior == "auth":
@@ -182,8 +197,9 @@ class FakeHandle:
 class PipelinePool:
     """Pool shim: real Router/RouteChain + canonical attempt/ledger wiring."""
 
-    def __init__(self, script, registry_mode="full"):
+    def __init__(self, script, registry_mode="full", responder=None):
         self.script = script
+        self.responder = responder
         self.calls = []
         self.transport = []
         self.telemetry = None
@@ -1057,6 +1073,414 @@ class AdapterPipelineTests(unittest.TestCase):
                              "call_recovery_failed")
             self.assertEqual(resumed["transport"], [])
             self.assertFalse(resumed["ledger"].get(rec.call_id).consumed)
+
+
+class D09SignoffPipelineTests(unittest.TestCase):
+    """D09: integration, fixer revalidation, sign-off approval/rejection and
+    gate prevention through the real WorkflowEngine and both adapters."""
+
+    def _responder(self, initial="print('ok')", fix="", multi_fix=None):
+        def responder(ref, messages):
+            blob = "\n".join(str(getattr(m, "content", m)) for m in messages)
+            if "handover memory" in blob:
+                return json.dumps({
+                    "what_it_is": "demo",
+                    "how_to_run": ["python app.py"],
+                    "entrypoints": ["app.py"],
+                    "architecture_notes": [],
+                    "tests": [],
+                    "known_issues": [],
+                    "next_steps": [],
+                })
+            if "fix the runtime/integration defects" in blob:
+                return multi_fix if multi_fix is not None else fix
+            if "Deliverable file: util.py" in blob:
+                return "```python\nx = 2\n```"
+            return f"```python\n{initial}\n```"
+        return responder
+
+    def _tasks(self):
+        return [
+            s.Task("a", kind="build", target_file="app.py", acceptance=["runs"]),
+            s.Task("b", kind="build", target_file="util.py", acceptance=["runs"]),
+        ]
+
+    def _run(self, kind, *, initial="print('ok')", fix="", multi_fix=None,
+             tasks=None, verifier=None):
+        base = Path(tempfile.mkdtemp(prefix=f"d09-{kind}-"))
+        project = base / "project"; project.mkdir()
+        ws = base / "ws"
+        cfg = settings(base)
+        cfg.max_verify_loops = 1
+        cfg.visual_check = False
+        st = make_state(project, ws, "medium", tasks)
+        st.phase = "BUILD"
+        st.profile = "script"
+        pool = PipelinePool({}, responder=self._responder(initial, fix, multi_fix))
+        verifier = verifier or FakeVerifier()
+        adapter = _make_adapter(kind, cfg, pool, st, verifier)
+        store = StateManager(cfg.workspace_dir, cfg.log_dir)
+        eng = engine.WorkflowEngine(st, store, adapter, emit=lambda *a: None)
+        eng.apply_pool(pool)
+        return {"kind": kind, "base": base, "project": project, "ws": ws,
+                "settings": cfg, "state": st, "pool": pool,
+                "verifier": verifier, "adapter": adapter, "engine": eng}
+
+    def _drive(self, run, limit=16):
+        results = []
+        for _ in range(limit):
+            result = run["engine"].step()
+            results.append(result)
+            if result in ("paused", "failed", "done"):
+                break
+        run["results"] = results
+        return results[-1] if results else ""
+
+    def _file_hash(self, run, rel):
+        root = Path(run["state"].extensions["workspace_root"])
+        return hashlib.sha256((root / rel).read_bytes()).hexdigest()
+
+    def _canon_fixes(self, st):
+        out = []
+        for item in (st.integration or {}).get("fix_records") or []:
+            out.append({
+                "task_ids": sorted(item.get("task_ids") or []),
+                "files": sorted(item.get("files") or []),
+                "outcome": item.get("outcome"),
+                "revalidations": sorted(
+                    ({"task_id": r.get("task_id"), "verdict": r.get("verdict"),
+                      "delivered": bool(r.get("delivered"))}
+                     for r in item.get("revalidations") or []),
+                    key=lambda r: str(r["task_id"])),
+            })
+        return out
+
+    def _successful_pause(self, kind):
+        run = self._run(kind)
+        self.assertEqual(self._drive(run), "paused", kind)
+        self.assertEqual(run["state"].phase, "SIGNOFF", kind)
+        self.assertEqual(run["state"].pause.reason, "signoff_approval", kind)
+        self.assertEqual(run["state"].integration.get("verdict"), "PASS", kind)
+        self.assertFalse(run["state"].signoff_approved(), kind)
+        self.assertNotIn("publish", run["state"].extensions, kind)
+        return run
+
+    def test_d09_01a_successful_integration_and_approval(self):
+        runs = {}
+        for kind in ("factory", "native"):
+            run = self._successful_pause(kind)
+            approval = run["engine"].approve_signoff("reviewer", "evidence checked")
+            self.assertEqual(run["engine"].run(), "done", kind)
+            self.assertEqual(run["state"].phase, "DONE", kind)
+            self.assertTrue(run["state"].signoff_approved(), kind)
+            self.assertIn("publish", run["state"].extensions, kind)
+            self.assertEqual(approval.artifact_hash, run["state"].signoff_hash(), kind)
+            self.assertEqual(run["state"].tasks[0].status, "done", kind)
+            runs[kind] = run
+        ref, new = runs["factory"], runs["native"]
+        self.assertEqual(ref["state"].signoff_hash(), new["state"].signoff_hash())
+        self.assertEqual(
+            [a.artifact_hash for a in ref["state"].approvals if a.kind == "signoff"],
+            [a.artifact_hash for a in new["state"].approvals if a.kind == "signoff"])
+        self.assertEqual(ref["state"].signoff_evidence(),
+                         new["state"].signoff_evidence())
+        self.assertEqual(ref["state"].phase, new["state"].phase)
+        self.assertEqual(ref["pool"].calls, new["pool"].calls)
+        self.assertEqual(ref["pool"].transport, new["pool"].transport)
+        pub_f = ref["state"].extensions["publish"]
+        pub_n = new["state"].extensions["publish"]
+        self.assertEqual(pub_f.get("status"), "COMMITTED")
+        self.assertEqual(pub_f.get("status"), pub_n.get("status"))
+        self.assertEqual(pub_f.get("entries"), pub_n.get("entries"))
+        self.assertEqual(pub_f.get("durability"), pub_n.get("durability"))
+        self.assertEqual((ref["project"] / "app.py").read_bytes(),
+                         (new["project"] / "app.py").read_bytes())
+
+    def test_d09_01b_integration_failure_blocks_signoff(self):
+        for kind in ("factory", "native"):
+            run = self._run(kind, initial="raise RuntimeError('boom')", fix="")
+            self.assertEqual(self._drive(run), "failed", kind)
+            st = run["state"]
+            self.assertEqual(st.phase, "INTEGRATE", kind)
+            self.assertEqual(st.pause.reason, "integrate_failed", kind)
+            self.assertEqual(st.integration.get("verdict"), "FAIL", kind)
+            self.assertFalse(st.signoff_approved(), kind)
+            self.assertFalse((run["ws"] / "project_memory.json").exists(), kind)
+            self.assertNotIn("publish", st.extensions, kind)
+            self.assertFalse(st.signoff_blockers() == [], kind)
+
+    def test_d09_02a_fixer_revalidates_single_file(self):
+        fix = "### FILE: app.py\n```python\nprint('fixed')\n```\n"
+        runs = {}
+        for kind in ("factory", "native"):
+            run = self._run(kind, initial="raise RuntimeError('boom')", multi_fix=fix)
+            self.assertEqual(self._drive(run), "paused", kind)
+            st = run["state"]
+            self.assertEqual(st.integration.get("verdict"), "PASS", kind)
+            fixes = self._canon_fixes(st)
+            self.assertEqual(len(fixes), 1, kind)
+            self.assertEqual(fixes[0]["task_ids"], ["a"], kind)
+            self.assertEqual(fixes[0]["files"], ["app.py"], kind)
+            self.assertEqual(fixes[0]["revalidations"],
+                             [{"task_id": "a", "verdict": "PASS",
+                               "delivered": True}], kind)
+            rec = st.verifications["a"]
+            self.assertEqual(rec.oracle.get("artifact_sha256"),
+                             self._file_hash(run, "app.py"), kind)
+            self.assertEqual(st.tasks[0].status, "done", kind)
+            runs[kind] = run
+        self.assertEqual(runs["factory"]["state"].signoff_evidence(),
+                         runs["native"]["state"].signoff_evidence())
+        self.assertEqual(runs["factory"]["pool"].calls,
+                         runs["native"]["pool"].calls)
+        self.assertEqual(runs["factory"]["pool"].transport,
+                         runs["native"]["pool"].transport)
+
+    def test_d09_02b_fixer_revalidates_every_changed_file(self):
+        fix = ("### FILE: app.py\n```python\nprint('fixed')\n```\n"
+               "### FILE: util.py\n```python\nx = 3\n```\n")
+        runs = {}
+        for kind in ("factory", "native"):
+            run = self._run(kind, initial="raise RuntimeError('boom')",
+                            multi_fix=fix, tasks=self._tasks())
+            self.assertEqual(self._drive(run), "paused", kind)
+            st = run["state"]
+            self.assertEqual(st.integration.get("verdict"), "PASS", kind)
+            fixes = self._canon_fixes(st)
+            self.assertEqual(len(fixes), 1, kind)
+            self.assertEqual(fixes[0]["task_ids"], ["a", "b"], kind)
+            self.assertEqual(fixes[0]["files"], ["app.py", "util.py"], kind)
+            self.assertEqual(fixes[0]["revalidations"], [
+                {"task_id": "a", "verdict": "PASS", "delivered": True},
+                {"task_id": "b", "verdict": "PASS", "delivered": True},
+            ], kind)
+            for task_id, rel in (("a", "app.py"), ("b", "util.py")):
+                rec = st.verifications[task_id]
+                self.assertEqual(rec.oracle.get("artifact_sha256"),
+                                 self._file_hash(run, rel), (kind, task_id))
+                task = next(t for t in st.tasks if t.id == task_id)
+                self.assertEqual(task.status, "done", (kind, task_id))
+            runs[kind] = run
+        self.assertEqual(runs["factory"]["state"].signoff_evidence(),
+                         runs["native"]["state"].signoff_evidence())
+
+    def test_d09_02c_revalidation_failure_blocks_integration(self):
+        fix = "### FILE: app.py\n```python\nprint('fixed')\n```\n"
+        for kind in ("factory", "native"):
+            verifier = FakeVerifier(critic_verdicts=["PASS", "FAIL"])
+            run = self._run(kind, initial="raise RuntimeError('boom')",
+                            multi_fix=fix, verifier=verifier)
+            self.assertEqual(self._drive(run), "failed", kind)
+            st = run["state"]
+            self.assertEqual(st.pause.reason, "integrate_failed", kind)
+            self.assertEqual(st.integration.get("verdict"), "FAIL", kind)
+            fixes = self._canon_fixes(st)
+            self.assertEqual(len(fixes), 1, kind)
+            self.assertEqual(fixes[0]["revalidations"],
+                             [{"task_id": "a", "verdict": "FAIL",
+                               "delivered": False}], kind)
+            self.assertEqual(st.tasks[0].status, "failed", kind)
+            self.assertFalse(st.signoff_approved(), kind)
+            self.assertFalse((run["ws"] / "project_memory.json").exists(), kind)
+
+    def test_d09_02c_oracle_fail_in_revalidation_skips_critic(self):
+        fix = "### FILE: app.py\n```python\ndef broken(:\n```\n"
+        for kind in ("factory", "native"):
+            verifier = FakeVerifier()
+            run = self._run(kind, initial="raise RuntimeError('boom')",
+                            multi_fix=fix, verifier=verifier)
+            self.assertEqual(self._drive(run), "failed", kind)
+            st = run["state"]
+            self.assertEqual(st.pause.reason, "integrate_failed", kind)
+            fixes = self._canon_fixes(st)
+            self.assertEqual(fixes[0]["revalidations"],
+                             [{"task_id": "a", "verdict": "FAIL",
+                               "delivered": False}], kind)
+            self.assertEqual(st.tasks[0].status, "failed", kind)
+            self.assertEqual(len(verifier.critic_calls), 1, kind)
+            self.assertFalse(st.signoff_approved(), kind)
+
+    def test_d09_02d_fixer_exhaustion_never_passes(self):
+        bad_fix = "### FILE: app.py\n```python\nraise RuntimeError('boom')\n```\n"
+        for kind in ("factory", "native"):
+            run = self._run(kind, initial="raise RuntimeError('boom')",
+                            multi_fix=bad_fix)
+            self.assertEqual(self._drive(run), "failed", kind)
+            st = run["state"]
+            self.assertEqual(st.pause.reason, "integrate_failed", kind)
+            self.assertEqual(st.integration.get("verdict"), "FAIL", kind)
+            fixes = self._canon_fixes(st)
+            self.assertEqual(len(fixes), 2, kind)
+            self.assertTrue(all(r["verdict"] == "PASS"
+                                for item in fixes
+                                for r in item["revalidations"]), kind)
+            self.assertFalse(st.signoff_approved(), kind)
+            self.assertNotIn("publish", st.extensions, kind)
+
+    def test_d09_03a_approval_persists_and_reloads(self):
+        runs = {}
+        for kind in ("factory", "native"):
+            run = self._successful_pause(kind)
+            approval = run["engine"].approve_signoff("reviewer", "checked")
+            self.assertTrue(run["state"].signoff_approved(), kind)
+            reloaded = s.ProjectState.from_dict(run["state"].to_dict())
+            self.assertTrue(reloaded.signoff_approved(), kind)
+            self.assertEqual(reloaded.signoff_hash(), approval.artifact_hash, kind)
+            self.assertTrue(any(a.kind == "signoff" and a.decision == "approved"
+                                and a.artifact_hash == approval.artifact_hash
+                                for a in reloaded.approvals), kind)
+            path = run["engine"].store.project_state_path(run["state"].project_root)
+            persisted = run["engine"].store.load_project(path)
+            self.assertTrue(persisted.signoff_approved(), kind)
+            self.assertEqual(persisted.signoff_hash(), approval.artifact_hash, kind)
+            runs[kind] = run
+        self.assertEqual(
+            [a.artifact_hash for a in runs["factory"]["state"].approvals
+             if a.kind == "signoff"],
+            [a.artifact_hash for a in runs["native"]["state"].approvals
+             if a.kind == "signoff"])
+
+    def test_d09_03b_missing_evidence_blocks_approval(self):
+        for kind in ("factory", "native"):
+            run = self._successful_pause(kind)
+            del run["state"].verifications["a"]
+            with self.assertRaises(s.StateValidationError):
+                run["engine"].approve_signoff()
+            self.assertFalse(any(a.kind == "signoff"
+                                 for a in run["state"].approvals), kind)
+            self.assertFalse(run["state"].signoff_approved(), kind)
+
+    def test_d09_03c_artifact_change_invalidates_approval(self):
+        for kind in ("factory", "native"):
+            run = self._successful_pause(kind)
+            old = run["engine"].approve_signoff()
+            target = Path(run["state"].extensions["workspace_root"]) / "app.py"
+            target.write_text("print('changed')\n", encoding="utf-8")
+            self.assertFalse(run["state"].signoff_approved(), kind)
+            with self.assertRaises(s.StateValidationError):
+                run["engine"].approve_signoff()
+            decisions = [a for a in run["state"].approvals
+                         if a.kind == "signoff"]
+            self.assertEqual([a.artifact_hash for a in decisions],
+                             [old.artifact_hash], kind)
+            self.assertEqual(run["state"].phase, "SIGNOFF", kind)
+
+    def test_d09_04a_rejection_is_persisted_and_blocks_done(self):
+        for kind in ("factory", "native"):
+            run = self._successful_pause(kind)
+            rejection = run["engine"].reject_signoff("human", "UI is wrong")
+            self.assertEqual(run["state"].pause.reason,
+                             "signoff_rejected", kind)
+            self.assertEqual(run["engine"].step(), "paused", kind)
+            self.assertNotEqual(run["state"].phase, "DONE", kind)
+            self.assertFalse(run["state"].signoff_approved(), kind)
+            self.assertEqual(rejection.decision, "rejected", kind)
+            self.assertEqual(rejection.detail, "UI is wrong", kind)
+            reloaded = s.ProjectState.from_dict(run["state"].to_dict())
+            self.assertTrue(any(a.kind == "signoff" and a.decision == "rejected"
+                                and a.detail == "UI is wrong"
+                                for a in reloaded.approvals), kind)
+
+    def test_d09_04b_rejection_then_approval_keeps_both(self):
+        for kind in ("factory", "native"):
+            run = self._successful_pause(kind)
+            run["engine"].reject_signoff("human", "first attempt rejected")
+            run["engine"].approve_signoff("reviewer", "fixed")
+            self.assertEqual(run["engine"].run(), "done", kind)
+            decisions = [a for a in run["state"].approvals
+                         if a.kind == "signoff"]
+            self.assertEqual([a.decision for a in decisions],
+                             ["rejected", "approved"], kind)
+            self.assertEqual(decisions[0].detail, "first attempt rejected", kind)
+            self.assertEqual(run["state"].phase, "DONE", kind)
+
+    def test_d09_04c_technical_block_is_not_human_rejection(self):
+        for kind in ("factory", "native"):
+            run = self._successful_pause(kind)
+            run["state"].verifications["a"].verdict = "FAIL"
+            with self.assertRaises(s.StateValidationError):
+                run["engine"].approve_signoff()
+            self.assertEqual(run["state"].pause.reason,
+                             "signoff_approval", kind)
+            decisions = [a for a in run["state"].approvals
+                         if a.kind == "signoff"]
+            self.assertEqual(decisions, [], kind)
+            self.assertNotEqual(run["state"].phase, "DONE", kind)
+
+    def test_d09_05a_oracle_and_critic_fail_block_signoff(self):
+        for kind in ("factory", "native"):
+            for failure in ("oracle", "critic"):
+                run = self._successful_pause(kind)
+                rec = run["state"].verifications["a"]
+                rec.verdict = "FAIL"
+                if failure == "oracle":
+                    rec.oracle = {"passed": False}
+                    rec.critic = {"verdict": "PASS"}
+                else:
+                    rec.oracle = {"passed": True}
+                    rec.critic = {"verdict": "FAIL",
+                                  "critic": {"ok": False}}
+                with self.assertRaises(s.StateValidationError):
+                    run["engine"].approve_signoff()
+                self.assertFalse(run["state"].signoff_approved(), (kind, failure))
+                self.assertNotEqual(run["state"].phase, "DONE", (kind, failure))
+
+    def test_d09_05c_payg_unknown_blocks_without_repeat(self):
+        script = {"gemini-3.1-pro-preview": "timeout"}
+        runs = {}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high",
+                               registry_mode="payg_first")
+            self.assertEqual(run["result"], "failed", kind)
+            calls_before = list(run["pool"].calls)
+            run["state"].pause = s.PauseState()
+            self.assertEqual(run["engine"].step(), "paused", kind)
+            self.assertEqual(run["state"].pause.reason,
+                             "call_unknown_failed", kind)
+            self.assertEqual(run["pool"].calls, calls_before, kind)
+            self.assertNotEqual(run["state"].phase, "DONE", kind)
+            self.assertFalse(run["state"].signoff_approved(), kind)
+            runs[kind] = run
+        self.assertEqual(len(runs["factory"]["pool"].calls), 1)
+        self.assertEqual(len(runs["native"]["pool"].calls), 1)
+        recs_f = runs["factory"]["ledger"].unresolved("r")
+        recs_n = runs["native"]["ledger"].unresolved("r")
+        self.assertEqual([(r.state, r.error_kind) for r in recs_f],
+                         [(r.state, r.error_kind) for r in recs_n])
+
+    def test_d09_05d_publisher_recovery_blocks_both_adapters(self):
+        for kind in ("factory", "native"):
+            run = self._successful_pause(kind)
+            run["state"].pause = s.PauseState()
+            run["adapter"].recovery_error = "journal corrompido"
+            with self.assertRaises((engine.EngineError,
+                                    native_adapter.NativeAdapterError)):
+                run["engine"].step()
+            self.assertEqual(run["state"].phase, "SIGNOFF", kind)
+            self.assertNotIn("publish", run["state"].extensions, kind)
+
+    def test_d09_05e_incomplete_integration_blocks_approval(self):
+        for kind in ("factory", "native"):
+            run = self._successful_pause(kind)
+            run["state"].integration = {}
+            with self.assertRaises(s.StateValidationError) as ctx:
+                run["engine"].approve_signoff()
+            self.assertIn("integração incompleta", str(ctx.exception), kind)
+            self.assertFalse(any(a.kind == "signoff"
+                                 for a in run["state"].approvals), kind)
+            self.assertNotEqual(run["state"].phase, "DONE", kind)
+
+    def test_d09_05f_missing_approval_prevents_done_and_publish(self):
+        for kind in ("factory", "native"):
+            run = self._successful_pause(kind)
+            self.assertEqual(run["engine"].step(), "paused", kind)
+            self.assertEqual(run["state"].phase, "SIGNOFF", kind)
+            self.assertEqual(run["state"].pause.reason,
+                             "signoff_approval", kind)
+            self.assertFalse(run["state"].signoff_approved(), kind)
+            self.assertNotIn("publish", run["state"].extensions, kind)
+            self.assertFalse(any(a.kind == "signoff"
+                                 for a in run["state"].approvals), kind)
 
 
 if __name__ == "__main__":

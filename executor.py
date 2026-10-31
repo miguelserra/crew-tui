@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Optional
@@ -246,7 +247,8 @@ Output the COMPLETE corrected file in ONE fenced block."""
             tests=tests, allow_unverified=self.settings.allow_unverified)
         record = VerificationRecord(
             verdict=decision.verdict, criterion_ids=list(task.requirement_ids),
-            oracle={"passed": oracle.passed, "exit_code": oracle.exit_code},
+            oracle={"passed": oracle.passed, "exit_code": oracle.exit_code,
+                    "artifact_sha256": hashlib.sha256((code.rstrip("\n") + "\n").encode("utf-8")).hexdigest()},
             critic=critic if isinstance(critic, dict) else {},
             visual={"verdict": verify_policy.NA}, tests=tests,
             reason="; ".join(decision.reasons),
