@@ -197,6 +197,36 @@ ADAPTER_PIPELINE = [
      "test_d10_11e_real_process_signoff_after_rejection"),
     ("Adapteres D10: crash real PUBLICATION com recovery pendente",
      "test_d10_11f_real_process_publication_recovery_pending"),
+    ("Adapteres D11: publicação normal equivalente",
+     "test_d11_01_normal_publication_is_equivalent"),
+    ("Adapteres D11: modificação externa após plano é conflito",
+     "test_d11_02_external_change_after_planning_is_a_conflict"),
+    ("Adapteres D11: falha de hash faz rollback",
+     "test_d11_03_hash_mismatch_rolls_back"),
+    ("Adapteres D11: resolução explícita via adapter",
+     "test_d11_04_explicit_resolution_uses_adapter_interface"),
+    ("Adapteres D11: deleção autorizada é equivalente",
+     "test_d11_05_authorized_deletion_is_equivalent"),
+    ("Adapteres D11: deleção sem autorização é bloqueada",
+     "test_d11_06_unauthorized_deletion_is_blocked"),
+    ("Adapteres D11: alvo de deleção alterado é bloqueado",
+     "test_d11_07_deletion_target_modified_externally_is_blocked"),
+    ("Adapteres D11: rollback de deleção restaura original",
+     "test_d11_08_deletion_rollback_restores_original"),
+    ("Adapteres D11: descoberta de órfãos equivalente",
+     "test_d11_09_orphan_discovery_is_equivalent"),
+    ("Adapteres D11: inspeção de órfãos é dry-run",
+     "test_d11_10_default_orphan_inspection_is_dry_run"),
+    ("Adapteres D11: limpeza explícita de órfãos é segura",
+     "test_d11_11_explicit_orphan_cleanup_is_safe"),
+    ("Adapteres D11: id de órfão inválido é seguro",
+     "test_d11_12_invalid_orphan_identifier_is_safe"),
+    ("Adapteres D11: publicação exige aprovação",
+     "test_d11_13_publication_requires_approval"),
+    ("Adapteres D11: aprovação stale não publica",
+     "test_d11_14_stale_approval_cannot_publish"),
+    ("Adapteres D11: recovery existente bloqueia publicação",
+     "test_d11_15_existing_recovery_blocks_publication"),
     ("Adapteres D04: 429 -> fallback seguro",
      "test_d04_429_fallback_matches_across_adapters"),
     ("Adapteres D04: auth/connection/server -> fallback",
@@ -333,10 +363,10 @@ MATRIX = [
         "PUBLICATION": ("COVERED", "COMMITTED recovered without repetition, ROLLED_BACK not success, RECOVERY_REQUIRED blocks DONE; full publisher crash parity remains D11/D12"),
     }),
     ("D11", "Publication conflict and recovery", {
-        "EXECUTION": ("COVERED", "publication parity/conflict sandbox"),
-        "MODELS_BILLING_LEDGER": ("N/A", "no model/billing operation"),
-        "VERIFICATION": ("N/A", "no verification operation"),
-        "PUBLICATION": ("PARTIAL", "deletion/orphan via adapters not compared"),
+        "EXECUTION": ("COVERED", "normal, external-conflict, resolution, deletion, orphan and approval gates through both adapters"),
+        "MODELS_BILLING_LEDGER": ("N/A", "publication and recovery invoke no provider; no ledger mutation"),
+        "VERIFICATION": ("COVERED", "sign-off approval eligibility, exact artifact/evidence binding and stale-approval rejection before publication"),
+        "PUBLICATION": ("COVERED", "manifests, hashes, conflicts, authorized/unauthorized deletions, rollback, orphan discovery/cleanup and recovered publication compared through both adapters"),
     }),
     ("D12", "Publisher crash recovery", {
         "EXECUTION": ("PARTIAL", "P6.1 unit matrix, not through both adapters"),
@@ -431,6 +461,8 @@ def run_adapter_pipeline() -> list[tuple[str, str, str, str]]:
             class_name = "D09SignoffPipelineTests"
         elif method.startswith("test_d10_"):
             class_name = "D10ResumePipelineTests"
+        elif method.startswith("test_d11_"):
+            class_name = "D11PublicationPipelineTests"
         else:
             class_name = "AdapterPipelineTests"
         status = _run_one("tests.test_p7_pipeline_adapters",

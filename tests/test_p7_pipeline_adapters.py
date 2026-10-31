@@ -2154,5 +2154,431 @@ class D10ResumePipelineTests(unittest.TestCase):
             self.assertEqual(st.tasks[1].status, "done", kind)
 
 
+@unittest.skipUnless(DEPS_OK, f"runtime deps missing: {DEPS_ERR}")
+class D11PublicationPipelineTests(unittest.TestCase):
+    """D11: adapter-level publication conflicts, deletions, orphans and gates."""
+
+    def _base(self, *, files=None, deletion=None, tasks=None):
+        base = Path(tempfile.mkdtemp(prefix="d11-"))
+        project = base / "project"; project.mkdir()
+        ws = base / "ws"
+        st = s.ProjectState(run_id="r", project_root=str(project), goal="demo",
+                            engine_kind=s.ENGINE_UNIFIED, phase="SIGNOFF",
+                            profile="script")
+        st.requirements = s.RequirementContract(
+            objective="demo",
+            acceptance=[s.AcceptanceCriterion(id="ac1", text="runs")])
+        st.architecture = s.ArchitectureContract(
+            approach="script", modules=[{"path": "app.py"}],
+            interfaces=[{"name": "main", "file": "app.py"}])
+        st.tasks = tasks or [
+            s.Task("a", kind="build", target_file="app.py",
+                   acceptance=["runs"], requirement_ids=["ac1"])]
+        if deletion is not None:
+            st.architecture.deletions = [deletion]
+        for rel, content in (files or {"app.py": "print('ok')\n"}).items():
+            path = project / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        st.extensions["workspace_root"] = str(ws)
+        st.approve_architecture()
+        cfg = settings(base)
+        store = StateManager(cfg.workspace_dir, cfg.log_dir)
+        store.save_project(st)
+        return {"base": base, "project": project, "ws": ws, "settings": cfg,
+                "state": st, "store": store}
+
+    def _engine(self, kind, run, responder=None):
+        cfg = settings(run["base"])
+        cfg.max_verify_loops = 1
+        st = run["store"].load_project(
+            run["store"].project_state_path(run["state"].project_root))
+        if responder is None:
+            def responder(ref, messages):
+                raise AssertionError("unexpected model call")
+        pool = PipelinePool({}, responder=responder)
+        verifier = FakeVerifier()
+        adapter = _make_adapter(kind, cfg, pool, st, verifier)
+        eng = engine.WorkflowEngine(st, run["store"], adapter,
+                                    emit=lambda *a: None)
+        eng.apply_pool(pool)
+        return {"kind": kind, "base": run["base"], "project": run["project"],
+                "ws": run["ws"], "settings": cfg, "state": st, "pool": pool,
+                "verifier": verifier, "adapter": adapter, "engine": eng}
+
+    def _approved(self, kind, run, content="print('ok')\n", responder=None,
+                  workspace_content=None, workspace_files=None):
+        seed = self._engine(kind, run)
+        st = seed["state"]
+        if workspace_files:
+            for rel, text in workspace_files.items():
+                path = run["ws"] / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+        elif workspace_content is not None:
+            (run["ws"] / "app.py").write_text(workspace_content,
+                                              encoding="utf-8")
+        st.tasks[0].status = "done"
+        st.verifications["a"] = s.VerificationRecord(
+            verdict="PASS",
+            oracle={"passed": True, "artifact_sha256": s.artifact_hash(content)})
+        st.integration = {"verdict": "PASS", "kind": "python", "exit": 0}
+        st.visual = {"verdict": "N/A"}
+        st.signoff = {"goal": "demo"}
+        st.approve_signoff("reviewer", "publication approved")
+        run["store"].save_project(st)
+        return self._engine(kind, run, responder=responder)
+
+    @staticmethod
+    def _hash(content: str) -> str:
+        import hashlib
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _project_files(project: Path) -> dict[str, str]:
+        import hashlib
+        out = {}
+        for path in sorted(project.rglob("*")):
+            if not path.is_file() or ".crew" in path.parts:
+                continue
+            rel = str(path.relative_to(project))
+            out[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return out
+
+    @staticmethod
+    def _journal_rows(project: Path) -> list[dict[str, str]]:
+        rows = []
+        root = project / ".crew" / "publish"
+        if not root.is_dir():
+            return rows
+        for path in sorted(root.glob("*/journal.json")):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for entry in data.get("entries") or []:
+                rows.append({
+                    "rel": str(entry.get("rel")),
+                    "action": str(entry.get("action")),
+                    "old_sha": str(entry.get("old_sha")),
+                    "new_sha": str(entry.get("new_sha")),
+                    "status": str(entry.get("status")),
+                })
+        return rows
+
+    @staticmethod
+    def _journal_manifests(project: Path) -> list[dict[str, str]]:
+        rows = []
+        root = project / ".crew" / "publish"
+        if not root.is_dir():
+            return rows
+        for path in sorted(root.glob("*/journal.json")):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            manifest = data.get("manifest") or {}
+            for item in manifest.get("files") or []:
+                rows.append({
+                    "path": str(item.get("path")),
+                    "original": str(item.get("original_sha256")),
+                    "workspace": str(item.get("workspace_sha256")),
+                    "classification": str(item.get("classification")),
+                })
+        return rows
+
+    def _orphan_setup(self, kind):
+        run = self._base()
+        eng = self._engine(kind, run)
+        root = run["project"] / ".crew" / "publish"
+        orphan = root / "orphan1"
+        orphan.mkdir(parents=True)
+        (orphan / "diagnostic.bin").write_bytes(b"abc")
+        valid = root / "valid"
+        valid.mkdir(parents=True)
+        (valid / "journal.json").write_text(json.dumps({
+            "id": "valid", "status": "COMMITTED", "entries": []}),
+            encoding="utf-8")
+        return run, eng, root, orphan, valid
+
+    def test_d11_01_normal_publication_is_equivalent(self):
+        runs = {}
+        for kind in ("factory", "native"):
+            run = self._base()
+            eng = self._approved(kind, run)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            st = eng["state"]
+            self.assertEqual(st.phase, "DONE", kind)
+            runs[kind] = eng
+        ref, new = runs["factory"], runs["native"]
+        self.assertEqual(ref["state"].extensions["publish"]["status"],
+                         new["state"].extensions["publish"]["status"])
+        self.assertEqual(ref["state"].extensions["publish"]["entries"],
+                         new["state"].extensions["publish"]["entries"])
+        self.assertEqual(ref["state"].extensions["publish"]["durability"],
+                         new["state"].extensions["publish"]["durability"])
+        self.assertEqual(self._project_files(ref["project"]),
+                         self._project_files(new["project"]))
+        self.assertEqual(self._journal_rows(ref["project"]),
+                         self._journal_rows(new["project"]))
+        self.assertEqual(self._journal_manifests(ref["project"]),
+                         self._journal_manifests(new["project"]))
+
+    def test_d11_02_external_change_after_planning_is_a_conflict(self):
+        import publish as publish_mod
+        original = publish_mod.PublishManager._new_dir
+        try:
+            for kind in ("factory", "native"):
+                run = self._base(files={"app.py": "old\n"})
+                eng = self._approved(kind, run, content="new\n",
+                                     workspace_content="new\n")
+
+                def modified(mgr):
+                    path = original(mgr)
+                    (mgr.project / "app.py").write_text("human\n",
+                                                        encoding="utf-8")
+                    return path
+
+                publish_mod.PublishManager._new_dir = modified
+                try:
+                    result = eng["engine"].step()
+                finally:
+                    publish_mod.PublishManager._new_dir = original
+                self.assertIn(result, ("failed", "raised"), kind)
+                st = eng["state"]
+                self.assertEqual((run["project"] / "app.py").read_text(
+                    encoding="utf-8"), "human\n", kind)
+                self.assertNotEqual(st.phase, "DONE", kind)
+                self.assertNotIn("publish", st.extensions, kind)
+                self.assertFalse(any(row["status"] == "COMMITTED"
+                                     for row in self._journal_rows(run["project"])),
+                                 kind)
+        finally:
+            publish_mod.PublishManager._new_dir = original
+
+    def test_d11_03_hash_mismatch_rolls_back(self):
+        import publish as publish_mod
+        original = publish_mod.PublishManager._apply
+        try:
+            for kind in ("factory", "native"):
+                run = self._base(files={"app.py": "old-a\n", "util.py": "old-b\n"})
+                eng = self._approved(
+                    kind, run, content="new-a\n",
+                    workspace_files={"app.py": "new-a\n",
+                                     "util.py": "new-b\n"})
+                calls = {"n": 0}
+
+                def flaky(mgr, item):
+                    calls["n"] += 1
+                    if calls["n"] == 2:
+                        raise RuntimeError("hash/apply failure")
+                    return original(mgr, item)
+
+                publish_mod.PublishManager._apply = flaky
+                try:
+                    result = eng["engine"].step()
+                finally:
+                    publish_mod.PublishManager._apply = original
+                self.assertEqual(result, "failed", kind)
+                self.assertEqual((run["project"] / "app.py").read_text(
+                    encoding="utf-8"), "old-a\n", kind)
+                self.assertEqual((run["project"] / "util.py").read_text(
+                    encoding="utf-8"), "old-b\n", kind)
+                self.assertNotEqual(eng["state"].phase, "DONE", kind)
+        finally:
+            publish_mod.PublishManager._apply = original
+
+    def test_d11_04_explicit_resolution_uses_adapter_interface(self):
+        for kind in ("factory", "native"):
+            run = self._base(files={"old.py": "old\n"})
+            seed = self._engine(kind, run)
+            run_dir = run["project"] / ".crew" / "publish" / "run1"
+            (run_dir / "backup").mkdir(parents=True)
+            (run_dir / "generated").mkdir()
+            (run_dir / "backup" / "old.py").write_text("old\n", encoding="utf-8")
+            (run_dir / "generated" / "old.py").write_text("new\n", encoding="utf-8")
+            (run["project"] / "old.py").write_text("human\n", encoding="utf-8")
+            journal = {"id": "run1", "status": "RECOVERY_REQUIRED",
+                       "entries": [{
+                           "rel": "old.py", "action": "replace",
+                           "old_sha": self._hash("old\n"),
+                           "new_sha": self._hash("new\n"),
+                           "backup": str(run_dir / "backup" / "old.py"),
+                           "generated": str(run_dir / "generated" / "old.py"),
+                           "status": "recovery_required"}]}
+            (run_dir / "journal.json").write_text(json.dumps(journal),
+                                                  encoding="utf-8")
+            resolved = seed["adapter"].resolve_publication(
+                "run1", "old.py", "original")
+            self.assertEqual(resolved["status"], "REVALIDATION_REQUIRED", kind)
+            self.assertEqual((run["project"] / "old.py").read_text(
+                encoding="utf-8"), "old\n", kind)
+
+    def test_d11_05_authorized_deletion_is_equivalent(self):
+        old = "old\n"
+        deletion = s.DeletionOperation(
+            target_file="old.py", expected_sha256=self._hash(old),
+            requirement_id="ac1", reason="obsolete")
+        for kind in ("factory", "native"):
+            run = self._base(files={"app.py": "print('ok')\n",
+                                    "old.py": old}, deletion=deletion)
+            eng = self._approved(kind, run)
+            (run["ws"] / "old.py").unlink()
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            self.assertFalse((run["project"] / "old.py").exists(), kind)
+            rows = self._journal_rows(run["project"])
+            self.assertTrue(any(r["rel"] == "old.py" and r["action"] == "delete"
+                                for r in rows), kind)
+            self.assertEqual(eng["state"].phase, "DONE", kind)
+
+    def test_d11_06_unauthorized_deletion_is_blocked(self):
+        old = "old\n"
+        for kind in ("factory", "native"):
+            run = self._base(files={"app.py": "print('ok')\n", "old.py": old})
+            eng = self._approved(kind, run)
+            (run["ws"] / "old.py").unlink()
+            result = eng["engine"].step()
+            self.assertIn(result, ("failed", "paused"), kind)
+            self.assertTrue((run["project"] / "old.py").is_file(), kind)
+            self.assertNotIn("publish", eng["state"].extensions, kind)
+
+    def test_d11_07_deletion_target_modified_externally_is_blocked(self):
+        old = "old\n"
+        deletion = s.DeletionOperation(
+            target_file="old.py", expected_sha256=self._hash(old),
+            requirement_id="ac1")
+        for kind in ("factory", "native"):
+            run = self._base(files={"app.py": "print('ok')\n",
+                                    "old.py": old}, deletion=deletion)
+            eng = self._approved(kind, run)
+            (run["ws"] / "old.py").unlink()
+            (run["project"] / "old.py").write_text("human\n", encoding="utf-8")
+            result = eng["engine"].step()
+            self.assertEqual(result, "failed", kind)
+            self.assertEqual((run["project"] / "old.py").read_text(
+                encoding="utf-8"), "human\n", kind)
+            self.assertNotEqual(eng["state"].phase, "DONE", kind)
+
+    def test_d11_08_deletion_rollback_restores_original(self):
+        import publish as publish_mod
+        old = "old\n"
+        deletion = s.DeletionOperation(
+            target_file="old.py", expected_sha256=self._hash(old),
+            requirement_id="ac1")
+        original = publish_mod.PublishManager._apply
+        try:
+            for kind in ("factory", "native"):
+                run = self._base(files={"app.py": "print('ok')\n",
+                                        "old.py": old}, deletion=deletion)
+                eng = self._approved(kind, run)
+                (run["ws"] / "old.py").unlink()
+
+                def flaky(mgr, item):
+                    original(mgr, item)
+                    raise RuntimeError("after delete")
+
+                publish_mod.PublishManager._apply = flaky
+                try:
+                    result = eng["engine"].step()
+                finally:
+                    publish_mod.PublishManager._apply = original
+                self.assertEqual(result, "failed", kind)
+                self.assertEqual((run["project"] / "old.py").read_text(
+                    encoding="utf-8"), old, kind)
+                self.assertNotEqual(eng["state"].phase, "DONE", kind)
+        finally:
+            publish_mod.PublishManager._apply = original
+
+    def test_d11_09_orphan_discovery_is_equivalent(self):
+        for kind in ("factory", "native"):
+            run, eng, root, orphan, valid = self._orphan_setup(kind)
+            listed = eng["adapter"].publication_orphans()
+            self.assertEqual([o["id"] for o in listed], ["orphan1"], kind)
+            self.assertEqual(listed[0]["files"], 1, kind)
+            self.assertEqual(listed[0]["bytes"], 3, kind)
+            self.assertTrue(valid.is_dir(), kind)
+
+    def test_d11_10_default_orphan_inspection_is_dry_run(self):
+        for kind in ("factory", "native"):
+            run, eng, root, orphan, valid = self._orphan_setup(kind)
+            preview = eng["adapter"].clean_publication_orphans()
+            self.assertTrue(preview["dry_run"], kind)
+            self.assertEqual(preview["removed"], [], kind)
+            self.assertTrue(orphan.is_dir(), kind)
+            try:
+                eng["adapter"].clean_publication_orphans(dry_run=False)
+            except Exception:
+                pass
+            else:
+                self.fail("destructive call without ids was accepted")
+            self.assertTrue(orphan.is_dir(), kind)
+
+    def test_d11_11_explicit_orphan_cleanup_is_safe(self):
+        for kind in ("factory", "native"):
+            run, eng, root, orphan, valid = self._orphan_setup(kind)
+            removed = eng["adapter"].clean_publication_orphans(
+                ["orphan1"], dry_run=False)
+            self.assertEqual(removed["removed"], ["orphan1"], kind)
+            self.assertFalse(orphan.exists(), kind)
+            self.assertTrue(valid.is_dir(), kind)
+
+    def test_d11_12_invalid_orphan_identifier_is_safe(self):
+        for kind in ("factory", "native"):
+            run, eng, root, orphan, valid = self._orphan_setup(kind)
+            missing = eng["adapter"].clean_publication_orphans(
+                ["does-not-exist"], dry_run=False)
+            self.assertEqual(missing["missing"], ["does-not-exist"], kind)
+            self.assertEqual(missing["removed"], [], kind)
+            self.assertTrue(orphan.is_dir(), kind)
+            self.assertTrue(valid.is_dir(), kind)
+
+    def test_d11_13_publication_requires_approval(self):
+        for kind in ("factory", "native"):
+            run = self._base()
+            seed = self._engine(kind, run)
+            st = seed["state"]
+            st.tasks[0].status = "done"
+            st.verifications["a"] = s.VerificationRecord(
+                verdict="PASS",
+                oracle={"passed": True,
+                        "artifact_sha256": s.artifact_hash("print('ok')\n")})
+            st.integration = {"verdict": "PASS", "kind": "python", "exit": 0}
+            st.visual = {"verdict": "N/A"}
+            st.signoff = {"goal": "demo"}
+            run["store"].save_project(st)
+
+            def responder(ref, messages):
+                return json.dumps({"what_it_is": "demo"})
+
+            eng = self._engine(kind, run, responder=responder)
+            self.assertEqual(eng["engine"].step(), "paused", kind)
+            self.assertEqual(eng["state"].pause.reason,
+                             "signoff_approval", kind)
+            self.assertNotIn("publish", eng["state"].extensions, kind)
+            self.assertNotEqual(eng["state"].phase, "DONE", kind)
+
+    def test_d11_14_stale_approval_cannot_publish(self):
+        for kind in ("factory", "native"):
+            run = self._base()
+            def responder(ref, messages):
+                return json.dumps({"what_it_is": "demo"})
+
+            eng = self._approved(kind, run, responder=responder)
+            (run["ws"] / "app.py").write_text("changed\n", encoding="utf-8")
+            self.assertEqual(eng["engine"].step(), "paused", kind)
+            self.assertEqual(eng["state"].pause.reason,
+                             "signoff_approval", kind)
+            self.assertNotIn("publish", eng["state"].extensions, kind)
+            self.assertNotEqual(eng["state"].phase, "DONE", kind)
+
+    def test_d11_15_existing_recovery_blocks_publication(self):
+        for kind in ("factory", "native"):
+            run = self._base()
+            eng = self._approved(kind, run)
+            bad = run["project"] / ".crew" / "publish" / "bad"
+            bad.mkdir(parents=True)
+            (bad / "journal.json").write_text("{invalid", encoding="utf-8")
+            try:
+                result = eng["engine"].step()
+            except (engine.EngineError, native_adapter.NativeAdapterError):
+                result = "raised"
+            self.assertIn(result, ("failed", "raised"), kind)
+            self.assertNotEqual(eng["state"].phase, "DONE", kind)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

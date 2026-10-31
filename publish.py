@@ -584,6 +584,8 @@ class PublishManager:
             removed: list[str] = []
             if not dry_run:
                 for oid in selected:
+                    if oid not in orphans:
+                        continue
                     path = (self.root / oid).resolve()
                     try:
                         path.relative_to(self.root.resolve())

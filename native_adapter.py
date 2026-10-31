@@ -136,14 +136,33 @@ class NativeAdapter:
         self.emit("VERIFY", f"checkpoint OK ({len(build_tasks)} tarefas)")
         return True
 
+    def _publication_manager(self) -> PublishManager:
+        origin = dict(self.project.extensions.get("workspace_origin") or {})
+        return PublishManager(self.project.project_root, self.workspace_root,
+                              Path(self.project.project_root) / ".crew", origin,
+                              rules=self.rules,
+                              deletions=self.project.architecture.deletions)
+
+    def publication_orphans(self) -> list[dict[str, Any]]:
+        return self._publication_manager().orphans()
+
+    def clean_publication_orphans(self, ids: Optional[Any] = None, *,
+                                  dry_run: bool = True) -> dict[str, Any]:
+        return self._publication_manager().clean_orphans(ids, dry_run=dry_run)
+
+    def publication_issues(self) -> dict[str, Any]:
+        return self._publication_manager().list_issues()
+
+    def resolve_publication(self, journal_id: str, rel: str, choice: str,
+                            manual_file: Optional[str] = None) -> dict[str, Any]:
+        return self._publication_manager().resolve(journal_id, rel, choice,
+                                                   manual_file)
+
     def publish(self) -> Optional[dict[str, Any]]:
         if not self.isolated or self.project.profile == "review":
             return None
         origin = dict(self.project.extensions.get("workspace_origin") or {})
-        mgr = PublishManager(self.project.project_root, self.workspace_root,
-                             Path(self.project.project_root) / ".crew", origin,
-                             rules=self.rules,
-                             deletions=self.project.architecture.deletions)
+        mgr = self._publication_manager()
         returned = mgr.recover()
         if returned and returned.get("status") in ("RECOVERY_REQUIRED",
                                                    "REVALIDATION_REQUIRED"):
