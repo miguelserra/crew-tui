@@ -112,6 +112,23 @@ def _safe_path(root: Path, rel: str) -> Path:
     return target
 
 
+def _fsync_dir(path: Path) -> None:
+    """Persist a directory entry after replace on POSIX. Windows has no portable
+    directory fsync; process-death recovery still applies there."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _atom_write_from(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.parent.is_symlink():
@@ -127,6 +144,7 @@ def _atom_write_from(src: Path, dest: Path) -> None:
         if sha256_file(tmp) != sha256_file(src):
             raise PublishError(f"cópia divergente: {dest}")
         os.replace(tmp, dest)
+        _fsync_dir(dest.parent)
     finally:
         try:
             tmp.unlink()
@@ -185,6 +203,7 @@ class PublishManager:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, target)
+            _fsync_dir(path)
         finally:
             try:
                 tmp.unlink()
@@ -486,6 +505,57 @@ class PublishManager:
                 ok = False
         return ok
 
+    # -- orphan run dirs ---------------------------------------------------- #
+
+    def _orphans_locked(self) -> list[dict[str, Any]]:
+        if not self.root.is_dir():
+            return []
+        out: list[dict[str, Any]] = []
+        for child in sorted(self.root.iterdir()):
+            if not child.is_dir() or child.is_symlink():
+                continue
+            if (child / "journal.json").is_file():
+                continue
+            files = 0
+            size = 0
+            for path in child.rglob("*"):
+                if path.is_file() and not path.is_symlink():
+                    files += 1
+                    try:
+                        size += path.stat().st_size
+                    except OSError:
+                        pass
+            out.append({"id": child.name, "path": str(child),
+                        "files": files, "bytes": size})
+        return out
+
+    def orphans(self) -> list[dict[str, Any]]:
+        """Run dirs without a journal: never applied, safe to inspect/clean."""
+        with ProjectLock(self.lock_path):
+            return self._orphans_locked()
+
+    def clean_orphans(self, ids: Optional[Iterable[str]] = None,
+                      *, dry_run: bool = False) -> dict[str, Any]:
+        """Remove orphan run dirs only when explicitly named (or all if None)."""
+        with ProjectLock(self.lock_path):
+            orphans = {o["id"]: o for o in self._orphans_locked()}
+            selected = sorted(orphans) if ids is None else [
+                _safe_rel(i) for i in ids]
+            missing = [i for i in selected if i not in orphans]
+            removed: list[str] = []
+            if not dry_run:
+                for oid in selected:
+                    path = (self.root / oid).resolve()
+                    try:
+                        path.relative_to(self.root.resolve())
+                    except ValueError:
+                        continue
+                    shutil.rmtree(path)
+                    removed.append(oid)
+            return {"orphans": [orphans[i] for i in selected if i in orphans],
+                    "removed": removed, "dry_run": bool(dry_run),
+                    "missing": missing}
+
     # -- conflict resolution ------------------------------------------------ #
 
     def list_issues(self) -> dict[str, Any]:
@@ -501,7 +571,7 @@ class PublishManager:
                 issues.append({"journal": data.get("id"),
                                "status": data.get("status"),
                                "entries": data.get("entries")})
-        return {"issues": issues}
+        return {"issues": issues, "orphans": self._orphans_locked()}
 
     def resolve(self, journal_id: str, rel: str, choice: str,
                 manual_file: Optional[str] = None) -> dict[str, Any]:

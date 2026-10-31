@@ -2,12 +2,15 @@
 """P6.1 publisher crash-recovery matrix (fault injection at each boundary)."""
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 import publish as pub
 import workspace as ws
@@ -218,6 +221,62 @@ class RecoveryTests(unittest.TestCase):
             fresh = pub.PublishManager(project, work, state, origin)
             self.assertIsNone(fresh.recover())
             self.assertEqual(_texts(project), ["old0", "old1", "old2"])
+
+    def test_orphan_run_dir_is_detected_and_cleaned(self):
+        with tempfile.TemporaryDirectory() as td:
+            project, work, state, origin = _setup(Path(td))
+            mgr = pub.PublishManager(project, work, state, origin)
+            orphan = mgr.root / "lonely"
+            orphan.mkdir(parents=True)
+            (orphan / "backup.bin").write_bytes(b"diagnostic")
+            self.assertEqual([o["id"] for o in mgr.orphans()], ["lonely"])
+            preview = mgr.clean_orphans(dry_run=True)
+            self.assertEqual(preview["removed"], [])
+            self.assertTrue(orphan.is_dir())
+            result = mgr.clean_orphans(["lonely"])
+            self.assertEqual(result["removed"], ["lonely"])
+            self.assertFalse(orphan.exists())
+
+    def test_orphan_cleanup_does_not_touch_journals(self):
+        with tempfile.TemporaryDirectory() as td:
+            project, work, state, origin = _setup(Path(td))
+            mgr = pub.PublishManager(project, work, state, origin)
+            mgr.publish()
+            orphan = mgr.root / "lonely"
+            orphan.mkdir(parents=True)
+            (orphan / "x").write_text("x", encoding="utf-8")
+            mgr.clean_orphans(["lonely"])
+            self.assertTrue((mgr.root / _journal(mgr)["id"] / "journal.json").is_file())
+
+    def test_real_process_death_is_recovered(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            project, work, state, origin = _setup(base, 3)
+            child = r"""
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+import publish, workspace as ws
+base = Path(sys.argv[1])
+project, work, state = base / "project", base / "work", base / "state"
+origin = {f"f{i}.py": ws.sha256_file(project / f"f{i}.py") for i in range(3)}
+def fault(name, info):
+    if name == "after_apply" and info.get("rel") == "f0.py":
+        os._exit(99)
+publish.PublishManager(project, work, state, origin, fault=fault).publish()
+"""
+            completed = subprocess.run(
+                [sys.executable, "-c", child, str(base), str(ROOT)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(completed.returncode, 99, completed.stderr)
+            self.assertEqual(_texts(project), ["new0", "old1", "old2"])
+            self.assertEqual(_journal(pub.PublishManager(project, work, state,
+                                                         origin))["status"],
+                             "PUBLISHING")
+            fresh = pub.PublishManager(project, work, state, origin)
+            self.assertEqual(fresh.recover()["status"], "ROLLED_BACK")
+            self.assertEqual(_texts(project), ["old0", "old1", "old2"])
+            self.assertIsNone(fresh.recovery_required())
 
     def test_normal_publish_is_committed(self):
         with tempfile.TemporaryDirectory() as td:

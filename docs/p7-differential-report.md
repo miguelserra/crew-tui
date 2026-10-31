@@ -54,6 +54,9 @@ Policy: recovery is **rollback-only**. A crash after every file was replaced but
 | Crash após commit -> PUBLISHED | Verde | `RecoveryTests.test_crash_after_commit_reports_published` |
 | Crash durante rollback -> retomado -> ROLLED_BACK | Verde | `RecoveryTests.test_crash_during_rollback_is_retried` |
 | Rollback impossível -> RECOVERY_REQUIRED | Verde | `RecoveryTests.test_rollback_failure_requires_recovery` |
+| Directório órfão sem journal detectado | Verde | `RecoveryTests.test_orphan_run_dir_is_detected_and_cleaned` |
+| Limpeza de órfãos não toca em journals | Verde | `RecoveryTests.test_orphan_cleanup_does_not_touch_journals` |
+| Morte real do processo (os._exit) -> recuperação | Verde | `RecoveryTests.test_real_process_death_is_recovered` |
 | Publicação normal -> COMMITTED | Verde | `RecoveryTests.test_normal_publish_is_committed` |
 
 ## Comparator

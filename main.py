@@ -4566,6 +4566,11 @@ def _resolve_publish_cli(args: Any) -> int:
     mgr = PublishManager(root, ws, root / ".crew", origin,
                          rules=IgnoreRules.from_project(root),
                          deletions=state.architecture.deletions)
+    if getattr(args, "clean_publish_orphans", False):
+        result = mgr.clean_orphans(args.orphan_id,
+                                   dry_run=not bool(args.orphan_id))
+        print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+        return 0
     if not args.journal:
         print(json.dumps(mgr.list_issues(), ensure_ascii=False, indent=2), flush=True)
         return 0
@@ -4644,6 +4649,10 @@ def main() -> None:
                         help="resolution choice")
     parser.add_argument("--manual-file", metavar="PATH",
                         help="replacement file for --choice manual")
+    parser.add_argument("--clean-publish-orphans", action="store_true",
+                        help="list orphan publish dirs (or remove those named by --orphan-id)")
+    parser.add_argument("--orphan-id", action="append", metavar="ID",
+                        help="orphan publish dir to remove (repeatable)")
     parser.add_argument("--resolve-call", metavar="ID",
                         help="resolve an ambiguous external call in .crew/calls.json")
     parser.add_argument("--call-outcome", choices=["confirmed", "failed"],

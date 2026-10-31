@@ -326,10 +326,13 @@ reconciled at startup so a replayed critic/visual call cannot duplicate an
 event. The machine-generated report lives in
 `docs/p7-differential-report.md` (`tools/p7_differential_report.py`). Publisher crash-recovery is covered by injected interruptions at every
 boundary (before/after journal, backups, apply, commit, rollback and partial
-recovery); recovery is rollback-only and ends in COMMITTED, ROLLED_BACK or
-RECOVERY_REQUIRED, never a false COMMITTED after partial application. Still
-pending before the gate opens: provider-declared idempotency headers and full
-differential equivalence. The runtime still uses `FactoryAdapter` and
+recovery), plus a real `os._exit()` subprocess test; recovery is rollback-only
+and ends in COMMITTED, ROLLED_BACK or RECOVERY_REQUIRED, never a false
+COMMITTED after partial application. Run dirs without a journal are reported
+as orphans and cleaned only when explicitly named; journal/file replacements
+fsync the containing directory on POSIX (Windows relies on process-death
+recovery). Still pending before the gate opens: provider-declared idempotency
+headers and full differential equivalence. The runtime still uses `FactoryAdapter` and
 removal is not authorized. P7 is not
 a closed gate; legacy migration/conversion remains readable and no silent
 conversion is performed. No prompt/routing/verification policy was changed in

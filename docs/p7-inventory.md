@@ -39,9 +39,9 @@ Baseline: `p6.1-gate` (`86f2df1`).
 | `visual.py` | multimodal | P7.1c extraction |
 | `signoff.py` | final sign-off | P7.1c extraction |
 | `native_adapter.py` | native composition | P7.1d extraction; not default |
-| differential cassette | normal, FAIL→FIX, UNVERIFIED, visual retry, fallback, Playwright, resume, publish parity/conflict | 10 green; PAYG intent ledger + crash-recovery pending |
+| differential cassette | normal, FAIL→FIX, UNVERIFIED, visual retry, fallback, Playwright, resume, publish parity/conflict | 10 green; PAYG ledger/recovery and publisher crash-recovery covered; idempotency header pending |
 | differential report | generated matrix + uncovered items | `docs/p7-differential-report.md` |
-| publisher recovery | fault injection at each journal/apply/rollback boundary | rollback-only; COMMITTED/ROLLED_BACK/RECOVERY_REQUIRED; never false COMMITTED |
+| publisher recovery | fault injection at each journal/apply/rollback boundary + real os._exit subprocess | rollback-only; COMMITTED/ROLLED_BACK/RECOVERY_REQUIRED; never false COMMITTED; orphans detected/cleaned explicitly |
 | `calls.py` | durable PAYG call ledger + result artifacts | PENDING/SUBMITTED/CONFIRMED/UNKNOWN/FAILED; text-only replay with full invocation fingerprint; history dedup; no silent PAYG retry; resume gate |
 | integration fixer | one call + affected task ids + producer | revalidates changed artefacts (oracle+critic), invalidates stale PASS |
 
