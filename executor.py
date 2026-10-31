@@ -67,12 +67,25 @@ class ExecutorService:
     def build(self, project: ProjectState, workspace_root: str | Path) -> bool:
         root = Path(workspace_root).expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
-        for task in project.tasks:
-            if task.kind != "build" or task.status in ("done", "verified"):
-                continue
-            if not self._build_task(project, root, task):
-                return False
-        return all(t.status in ("done", "verified") for t in project.tasks if t.kind == "build")
+        pending = [t for t in project.tasks
+                   if t.kind == "build" and t.status not in ("done", "verified")]
+        done_ids = {t.id for t in project.tasks
+                    if t.status in ("done", "verified")}
+        guard = 0
+        while pending and guard < 3 * len(project.tasks) + 10:
+            guard += 1
+            ready = [t for t in pending
+                     if all(d in done_ids for d in t.depends_on)]
+            batch = ready or pending  # match Factory: break deadlocks
+            for task in batch:
+                if not self._build_task(project, root, task):
+                    return False
+                if task.status in ("done", "verified"):
+                    done_ids.add(task.id)
+            pending = [t for t in pending
+                       if t.status not in ("done", "verified")]
+        return all(t.status in ("done", "verified")
+                   for t in project.tasks if t.kind == "build")
 
     def _build_task(self, project: ProjectState, root: Path, task: Task) -> bool:
         target = _safe(root, task.target_file)

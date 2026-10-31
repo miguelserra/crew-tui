@@ -147,6 +147,7 @@ class FakePool:
         self.dispatch_guard = None
         self.last_attempt_model = {}
         self.fallback_script = fallback_script
+        self.call_order = []
         self.router = types.SimpleNamespace(route=lambda req: types.SimpleNamespace(
             candidates=[object()], chain=None))
 
@@ -179,6 +180,8 @@ class FakePool:
         meta = meta or {}
         task = meta.get("task") or ""
         tag = meta.get("tag") or ""
+        if task and tag != "SIGN":
+            self.call_order.append(task)
         if tag == "SIGN":
             return '{"what_it_is": "demo", "how_to_run": ["python app.py"]}'
         blob = str(meta.get("prompt") or "") + str(messages)
@@ -238,20 +241,26 @@ class DifferentialSmokeTests(unittest.TestCase):
         return settings
 
     def _pair(self, base, *, fail_first=False, unverified=False,
-              fallback_script=None):
+              fallback_script=None, tasks_factory=None):
         proj_f = base / "proj_f"; proj_f.mkdir()
         proj_n = base / "proj_n"; proj_n.mkdir()
         pool_f = FakePool(fallback_script=fallback_script)
         pool_n = FakePool(fallback_script=fallback_script)
         ver_f = FakeVerifier(fail_first=fail_first, unverified=unverified)
         ver_n = FakeVerifier(fail_first=fail_first, unverified=unverified)
+        st_f = self._state(proj_f, base / "ws_f")
+        st_n = self._state(proj_n, base / "ws_n")
+        if tasks_factory is not None:
+            st_f.tasks = tasks_factory()
+            st_n.tasks = tasks_factory()
         ref = engine.FactoryAdapter(
-            self._settings(base), pool_f, lambda *a: None,
-            self._state(proj_f, base / "ws_f"), isolate_workspace=True)
-        native = native_adapter.NativeAdapter(
-            self._settings(base), pool_n, lambda *a: None,
-            self._state(proj_n, base / "ws_n"), verifier=ver_n,
+            self._settings(base), pool_f, lambda *a: None, st_f,
             isolate_workspace=True)
+        native = native_adapter.NativeAdapter(
+            self._settings(base), pool_n, lambda *a: None, st_n,
+            verifier=ver_n, isolate_workspace=True)
+        self._pool_f = pool_f
+        self._pool_n = pool_n
         ref.factory.verifier = ver_f
 
         def native_sink(event):
@@ -335,6 +344,27 @@ class DifferentialSmokeTests(unittest.TestCase):
             self.assertFalse(divergent, divergent)
             self.assertTrue(any(r["verdict"] == EQUIVALENT for r in rows))
             self.assertTrue(any(r["verdict"] == ALLOWED_VARIANCE for r in rows))
+
+    def test_task_dependencies_order_match(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+
+            def tasks():
+                return [
+                    s.Task("b", kind="build", target_file="util.py",
+                           depends_on=["a"]),
+                    s.Task("a", kind="build", target_file="app.py"),
+                ]
+
+            ref, native, (ws_f, ws_n) = self._pair(base,
+                                                   tasks_factory=tasks)
+            self.assertTrue(ref.step("BUILD"))
+            self.assertTrue(native.step("BUILD"))
+            ref.sync_to_project()
+            self.assertEqual(self._pool_f.call_order, ["a", "b"])
+            self.assertEqual(self._pool_n.call_order, ["a", "b"])
+            self.assertEqual([(t.id, t.status) for t in ref.project.tasks],
+                             [(t.id, t.status) for t in native.project.tasks])
 
     def test_build_quality_recovery_fail_then_fix(self):
         with tempfile.TemporaryDirectory() as td:
