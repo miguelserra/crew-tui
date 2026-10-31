@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Protocol
 
 from attempts import AttemptEvent
+from calls import CallLedger, CallLedgerError
 from registry import BILLING_UNKNOWN, ModelRef
 from state import (
     ENGINE_LEGACY,
@@ -130,6 +131,7 @@ class WorkflowEngine:
         self.allow_unknown = allow_unknown
         self.persistence = persistence if persistence in ("crew", "factory") else "crew"
         self._last_ok: dict[str, ModelRef] = {}
+        self.call_ledger: Optional[CallLedger] = None
 
     # -- pool wiring -------------------------------------------------------- #
 
@@ -138,6 +140,18 @@ class WorkflowEngine:
             return
         pool.dispatch_guard = self.check_refs
         pool.attempt_sink = self.on_attempt
+        try:
+            if self.state.project_root:
+                calls_path = (Path(self.state.project_root) / ".crew" /
+                              "calls.json")
+            else:
+                calls_path = (self.store.staging_path(self.state.run_id).parent /
+                              "calls.json")
+            self.call_ledger = CallLedger(calls_path)
+            if getattr(pool, "router", None) is not None:
+                pool.router.call_ledger = self.call_ledger
+        except CallLedgerError as exc:
+            raise EngineError(f"ledger de chamadas inválido: {exc}") from exc
 
     def check_refs(self, refs: Iterable[ModelRef]) -> None:
         for ref in refs:
@@ -297,6 +311,13 @@ class WorkflowEngine:
             return "done"
         if self.state.pause.reason:
             return "paused"
+        if self.call_ledger is not None:
+            pending = self.call_ledger.unresolved(self.state.run_id)
+            if pending:
+                ids = ", ".join(r.call_id for r in pending[:3])
+                self._pause("call_unknown_failed",
+                            f"{len(pending)} chamada(s) externa(s) por confirmar: {ids}")
+                return "paused"
         if (phase == "SPEC" and self.state.requirements.objective
                 and self._has_approval("spec")):
             self.state.phase = self.next_phase("SPEC")

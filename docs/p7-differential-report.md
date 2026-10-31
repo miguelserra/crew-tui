@@ -21,6 +21,15 @@ The gate is **closed**. Every applicable scenario must be green in both paths wi
 | Publicação normal (sandboxes) | Verde | `test_publication_parity` | manifest, hashes, ficheiros publicados, journal |
 | Publicação com conflito | Verde | `test_publication_conflict_parity` | detecção de conflito e recusa |
 
+## Billing safety (PAYG ledger)
+
+| Caso | Estado | Teste |
+|---|---|---|
+| PAYG timeout -> UNKNOWN, sem retry | Verde | `RouteChainLedgerTests.test_payg_timeout_is_unknown_and_not_retried` |
+| PAYG 429 -> FAILED e fallback seguro | Verde | `RouteChainLedgerTests.test_payg_429_is_failed_then_fallback` |
+| UNKNOWN bloqueia o resume | Verde | `EngineCallGateTests.test_unresolved_call_pauses_run` |
+| Ledger durável após reload | Verde | `LedgerTests.test_state_machine_and_reload` |
+
 ## Comparator
 
 - artefactos: conteúdo integral por ficheiro (hashes normalizados pelo conteúdo, sem caminhos temporários);
@@ -36,7 +45,7 @@ The gate is **closed**. Every applicable scenario must be green in both paths wi
 
 | Item | Requisito em falta |
 |---|---|
-| PAYG intent ledger / idempotency | Registar intenção antes do envio, persistir resultado/identidade, marcar resultados ambíguos como UNKNOWN, usar idempotency keys quando suportadas e nunca repetir silenciosamente uma chamada potencialmente cobrada. O teste de resume actual cobre continuidade de estado, não este protocolo de facturação. |
+| PAYG ledger — idempotency + CONFIRMED-unconsumed | Implementado: estados PENDING/SUBMITTED/CONFIRMED/UNKNOWN/FAILED, persistência atómica, bloqueio de resume em PENDING/SUBMITTED/UNKNOWN e recusa de retry automático de PAYG ambíguo. Em falta: enviar idempotency keys quando o endpoint o declara, e tratar/reutilizar um CONFIRMED cujo resultado ainda não foi commitado no estado (janela entre confirmação e persistência do engine). |
 | Crash-recovery completo de publicação | Replay de journals interrompidos a meio de PUBLISHING/ROLLING_BACK e comparação da recuperação entre motores. O teste actual cobre publish normal e conflito, não a recuperação após crash. |
 
 ## Regenerar

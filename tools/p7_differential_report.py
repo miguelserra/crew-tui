@@ -51,16 +51,32 @@ SCENARIOS = [
 ]
 
 PENDING = [
-    ("PAYG intent ledger / idempotency",
-     "Registar intenção antes do envio, persistir resultado/identidade, "
-     "marcar resultados ambíguos como UNKNOWN, usar idempotency keys quando "
-     "suportadas e nunca repetir silenciosamente uma chamada potencialmente "
-     "cobrada. O teste de resume actual cobre continuidade de estado, não "
-     "este protocolo de facturação."),
+    ("PAYG ledger — idempotency + CONFIRMED-unconsumed",
+     "Implementado: estados PENDING/SUBMITTED/CONFIRMED/UNKNOWN/FAILED, "
+     "persistência atómica, bloqueio de resume em PENDING/SUBMITTED/UNKNOWN e "
+     "recusa de retry automático de PAYG ambíguo. Em falta: enviar "
+     "idempotency keys quando o endpoint o declara, e tratar/reutilizar um "
+     "CONFIRMED cujo resultado ainda não foi commitado no estado (janela "
+     "entre confirmação e persistência do engine)."),
     ("Crash-recovery completo de publicação",
      "Replay de journals interrompidos a meio de PUBLISHING/ROLLING_BACK e "
      "comparação da recuperação entre motores. O teste actual cobre publish "
      "normal e conflito, não a recuperação após crash."),
+]
+
+SAFETY = [
+    ("PAYG timeout -> UNKNOWN, sem retry",
+     "tests.test_p04_calls", "RouteChainLedgerTests",
+     "test_payg_timeout_is_unknown_and_not_retried"),
+    ("PAYG 429 -> FAILED e fallback seguro",
+     "tests.test_p04_calls", "RouteChainLedgerTests",
+     "test_payg_429_is_failed_then_fallback"),
+    ("UNKNOWN bloqueia o resume",
+     "tests.test_p04_calls", "EngineCallGateTests",
+     "test_unresolved_call_pauses_run"),
+    ("Ledger durável após reload",
+     "tests.test_p04_calls", "LedgerTests",
+     "test_state_machine_and_reload"),
 ]
 
 
@@ -72,24 +88,34 @@ def _walk(suite):
             yield test
 
 
+def _run_one(module_name: str, class_name: str, method: str) -> str:
+    module = importlib.import_module(module_name)
+    case = getattr(module, class_name)(method)
+    result = unittest.TestResult()
+    case.run(result)
+    if result.skipped:
+        return "Skip (deps)"
+    return "Verde" if result.wasSuccessful() else "Falha"
+
+
 def run_scenarios() -> list[tuple[str, str, str, str]]:
-    module = importlib.import_module("tests.test_p7_differential")
     rows = []
     for label, name, dims in SCENARIOS:
-        case = module.DifferentialSmokeTests(name)
-        result = unittest.TestResult()
-        case.run(result)
-        if result.skipped:
-            status = "Skip (deps)"
-        elif result.wasSuccessful():
-            status = "Verde"
-        else:
-            status = "Falha"
+        status = _run_one("tests.test_p7_differential",
+                          "DifferentialSmokeTests", name)
         rows.append((label, name, dims, status))
     return rows
 
 
-def render(rows) -> str:
+def run_safety() -> list[tuple[str, str, str, str]]:
+    rows = []
+    for label, module, cls, method in SAFETY:
+        status = _run_one(module, cls, method)
+        rows.append((label, f"{cls}.{method}", "", status))
+    return rows
+
+
+def render(rows, safety) -> str:
     lines = [
         "# P7 differential equivalence report (P7.1d)",
         "",
@@ -112,6 +138,15 @@ def render(rows) -> str:
     ]
     for label, name, dims, status in rows:
         lines.append(f"| {label} | {status} | `{name}` | {dims} |")
+    lines += [
+        "",
+        "## Billing safety (PAYG ledger)",
+        "",
+        "| Caso | Estado | Teste |",
+        "|---|---|---|",
+    ]
+    for label, name, _dims, status in safety:
+        lines.append(f"| {label} | {status} | `{name}` |")
     lines += [
         "",
         "## Comparator",
@@ -150,11 +185,12 @@ def render(rows) -> str:
 
 def main() -> int:
     rows = run_scenarios()
+    safety = run_safety()
     out = ROOT / "docs" / "p7-differential-report.md"
-    out.write_text(render(rows), encoding="utf-8")
-    failed = [r for r in rows if r[3] == "Falha"]
+    out.write_text(render(rows, safety), encoding="utf-8")
+    failed = [r for r in rows + safety if r[3] == "Falha"]
     print(f"wrote {out}")
-    for label, _name, _dims, status in rows:
+    for label, _name, _dims, status in rows + safety:
         print(f"  {status:10} {label}")
     return 1 if failed else 0
 

@@ -84,6 +84,7 @@ from registry import (
     ModelRegistry, RegistryError, normalize_billing, ref_from_handle,
 )
 from publish import PublishError, PublishManager, RecoveryRequired
+from calls import CallLedger, CallLedgerError
 from workspace import IgnoreRules, default_workspace
 from engine import (
     ENGINE_LEGACY, ENGINE_UNIFIED, ENGINE_VERSION, EngineError, EngineFacade,
@@ -4524,6 +4525,22 @@ def _factory_cli(args: Any) -> int:
     return _engine_cli_run(args, kind, settings, store, None, persistence="factory")
 
 
+def _resolve_call_cli(args: Any) -> int:
+    if not args.project or not args.call_outcome:
+        print("--resolve-call exige --project DIR e --call-outcome "
+              "confirmed|failed", flush=True)
+        return 2
+    root = Path(os.path.expanduser(args.project)).expanduser().resolve()
+    ledger = CallLedger(root / ".crew" / "calls.json")
+    try:
+        rec = ledger.resolve(args.resolve_call, args.call_outcome)
+    except CallLedgerError as exc:
+        print(f"[CALL] {exc}", flush=True)
+        return 6
+    print(json.dumps(rec.to_dict(), ensure_ascii=False, indent=2), flush=True)
+    return 0
+
+
 def _resolve_publish_cli(args: Any) -> int:
     settings = Settings.from_env()
     store = StateManager(settings.workspace_dir, settings.log_dir)
@@ -4620,6 +4637,10 @@ def main() -> None:
                         help="resolution choice")
     parser.add_argument("--manual-file", metavar="PATH",
                         help="replacement file for --choice manual")
+    parser.add_argument("--resolve-call", metavar="ID",
+                        help="resolve an ambiguous external call in .crew/calls.json")
+    parser.add_argument("--call-outcome", choices=["confirmed", "failed"],
+                        help="resolution for --resolve-call")
     parser.add_argument("--migrate-state", action="store_true",
                         help="converte .factory/state.json para .crew/state.json (não muda o motor)")
     parser.add_argument("--migrate-schema", action="store_true",
@@ -4629,6 +4650,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.resolve_publish_conflict:
         raise SystemExit(_resolve_publish_cli(args))
+    if args.resolve_call:
+        raise SystemExit(_resolve_call_cli(args))
     if args.goal and args.factory:
         parser.error("dá o objetivo como posicional OU --factory (deprecated), não ambos")
     if args.factory:

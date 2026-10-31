@@ -310,12 +310,15 @@ NativeAdapter and the differential cassettes exist (P7.1d). The matrix covers
 normal execution, FAIL→FIX recovery, UNVERIFIED blocking, visual retry,
 technical fallback (quota/timeout/all-unavailable), Playwright unavailable,
 resume-after-BUILD continuity, and publication parity/conflict in disposable
-clones. The machine-generated report lives in
-`docs/p7-differential-report.md` (`tools/p7_differential_report.py`). Still
-pending before the gate opens: the PAYG intent ledger (intent-before-send,
-UNKNOWN ambiguous outcomes, idempotency keys) and full crash-recovery journal
-replay. The runtime still uses `FactoryAdapter` and removal is not authorized.
-P7 is not
+clones. `calls.py` adds a durable PAYG call ledger (`PENDING`, `SUBMITTED`,
+`CONFIRMED`, `UNKNOWN`, `FAILED`): an ambiguous PAYG outcome stops the call
+instead of retrying/falling back, unresolved calls block resume, and
+`--resolve-call ID --call-outcome` provides manual resolution. The
+machine-generated report lives in `docs/p7-differential-report.md`
+(`tools/p7_differential_report.py`). Still pending before the gate opens:
+idempotency-header use when a provider declares support, reuse/blocking of a
+CONFIRMED-but-not-committed result, and full crash-recovery journal replay.
+The runtime still uses `FactoryAdapter` and removal is not authorized. P7 is not
 a closed gate; legacy migration/conversion remains readable and no silent
 conversion is performed. No prompt/routing/verification policy was changed in
 this extraction.

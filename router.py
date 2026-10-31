@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from budget import BudgetSuspended
+from calls import CallOutcomeUnknown
 from registry import (
     BILLING_LOCAL,
     BILLING_PAYG,
@@ -596,6 +597,10 @@ class RouteChain:
 
     is_route_chain = True
 
+    # An ambiguous outcome may already have been processed and billed. For a
+    # PAYG candidate we stop instead of retrying/falling back silently.
+    AMBIGUOUS_KINDS = {"timeout", "connection", "server", "empty", "unknown"}
+
     def __init__(self, result: RouteResult):
         self.result = result
         self.request = result.request
@@ -608,6 +613,7 @@ class RouteChain:
     def invoke(self, messages: Any) -> Any:
         last_error: Optional[BaseException] = None
         denied_paid = False
+        ledger = getattr(self.router, "call_ledger", None)
         for candidate in self.result.candidates:
             identity = candidate.identity
             if self.router is not None and not self.router.breaker.allow(identity):
@@ -620,20 +626,44 @@ class RouteChain:
                 denied_paid = True
                 continue
             for attempt in range(2):
+                record = None
+                if (ledger is not None and identity.billing == BILLING_PAYG
+                        and self.request.run_id):
+                    record = ledger.intent(
+                        run_id=self.request.run_id,
+                        role=self.request.role,
+                        ref=candidate.ref,
+                        task=self.request.task_id,
+                        tag=self.request.tag or self.request.role,
+                    )
+                    ledger.submitted(record.call_id)
                 try:
                     response = candidate.handle.invoke(messages)
-                    if not _content(response).strip():
+                    content = _content(response)
+                    if not content.strip():
                         raise RuntimeError("empty response from model")
                 except Exception as exc:
                     info = classify_error(exc)
+                    ambiguous = info.kind in self.AMBIGUOUS_KINDS
+                    if record is not None:
+                        ledger.fail(record.call_id, str(exc), info.kind,
+                                    ambiguous=ambiguous)
                     self.router.breaker.record_failure(identity, info)
                     last_error = exc
+                    if ambiguous and record is not None:
+                        raise CallOutcomeUnknown(
+                            f"{self.request.role}: resultado ambíguo em "
+                            f"{identity.model_id} ({info.kind}); resolução "
+                            f"manual necessária (call {record.call_id})") from exc
                     if info.kind == "bad_request":
                         raise
                     if info.kind in ("timeout", "empty") and attempt == 0:
                         continue
                     break
                 self.router.breaker.record_success(identity)
+                if record is not None:
+                    ledger.confirm(record.call_id, served=candidate.ref,
+                                   text=content)
                 self.router.charge(self.request, candidate, response)
                 return response
         if denied_paid:
