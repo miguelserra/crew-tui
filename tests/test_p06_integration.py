@@ -84,7 +84,7 @@ class IsolatedFactoryTests(unittest.TestCase):
         (ws / "new.py").write_text("generated\n", encoding="utf-8")
         self.assertFalse((self.project / "new.py").exists())
         result = self.adapter.publish()
-        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["status"], "COMMITTED")
         self.assertEqual((self.project / "new.py").read_text(), "generated\n")
         self.assertEqual((self.project / "app.py").read_text(), "old\n")
 

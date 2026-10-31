@@ -71,13 +71,13 @@ class PublishTests(unittest.TestCase):
             project, work, state, origin = self._setup(td)
             mgr = pub.PublishManager(project, work, state, origin)
             result = mgr.publish()
-            self.assertEqual(result["status"], "done")
+            self.assertEqual(result["status"], "COMMITTED")
             self.assertEqual((project / "change.py").read_text(), "new")
             self.assertEqual((project / "new.py").read_text(), "brand new")
             journals = list((state / "publish").glob("*/journal.json"))
             self.assertEqual(len(journals), 1)
             data = json.loads(journals[0].read_text())
-            self.assertEqual(data["status"], "done")
+            self.assertEqual(data["status"], "COMMITTED")
             self.assertTrue((journals[0].parent / "backup" / "change.py").is_file())
 
     def test_conflict_blocks_without_overwrite(self):
@@ -116,13 +116,15 @@ class PublishTests(unittest.TestCase):
             project, work, state, origin = self._setup(td)
             run = state / "publish" / "run1"
             (run / "backup").mkdir(parents=True)
+            old_sha = ws.sha256_file(project / "change.py")
             (run / "backup" / "change.py").write_text("old", encoding="utf-8")
             (project / "change.py").write_text("new", encoding="utf-8")
             (project / "new.py").write_text("brand new", encoding="utf-8")
-            journal = {"id": "run1", "status": "publishing",
+            journal = {"id": "run1", "status": "PUBLISHING",
                        "entries": [
                            {"rel": "change.py", "action": "replace",
-                            "old_sha": "", "new_sha": "",
+                            "old_sha": old_sha,
+                            "new_sha": ws.sha256_file(project / "change.py"),
                             "backup": str(run / "backup" / "change.py"),
                             "status": "done"},
                            {"rel": "new.py", "action": "create", "old_sha": "",
@@ -132,7 +134,7 @@ class PublishTests(unittest.TestCase):
             (run / "journal.json").write_text(json.dumps(journal), encoding="utf-8")
             mgr = pub.PublishManager(project, work, state, origin)
             result = mgr.recover()
-            self.assertEqual(result["status"], "rolled_back")
+            self.assertEqual(result["status"], "ROLLED_BACK")
             self.assertEqual((project / "change.py").read_text(), "old")
             self.assertFalse((project / "new.py").exists())
 

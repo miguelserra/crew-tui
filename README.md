@@ -245,7 +245,7 @@ Delivery requires independent evidence, not just a successful model call:
 `verify.py` owns the delivery policy; `main.Verifier` collects evidence and
 the Factory/Orchestrator call the same gate.
 
-## Workflow profiles and transactional delivery (P6)
+## Workflow profiles and recoverable delivery (P6/P6.1)
 
 New unified runs separate **production** from **delivery**:
 
@@ -260,14 +260,29 @@ New unified runs separate **production** from **delivery**:
   symlink validation, manifest, idempotent, zero LLM calls.
 - **Workspace isolation**: the user's `project_root` is only the destination.
   BUILD, VERIFY, INTEGRATE, Playwright and VISUAL operate on an isolated
-  `workspace_root` seeded from the project. The project is not touched during
-  the run.
-- **Transactional publish** happens only after all gates and SIGN-OFF:
-  manifest with original/result hashes, human-change conflict detection,
-  backups, journal, per-file atomic replace, rollback/recovery after
-  interruption, and `DONE` only after confirmation. Conflicting human edits
-  are never overwritten silently.
-- P6 applies to the unified engine; the legacy Factory path remains for
+  `workspace_root` seeded from the project. A `WorkspaceManifest` validates
+  integrity: an original file missing from the workspace blocks publish
+  unless an approved `DeletionOperation` covers it.
+- **Ignore safety**: mandatory security exclusions (`.env*` except templates,
+  keys, `.ssh`, `.aws`), technical exclusions (`.venv`, `.git`, `bin`, `obj`,
+  `.vs`, `.vscode`, `node_modules`, caches) and `.crewignore`/`.gitignore`
+  patterns. Excluded files and reasons are recorded in the workspace report.
+- **Recoverable publish** happens only after all gates and SIGN-OFF:
+  immutable generated snapshots, backups, journal states
+  (`PREPARED`/`PUBLISHING`/`ROLLING_BACK`/`RECOVERY_REQUIRED`/`COMMITTED`/
+  `ROLLED_BACK`), per-file atomic replacement, hash-aware rollback,
+  corruption detection and a per-project publish lock. This is **per-file
+  atomic replacement with a journal**, not a global multi-file transaction.
+- Human edits/deletions of files Crew changed block publication; unchanged
+  files are skipped. A conflict is resolved with
+  `--resolve-publish-conflict --project DIR --journal ID --file REL
+  --choice human|original|generated|manual`; a choice other than the tested
+  generated version requires revalidation and is never marked `DONE`
+  automatically.
+- **Approved deletions** are explicit `DeletionOperation`s bound to the
+  architecture hash, requirement and expected file hash; they are backed up,
+  journaled and reversible. LLM-inferred deletions are not accepted.
+- P6/P6.1 applies to the unified engine; the legacy Factory path remains for
   compatibility until P7.
 
 ## Financial circuit breaker
@@ -604,7 +619,7 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `scripts/crew-sleep` | Root helper that arms the RTC alarm / suspends (Linux) |
 | `scripts/install-crew-sleep.sh` | One-time root install + sudoers rule |
 | `setup.ps1`, `run.ps1` | Windows bootstrap and launcher |
-| `tests/` | Power, budget, P0/P1 foundation, P2 contracts, P3 registry, P4 router, P5 verification and P6 workspace/publish tests |
+| `tests/` | Power, budget, P0/P1 foundation, P2 contracts, P3 registry, P4 router, P5 verification, P6 workspace/publish and P6.1 recovery tests |
 
 ## Tests & CI
 
@@ -615,6 +630,7 @@ python -m unittest discover -s tests -p "test_p03_*.py"   # registry, no deps
 python -m unittest discover -s tests -p "test_p04_*.py"   # router, no deps
 python -m unittest discover -s tests -p "test_p05_*.py"   # verification, no deps
 python -m unittest discover -s tests -p "test_p06_*.py"   # profiles/scaffold/workspace, no deps
+python -m unittest discover -s tests -p "test_p061_*.py"  # publish safety/recovery, no deps
 .venv/bin/python -m unittest discover -s tests -p "test_p0*_integration.py"
 python tests/test_power.py
 python tests/test_budget.py

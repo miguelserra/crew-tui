@@ -255,11 +255,33 @@ class RequirementContract:
 
 
 @dataclass
+class DeletionOperation:
+    target_file: str
+    expected_sha256: str
+    requirement_id: str = ""
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.__dict__)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "DeletionOperation":
+        data = data or {}
+        return cls(
+            target_file=str(data.get("target_file") or ""),
+            expected_sha256=str(data.get("expected_sha256") or ""),
+            requirement_id=str(data.get("requirement_id") or ""),
+            reason=str(data.get("reason") or ""),
+        )
+
+
+@dataclass
 class ArchitectureContract:
     approach: str = ""
     modules: list[dict[str, Any]] = field(default_factory=list)
     interfaces: list[dict[str, Any]] = field(default_factory=list)
     test_plan: list[dict[str, Any]] = field(default_factory=list)
+    deletions: list[DeletionOperation] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -269,6 +291,7 @@ class ArchitectureContract:
             "modules": list(self.modules),
             "interfaces": list(self.interfaces),
             "test_plan": list(self.test_plan),
+            "deletions": [d.to_dict() for d in self.deletions],
         })
         return out
 
@@ -280,6 +303,8 @@ class ArchitectureContract:
             modules=[dict(x) for x in (data.get("modules") or [])],
             interfaces=[dict(x) for x in (data.get("interfaces") or [])],
             test_plan=[dict(x) for x in (data.get("test_plan") or [])],
+            deletions=[DeletionOperation.from_dict(x)
+                       for x in (data.get("deletions") or [])],
             raw=dict(data),
         )
 
@@ -468,6 +493,34 @@ def validate_dependencies(tasks: list[Task]) -> None:
 
     for node in graph:
         visit(node)
+
+
+def validate_deletions(architecture: ArchitectureContract,
+                       requirements: RequirementContract,
+                       project_root: str | Path | None = None) -> None:
+    crit_ids = set(requirements.criterion_ids())
+    for deletion in architecture.deletions:
+        target = normalize_target_file(deletion.target_file)
+        deletion.target_file = target
+        if not target:
+            raise StateValidationError("deletion sem target_file")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", deletion.expected_sha256 or ""):
+            raise StateValidationError(
+                f"deletion {target}: expected_sha256 inválido")
+        if not deletion.requirement_id:
+            raise StateValidationError(
+                f"deletion {target}: requirement_id obrigatório")
+        if crit_ids and deletion.requirement_id not in crit_ids:
+            raise StateValidationError(
+                f"deletion {target}: requirement_id inexistente")
+        if project_root:
+            root = Path(project_root).expanduser().resolve()
+            dest = (root / target).resolve()
+            try:
+                dest.relative_to(root)
+            except ValueError as exc:
+                raise StateValidationError(
+                    f"deletion escapa da raiz: {target}") from exc
 
 
 def _norm_text(value: str) -> str:
@@ -667,6 +720,8 @@ class ProjectState:
         validate_dependencies(self.tasks)
         link_traceability(self.requirements, self.tasks)
         validate_traceability(self.requirements, self.tasks)
+        validate_deletions(self.architecture, self.requirements,
+                           self.project_root or None)
         crit_ids = set(self.requirements.criterion_ids())
         for record in self.verifications.values():
             for cid in record.criterion_ids:
@@ -711,6 +766,8 @@ class ProjectState:
     def approve_architecture(self, actor: str = "human", detail: str = "") -> Approval:
         link_traceability(self.requirements, self.tasks)
         validate_traceability(self.requirements, self.tasks)
+        validate_deletions(self.architecture, self.requirements,
+                           self.project_root or None)
         approval = Approval(kind="architecture", artifact_hash=self.architecture_hash(),
                             actor=actor, decision="approved",
                             timestamp=utc_now(), detail=detail)

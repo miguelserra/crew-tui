@@ -36,12 +36,14 @@ from state import (
     link_traceability,
     validate_traceability,
     validate_dependencies,
+    validate_deletions,
     utc_now,
 )
 from store import ResumeTarget, StateManager, atomic_write_json
 from profiles import resolve_profile, phases_for
-from publish import PublishError, PublishManager
-from workspace import default_workspace, prepare_workspace
+from publish import PublishConflict, PublishError, PublishManager
+from workspace import (IgnoreRules, default_workspace, prepare_workspace,
+                       validate_workspace_integrity)
 from scaffold import scaffold
 
 ENGINE_VERSION = "1.0"
@@ -496,21 +498,30 @@ class FactoryAdapter:
         self.order = PHASE_ORDER_LEGACY if legacy_order else PHASE_ORDER_UNIFIED
         self.isolated = bool(isolate_workspace)
         self._last_ok: dict[str, ModelRef] = {}
+        self.rules = None
+        self.recovery_error = ""
         if self.isolated and project.project_root:
+            self.rules = IgnoreRules.from_project(project.project_root)
             ws = str(project.extensions.get("workspace_root") or
                      default_workspace(settings, project.run_id))
             project.extensions["workspace_root"] = ws
             origin = project.extensions.get("workspace_origin")
             if not origin:
-                origin = prepare_workspace(project.project_root, ws)
+                excluded_report: list[tuple[str, str]] = []
+                origin = prepare_workspace(project.project_root, ws,
+                                           rules=self.rules,
+                                           report=excluded_report)
                 project.extensions["workspace_origin"] = origin
+                project.extensions["workspace_excluded"] = [
+                    {"path": p, "reason": r} for p, r in excluded_report]
             self.workspace_root = ws
             try:
                 PublishManager(project.project_root, ws,
                                Path(project.project_root) / ".crew",
-                               origin).recover()
-            except Exception:
-                pass
+                               origin, rules=self.rules,
+                               deletions=project.architecture.deletions).recover()
+            except Exception as exc:
+                self.recovery_error = str(exc)
         else:
             self.workspace_root = project.project_root
 
@@ -571,6 +582,8 @@ class FactoryAdapter:
         req.answers = [dict(x) for x in (fs.answers or [])]
         self.project.requirements = req
         self.project.architecture = ArchitectureContract.from_dict(fs.architecture)
+        validate_deletions(self.project.architecture, self.project.requirements,
+                           self.project.project_root or None)
         self.project.scaffold = dict(fs.scaffold)
         existing = {t.id: t for t in self.project.tasks}
         tasks: list[Task] = []
@@ -694,8 +707,21 @@ class FactoryAdapter:
             return None
         origin = dict(self.project.extensions.get("workspace_origin") or {})
         mgr = PublishManager(self.project.project_root, self.workspace_root,
-                             Path(self.project.project_root) / ".crew", origin)
-        mgr.recover()
+                             Path(self.project.project_root) / ".crew", origin,
+                             rules=self.rules,
+                             deletions=self.project.architecture.deletions)
+        returned = mgr.recover()
+        if returned and returned.get("status") in ("RECOVERY_REQUIRED",
+                                                   "REVALIDATION_REQUIRED"):
+            raise PublishConflict("recuperação de publicação pendente")
+        manifest = validate_workspace_integrity(
+            self.project.project_root, self.workspace_root, origin,
+            self.rules, self.project.architecture.deletions)
+        self.project.extensions["workspace_manifest"] = manifest.to_dict()
+        if not manifest.ok:
+            raise PublishConflict("workspace incompleto: "
+                                  + ", ".join(manifest.missing[:5]))
+        mgr.manifest = manifest
         return mgr.publish()
 
     def on_last_ok(self, task_id: str, ref: ModelRef) -> None:

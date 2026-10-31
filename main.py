@@ -83,6 +83,8 @@ from registry import (
     BILLING_PAYG, BILLING_UNKNOWN as MB_UNKNOWN, CostEstimate, ModelIdentity, ModelRef,
     ModelRegistry, RegistryError, normalize_billing, ref_from_handle,
 )
+from publish import PublishError, PublishManager, RecoveryRequired
+from workspace import IgnoreRules, default_workspace
 from engine import (
     ENGINE_LEGACY, ENGINE_UNIFIED, ENGINE_VERSION, EngineError, EngineFacade,
     FactoryAdapter, UnknownBilling, WorkflowEngine, iter_model_refs, migrate_engine,
@@ -4522,6 +4524,43 @@ def _factory_cli(args: Any) -> int:
     return _engine_cli_run(args, kind, settings, store, None, persistence="factory")
 
 
+def _resolve_publish_cli(args: Any) -> int:
+    settings = Settings.from_env()
+    store = StateManager(settings.workspace_dir, settings.log_dir)
+    if not args.project:
+        print("--resolve-publish-conflict exige --project DIR", flush=True)
+        return 2
+    root = Path(os.path.expanduser(args.project)).expanduser().resolve()
+    try:
+        state = store.load_project(store.project_state_path(root))
+    except Exception as exc:
+        print(f"[STATE] {exc}", flush=True)
+        return 6
+    ws = state.extensions.get("workspace_root") or str(
+        default_workspace(settings, state.run_id))
+    origin = dict(state.extensions.get("workspace_origin") or {})
+    mgr = PublishManager(root, ws, root / ".crew", origin,
+                         rules=IgnoreRules.from_project(root),
+                         deletions=state.architecture.deletions)
+    if not args.journal:
+        print(json.dumps(mgr.list_issues(), ensure_ascii=False, indent=2), flush=True)
+        return 0
+    if not args.file or not args.choice:
+        print("usa --journal ID --file REL --choice "
+              "human|original|generated|manual [--manual-file PATH]", flush=True)
+        return 2
+    try:
+        result = mgr.resolve(args.journal, args.file, args.choice, args.manual_file)
+    except (PublishError, RecoveryRequired) as exc:
+        print(f"[PUBLISH] {exc}", flush=True)
+        return 4
+    print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    if result.get("status") == "REVALIDATION_REQUIRED":
+        print("[PUBLISH] revalidação necessária antes de DONE; "
+              "não foi marcado como entregue", flush=True)
+    return 0
+
+
 def _migrate_cli(args: Any) -> int:
     settings = Settings.from_env()
     store = StateManager(settings.workspace_dir, settings.log_dir)
@@ -4571,6 +4610,16 @@ def main() -> None:
                         help="workflow: auto|web|library|script|review")
     parser.add_argument("--approve-architecture", action="store_true",
                         help="aprova a arquitetura (o --yes não a aprova)")
+    parser.add_argument("--resolve-publish-conflict", action="store_true",
+                        help="resolve/recover a pending transactional publish")
+    parser.add_argument("--journal", metavar="ID",
+                        help="journal id for --resolve-publish-conflict")
+    parser.add_argument("--file", metavar="REL",
+                        help="file path to resolve in the journal")
+    parser.add_argument("--choice", choices=["human", "original", "generated", "manual"],
+                        help="resolution choice")
+    parser.add_argument("--manual-file", metavar="PATH",
+                        help="replacement file for --choice manual")
     parser.add_argument("--migrate-state", action="store_true",
                         help="converte .factory/state.json para .crew/state.json (não muda o motor)")
     parser.add_argument("--migrate-schema", action="store_true",
@@ -4578,6 +4627,8 @@ def main() -> None:
     parser.add_argument("--migrate-engine", action="store_true",
                         help="muda engine_kind para unified (operação distinta)")
     args = parser.parse_args()
+    if args.resolve_publish_conflict:
+        raise SystemExit(_resolve_publish_cli(args))
     if args.goal and args.factory:
         parser.error("dá o objetivo como posicional OU --factory (deprecated), não ambos")
     if args.factory:
