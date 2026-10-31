@@ -324,9 +324,12 @@ replayable, and blocks recovery until resolved. Interrupted `SUBMITTED` calls
 with a surviving result are reconciled to `CONFIRMED`; `history` call ids are
 reconciled at startup so a replayed critic/visual call cannot duplicate an
 event. The machine-generated report lives in
-`docs/p7-differential-report.md` (`tools/p7_differential_report.py`). Still
+`docs/p7-differential-report.md` (`tools/p7_differential_report.py`). Publisher crash-recovery is covered by injected interruptions at every
+boundary (before/after journal, backups, apply, commit, rollback and partial
+recovery); recovery is rollback-only and ends in COMMITTED, ROLLED_BACK or
+RECOVERY_REQUIRED, never a false COMMITTED after partial application. Still
 pending before the gate opens: provider-declared idempotency headers and full
-crash-recovery journal replay. The runtime still uses `FactoryAdapter` and
+differential equivalence. The runtime still uses `FactoryAdapter` and
 removal is not authorized. P7 is not
 a closed gate; legacy migration/conversion remains readable and no silent
 conversion is performed. No prompt/routing/verification policy was changed in

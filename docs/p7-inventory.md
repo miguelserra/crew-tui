@@ -41,6 +41,7 @@ Baseline: `p6.1-gate` (`86f2df1`).
 | `native_adapter.py` | native composition | P7.1d extraction; not default |
 | differential cassette | normal, FAIL→FIX, UNVERIFIED, visual retry, fallback, Playwright, resume, publish parity/conflict | 10 green; PAYG intent ledger + crash-recovery pending |
 | differential report | generated matrix + uncovered items | `docs/p7-differential-report.md` |
+| publisher recovery | fault injection at each journal/apply/rollback boundary | rollback-only; COMMITTED/ROLLED_BACK/RECOVERY_REQUIRED; never false COMMITTED |
 | `calls.py` | durable PAYG call ledger + result artifacts | PENDING/SUBMITTED/CONFIRMED/UNKNOWN/FAILED; text-only replay with full invocation fingerprint; history dedup; no silent PAYG retry; resume gate |
 | integration fixer | one call + affected task ids + producer | revalidates changed artefacts (oracle+critic), invalidates stale PASS |
 

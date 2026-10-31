@@ -55,10 +55,29 @@ PENDING = [
      "A chave é gerada e registada, mas ainda não é enviada. Falta uma "
      "capacidade explícita no contrato do provider (suporte, header, âmbito e "
      "retenção) e o envio condicionado a essa declaração."),
-    ("Crash-recovery completo de publicação",
-     "Replay de journals interrompidos a meio de PUBLISHING/ROLLING_BACK e "
-     "comparação da recuperação entre motores. O teste actual cobre publish "
-     "normal e conflito, não a recuperação após crash."),
+]
+
+PUBLISHER = [
+    ("Crash antes do journal (projecto intacto)",
+     "test_crash_before_journal_leaves_project_untouched"),
+    ("Crash durante backups (projecto intacto)",
+     "test_crash_during_backup_leaves_project_untouched"),
+    ("Crash após journal PREPARED -> ROLLED_BACK",
+     "test_crash_after_journal_rolls_back"),
+    ("Crash após PUBLISHING -> ROLLED_BACK",
+     "test_crash_after_publishing_rolls_back"),
+    ("Crash a meio da aplicação -> não COMMITTED -> ROLLED_BACK",
+     "test_crash_mid_apply_never_reports_committed"),
+    ("Crash após substituições antes do commit -> ROLLED_BACK",
+     "test_crash_after_all_applied_before_commit_rolls_back"),
+    ("Crash após commit -> PUBLISHED",
+     "test_crash_after_commit_reports_published"),
+    ("Crash durante rollback -> retomado -> ROLLED_BACK",
+     "test_crash_during_rollback_is_retried"),
+    ("Rollback impossível -> RECOVERY_REQUIRED",
+     "test_rollback_failure_requires_recovery"),
+    ("Publicação normal -> COMMITTED",
+     "test_normal_publish_is_committed"),
 ]
 
 SAFETY = [
@@ -139,7 +158,15 @@ def run_safety() -> list[tuple[str, str, str, str]]:
     return rows
 
 
-def render(rows, safety) -> str:
+def run_publisher() -> list[tuple[str, str, str, str]]:
+    rows = []
+    for label, method in PUBLISHER:
+        status = _run_one("tests.test_p061_recovery", "RecoveryTests", method)
+        rows.append((label, f"RecoveryTests.{method}", "", status))
+    return rows
+
+
+def render(rows, safety, publisher) -> str:
     lines = [
         "# P7 differential equivalence report (P7.1d)",
         "",
@@ -150,10 +177,10 @@ def render(rows, safety) -> str:
         "",
         "## Gate",
         "",
-        "The gate is **closed**. Every applicable scenario must be green in both "
-        "paths with no billing/security/verification divergence, and the "
-        "interruption/resume billing protocol plus full crash-recovery must be "
-        "covered before switching the runtime default.",
+        "The gate is **closed**. Differential equivalence must be green in both "
+        "paths with no billing/security/verification divergence. The PAYG "
+        "recovery protocol and the publisher crash-recovery matrix are covered; "
+        "provider-declared idempotency headers remain pending.",
         "",
         "## Scenarios",
         "",
@@ -170,6 +197,20 @@ def render(rows, safety) -> str:
         "|---|---|---|",
     ]
     for label, name, _dims, status in safety:
+        lines.append(f"| {label} | {status} | `{name}` |")
+    lines += [
+        "",
+        "## Publisher crash-recovery (P6.1)",
+        "",
+        "Policy: recovery is **rollback-only**. A crash after every file was "
+        "replaced but before COMMITTED resolves to ROLLED_BACK, never a false "
+        "PUBLISHED. A crash before the journal is created leaves the project "
+        "untouched (no publication attempt is recorded).",
+        "",
+        "| Fronteira | Estado | Teste |",
+        "|---|---|---|",
+    ]
+    for label, name, _dims, status in publisher:
         lines.append(f"| {label} | {status} | `{name}` |")
     lines += [
         "",
@@ -210,11 +251,12 @@ def render(rows, safety) -> str:
 def main() -> int:
     rows = run_scenarios()
     safety = run_safety()
+    publisher = run_publisher()
     out = ROOT / "docs" / "p7-differential-report.md"
-    out.write_text(render(rows, safety), encoding="utf-8")
-    failed = [r for r in rows + safety if r[3] == "Falha"]
+    out.write_text(render(rows, safety, publisher), encoding="utf-8")
+    failed = [r for r in rows + safety + publisher if r[3] == "Falha"]
     print(f"wrote {out}")
-    for label, _name, _dims, status in rows + safety:
+    for label, _name, _dims, status in rows + safety + publisher:
         print(f"  {status:10} {label}")
     return 1 if failed else 0
 

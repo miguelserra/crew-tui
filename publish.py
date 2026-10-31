@@ -139,7 +139,8 @@ class PublishManager:
                  state_dir: str | Path, origin_hashes: dict[str, str], *,
                  rules: Optional[IgnoreRules] = None,
                  deletions: Iterable[Any] = (),
-                 manifest: Optional[WorkspaceManifest] = None):
+                 manifest: Optional[WorkspaceManifest] = None,
+                 fault: Optional[Any] = None):
         self.project = Path(project_root).expanduser().resolve()
         self.workspace = Path(workspace_root).expanduser().resolve()
         self.state_dir = Path(state_dir).expanduser().resolve()
@@ -147,11 +148,17 @@ class PublishManager:
         self.rules = rules or IgnoreRules.from_project(self.project)
         self.deletions = list(deletions or ())
         self.manifest = manifest
+        self.fault = fault
         self.root = self.state_dir / "publish"
         self.marker = self.root / "RECOVERY_REQUIRED.json"
         self.lock_path = self.state_dir / "publish.lock"
 
     # -- journal helpers ---------------------------------------------------- #
+
+    def _checkpoint(self, name: str, **info: Any) -> None:
+        """Test seam for crash injection; a BaseException simulates a crash."""
+        if self.fault is not None:
+            self.fault(name, info)
 
     def _new_dir(self) -> Path:
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -282,6 +289,7 @@ class PublishManager:
             _safe_path(self.project, entry.rel)
             _safe_path(self.workspace, entry.rel)
         run_dir = self._new_dir()
+        self._checkpoint("after_run_dir", run_dir=run_dir.name)
         entries: list[dict[str, Any]] = []
         for entry in pending:
             backup = None
@@ -292,44 +300,57 @@ class PublishManager:
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 if not src.is_file():
                     raise PublishConflict(f"original desapareceu: {entry.rel}")
+                self._checkpoint("before_backup", rel=entry.rel)
                 shutil.copy2(src, backup)
                 if sha256_file(backup) != entry.old_sha:
                     raise PublishConflict(f"original mudou: {entry.rel}")
+                self._checkpoint("after_backup", rel=entry.rel)
             if entry.action in ("create", "replace"):
                 src = self.workspace / entry.rel
                 generated = run_dir / "generated" / entry.rel
                 generated.parent.mkdir(parents=True, exist_ok=True)
+                self._checkpoint("before_generated", rel=entry.rel)
                 shutil.copy2(src, generated)
                 if sha256_file(generated) != entry.new_sha:
                     raise PublishError(f"artefacto gerado mudou: {entry.rel}")
+                self._checkpoint("after_generated", rel=entry.rel)
             entries.append({"rel": entry.rel, "action": entry.action,
                             "old_sha": entry.old_sha, "new_sha": entry.new_sha,
                             "backup": str(backup) if backup else None,
                             "generated": str(generated) if generated else None,
                             "status": "pending", "error": ""})
+        self._checkpoint("before_journal", run_dir=run_dir.name)
         journal = {"id": run_dir.name, "status": STATUS_PREPARED,
                    "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                    "manifest": plan.manifest.to_dict() if plan.manifest else None,
                    "entries": entries}
         self._write_journal(run_dir, journal)
+        self._checkpoint("after_journal", run_dir=run_dir.name)
         journal["status"] = STATUS_PUBLISHING
         self._write_journal(run_dir, journal)
+        self._checkpoint("after_publishing", run_dir=run_dir.name)
         try:
             for item in journal["entries"]:
                 item["status"] = "applying"
                 self._write_journal(run_dir, journal)
+                self._checkpoint("before_apply", rel=item["rel"])
                 self._apply(item)
                 item["status"] = "done"
                 self._write_journal(run_dir, journal)
+                self._checkpoint("after_apply", rel=item["rel"])
+            self._checkpoint("before_commit", run_dir=run_dir.name)
             journal["status"] = STATUS_COMMITTED
             self._write_journal(run_dir, journal)
             self._clear_marker()
+            self._checkpoint("after_commit", run_dir=run_dir.name)
             return {"id": run_dir.name, "status": STATUS_COMMITTED,
                     "entries": len(entries), "path": str(run_dir)}
         except Exception as exc:
             journal["status"] = STATUS_ROLLING_BACK
             self._write_journal(run_dir, journal)
+            self._checkpoint("before_rollback", run_dir=run_dir.name)
             ok = self._rollback(journal, run_dir)
+            self._checkpoint("after_rollback", run_dir=run_dir.name, ok=ok)
             journal["status"] = STATUS_ROLLED_BACK if ok else STATUS_RECOVERY_REQUIRED
             journal["error"] = str(exc)[:500]
             self._write_journal(run_dir, journal)
@@ -394,7 +415,10 @@ class PublishManager:
                 continue
             data["status"] = STATUS_ROLLING_BACK
             self._write_journal(run_dir, data)
+            self._checkpoint("before_recovery_rollback", run_dir=run_dir.name)
             ok = self._rollback(data, run_dir)
+            self._checkpoint("after_recovery_rollback", run_dir=run_dir.name,
+                             ok=ok)
             data["status"] = STATUS_ROLLED_BACK if ok else STATUS_RECOVERY_REQUIRED
             self._write_journal(run_dir, data)
             if not ok:
@@ -408,6 +432,7 @@ class PublishManager:
         ok = True
         for item in reversed(journal.get("entries", [])):
             rel = item["rel"]
+            self._checkpoint("during_rollback", rel=rel)
             try:
                 dest = _safe_path(self.project, rel)
                 current = sha256_file(dest) if dest.is_file() and not dest.is_symlink() else ""
