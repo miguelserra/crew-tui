@@ -139,14 +139,21 @@ No prose, no placeholders, no elided sections.
             task.status = "done"
             self.emit("DEV", f"{task.id} entregue em {task.target_file}")
             return True
+        project.verifications[task.id] = record
+        task.verification = record.to_dict()
         if record.verdict == verify_policy.UNVERIFIED:
             task.status = "failed"
-            project.verifications[task.id] = record
-            task.verification = record.to_dict()
             self.emit("SYSTEM", f"{task.id}: UNVERIFIED — não entregue")
             return False
         # Quality FAIL: one native fix attempt, then re-verify.
+        objections = (record.critic.get("objections")
+                      if isinstance(record.critic, dict) else [])
+        detail = "; ".join(
+            str(o.get("claim") or o.get("why_wrong") or o)
+            if isinstance(o, dict) else str(o)
+            for o in objections)
         error = record.reason or "critic FAIL"
+        task.errors.append(f"critic FAIL: {detail or error}")
         try:
             fixed = self._fix(project, task, code, error, root)
         except Exception as exc:
@@ -198,6 +205,8 @@ Output the COMPLETE corrected file in ONE fenced block."""
             return None
         ok, _fb, record = self._verify(project, task, new_code, root, target, lang)
         if not ok:
+            project.verifications[task.id] = record
+            task.verification = record.to_dict()
             return None
         return new_code, record
 

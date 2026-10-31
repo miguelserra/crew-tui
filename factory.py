@@ -258,12 +258,22 @@ class Factory:
              complexity: str = "auto") -> tuple[Any, str]:
         """Route a factory role through the central Router policy."""
         role = (role or "").lower()
+        escalation = False
+        producer = None
         if role == "analyst":
             route_role, tag, complexity = "spec", "ANALYST", "medium"
         elif role == "chief":
             route_role, tag, complexity = "architecture", "ARCHITECT", "high"
         elif role in ("fixer", "escalation"):
             route_role, tag, complexity = "fixer", "DEV", "high"
+            escalation = True
+            if task_id:
+                producer = self.pool.last_attempt_model.get(task_id)
+                if producer is None:
+                    for task in self.state.tasks:
+                        if task.id == task_id:
+                            producer = task.delivered_by
+                            break
         elif role in ("junior", "senior"):
             route_role, tag = "programming", "DEV"
         else:
@@ -273,6 +283,7 @@ class Factory:
             role=route_role, complexity=complexity, tag=tag,
             required_capabilities=frozenset({"text"}),
             task_id=task_id, run_id=self.run_id or "",
+            escalation=escalation, producer=producer,
         )
         routed = self.pool.router.route(request)
         if not routed.candidates:
@@ -623,6 +634,7 @@ No prose, no placeholders, no elided sections.
                 self.log("test", f"{task.id} teste advisory falhou:\n{test_err}")
 
         # Mandatory critic / delivery gate before installing the file.
+        quality_fix_used = False
         for gate_attempt in range(2):
             producer = self.pool.last_attempt_model.get(task.id)
             if producer is None and task.delivered_by:
@@ -658,7 +670,11 @@ No prose, no placeholders, no elided sections.
                 str(o.get("claim") or o.get("why_wrong") or o)
                 for o in (critic.get("objections") or []) if isinstance(critic, dict))
             feedback = objections or (critic.get("note") if isinstance(critic, dict) else "")
+            task.errors.append(f"critic FAIL: {feedback or 'quality rejected'}")
             self.emit("CRITIC", f"{task.id}: FAIL — correção antes da entrega")
+            if quality_fix_used:
+                return False
+            quality_fix_used = True
             fixed = self._fix(task, cand, feedback or "critic FAIL", attempts=2)
             if fixed is None:
                 return False

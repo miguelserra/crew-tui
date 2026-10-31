@@ -58,13 +58,36 @@ class Http500(Exception):
 
 
 class FakeVerifier:
+    """Deterministic critic with explicit quality-rejection modes."""
+
+    def __init__(self, mode="pass"):
+        self.mode = mode
+        self.critic_calls = []
+        self._calls = {}
+
     def run_oracle(self, task_id, artifact, run_id=None, suffix=""):
         return types.SimpleNamespace(passed=True, exit_code=0)
 
     def run_critic(self, producer, task, code, run_id=None, review=False):
-        return {"verdict": "PASS", "critic": {"ok": True},
+        key = getattr(task, "id", task)
+        n = self._calls.get(key, 0) + 1
+        self._calls[key] = n
+        reject = self.mode == "always_fail" or (
+            self.mode == "fail_first" and n == 1)
+        verdict = "FAIL" if reject else "PASS"
+        objections = ([{"claim": "missing acceptance behaviour",
+                        "evidence": "critic rejected first artifact"}]
+                      if reject else [])
+        self.critic_calls.append({
+            "n": n, "task": key, "verdict": verdict,
+            "producer": getattr(producer, "model_id", ""),
+            "code": code, "objections": objections,
+        })
+        return {"verdict": verdict,
+                "critic": {"ok": not reject,
+                           "note": "quality rejected" if reject else "ok"},
                 "producer_family": "fake", "critic_family": "critic",
-                "producer_known": True, "objections": []}
+                "producer_known": True, "objections": objections}
 
     def run_test_oracle(self, *a, **k):
         return {"verdict": "SKIP", "advisory": True}
@@ -256,14 +279,15 @@ def settings(base):
     return cfg
 
 
-def _make_adapter(kind, cfg, pool, st):
+def _make_adapter(kind, cfg, pool, st, verifier=None):
+    verifier = verifier or FakeVerifier()
     if kind == "factory":
         adapter = engine.FactoryAdapter(cfg, pool, lambda *a: None, st,
                                         isolate_workspace=True)
-        adapter.factory.verifier = FakeVerifier()
+        adapter.factory.verifier = verifier
     else:
         adapter = native_adapter.NativeAdapter(
-            cfg, pool, lambda *a: None, st, verifier=FakeVerifier(),
+            cfg, pool, lambda *a: None, st, verifier=verifier,
             isolate_workspace=True)
     return adapter
 
@@ -280,7 +304,8 @@ def _crash_before_consume(eng):
 
 def run_pipeline(kind, script, complexity="medium", pre_ledger=None,
                  registry_mode="full", *, crash_after_confirm=False,
-                 crash_before_consume=False, request_overrides=None):
+                 crash_before_consume=False, request_overrides=None,
+                 verifier_mode="pass"):
     base = Path(tempfile.mkdtemp(prefix="p7pipe-"))
     project = base / "project"; project.mkdir()
     ws = base / "ws"
@@ -291,7 +316,8 @@ def run_pipeline(kind, script, complexity="medium", pre_ledger=None,
     pool = PipelinePool(script, registry_mode)
     pool.crash_after_confirm = crash_after_confirm
     pool.request_overrides = request_overrides
-    adapter = _make_adapter(kind, cfg, pool, st)
+    verifier = FakeVerifier(verifier_mode)
+    adapter = _make_adapter(kind, cfg, pool, st, verifier)
     store = StateManager(cfg.workspace_dir, cfg.log_dir)
     eng = engine.WorkflowEngine(st, store, adapter, emit=lambda *a: None)
     eng.apply_pool(pool)
@@ -305,7 +331,8 @@ def run_pipeline(kind, script, complexity="medium", pre_ledger=None,
         result = "crashed"
     return {"base": base, "state": st, "engine": eng, "pool": pool,
             "ledger": eng.call_ledger, "result": result, "kind": kind,
-            "transport": pool.transport, "crashed": crashed}
+            "transport": pool.transport, "crashed": crashed,
+            "verifier": verifier}
 
 
 def resume_run(run, script=None, registry_mode="payg_first", *,
@@ -363,6 +390,117 @@ class AdapterPipelineTests(unittest.TestCase):
                              ["gemini-3.1-pro-preview",
                               "nvidia/nemotron-3-ultra",
                               "deepseek-v4-pro"])
+
+    def test_d03_quality_failure_escalates(self):
+        script = {"gemini-3.1-pro-preview": "ok",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high",
+                               verifier_mode="fail_first")
+            self.assertEqual(run["result"], "ok", kind)
+            self.assertEqual(run["transport"], [
+                ("gemini-3.1-pro-preview", "ok"),
+                ("nvidia/nemotron-3-ultra", "ok")], kind)
+            self.assertEqual(run["pool"].calls, ["ok", "ok"], kind)
+            self.assertEqual([c["verdict"] for c in
+                              run["verifier"].critic_calls],
+                             ["FAIL", "PASS"], kind)
+            self.assertEqual([c["producer"] for c in
+                              run["verifier"].critic_calls],
+                             ["gemini-3.1-pro-preview",
+                              "nvidia/nemotron-3-ultra"], kind)
+            task = run["state"].tasks[0]
+            self.assertIn(task.status, ("done", "verified"), kind)
+            self.assertEqual(task.delivered_by.model_id,
+                             "nvidia/nemotron-3-ultra", kind)
+
+    def test_d03_quality_failure_is_not_technical_fallback(self):
+        script = {"gemini-3.1-pro-preview": "ok",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high",
+                               verifier_mode="fail_first")
+            task = run["state"].tasks[0]
+            self.assertEqual(run["pool"].calls, ["ok", "ok"], kind)
+            self.assertFalse(any(word in " ".join(task.errors).lower()
+                                 for word in ("timeout", "429", "connection",
+                                              "rate_limit", "server")), kind)
+            self.assertTrue(any(err.startswith("critic FAIL:")
+                                for err in task.errors), kind)
+            self.assertFalse(run["state"].pause.reason, kind)
+
+    def test_d03_approved_response_does_not_reinvoke(self):
+        script = {"gemini-3.1-pro-preview": "ok",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high")
+            self.assertEqual(run["result"], "ok", kind)
+            self.assertEqual(run["transport"],
+                             [("gemini-3.1-pro-preview", "ok")], kind)
+            self.assertEqual(len(run["verifier"].critic_calls), 1, kind)
+            self.assertEqual(run["verifier"].critic_calls[0]["verdict"],
+                             "PASS", kind)
+            task = run["state"].tasks[0]
+            self.assertEqual(len(task.attempts), 1, kind)
+            rec = run["state"].verifications.get(task.id)
+            self.assertIsNotNone(rec, kind)
+            self.assertEqual(rec.verdict, "PASS", kind)
+
+    def test_d03_quality_chain_exhausted_never_passes(self):
+        script = {"gemini-3.1-pro-preview": "ok",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high",
+                               verifier_mode="always_fail")
+            self.assertEqual(run["result"], "failed", kind)
+            self.assertEqual(run["transport"], [
+                ("gemini-3.1-pro-preview", "ok"),
+                ("nvidia/nemotron-3-ultra", "ok")], kind)
+            self.assertEqual([c["verdict"] for c in
+                              run["verifier"].critic_calls],
+                             ["FAIL", "FAIL"], kind)
+            task = run["state"].tasks[0]
+            self.assertEqual(task.status, "failed", kind)
+            rec = run["state"].verifications.get(task.id)
+            self.assertIsNotNone(rec, kind)
+            self.assertEqual(rec.verdict, "FAIL", kind)
+            self.assertFalse((Path(run["base"]) / "project" / "app.py")
+                             .exists(), kind)
+
+    def test_d03_quality_billing_parity(self):
+        script = {"gemini-3.1-pro-preview": "ok",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        ref = run_pipeline("factory", script, "high",
+                           verifier_mode="fail_first")
+        new = run_pipeline("native", script, "high",
+                           verifier_mode="fail_first")
+        self.assertEqual(ref["transport"], new["transport"])
+        self.assertEqual(ref["pool"].calls, new["pool"].calls)
+        self.assertEqual(
+            [(c["producer"], c["verdict"], c["n"]) for c in
+             ref["verifier"].critic_calls],
+            [(c["producer"], c["verdict"], c["n"]) for c in
+             new["verifier"].critic_calls])
+        self.assertEqual(ref["result"], new["result"])
+        self.assertEqual(len(ref["ledger"].all()), len(new["ledger"].all()))
+
+    def test_d03_quality_evidence_and_history(self):
+        script = {"gemini-3.1-pro-preview": "ok",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high",
+                               verifier_mode="fail_first")
+            task = run["state"].tasks[0]
+            self.assertTrue(any("missing acceptance behaviour" in err
+                                for err in task.errors), kind)
+            self.assertEqual([a.model.model_id for a in task.attempts],
+                             ["gemini-3.1-pro-preview",
+                              "nvidia/nemotron-3-ultra"], kind)
+            self.assertTrue(all(a.attempt_id for a in task.attempts), kind)
+            final = run["state"].verifications.get(task.id)
+            self.assertIsNotNone(final, kind)
+            self.assertEqual(final.verdict, "PASS", kind)
+            self.assertEqual(final.critic.get("verdict"), "PASS", kind)
 
     def test_d04_auth_connection_server_fallback(self):
         # Compare both adapters rather than hard-coding which candidate the
