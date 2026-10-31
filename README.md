@@ -186,6 +186,38 @@ preserved in `ProjectState.extensions`, contract `raw` data and
 - `ModelRef` stores an identity snapshot for historical attempts/telemetry;
 - Python 3.10 uses `tomli`; 3.11+ uses `tomllib`.
 
+## Router (P4)
+
+Routing is a central policy over Registry identities, not a chain of
+`with_fallbacks` guesses:
+
+- **Fallback** handles technical failure only: timeout (limited retry),
+  connection, 429 rate limit (respecting `Retry-After`), quota exhaustion
+  (tracked separately), 5xx and empty responses.
+- **Escalation** is a quality decision after oracle/critic failure: it uses a
+  stronger chain and excludes the producer that failed.
+- **Circuit breaker** is keyed by provider + endpoint + credential profile:
+  3 rate limits within the window open a 15-minute cooldown, a half-open probe
+  is allowed before closing, and the state survives restarts
+  (`logs/router_state.json`). Auth failures disable the credential; quota has
+  its own cooldown.
+- **PAYG grants are scoped**: a TUI approval authorizes one task; `--allow-paid`
+  is a run-scoped grant. There is no persistent global “allow paid” switch.
+  Every fallback/escalation candidate still passes the Registry billing gate;
+  `unknown` remains blocked.
+- **Complexity comes from `Task.complexity`** when present; the token heuristic
+  is only an `auto` fallback:
+
+| Complexity | Chain |
+|---|---|
+| tiny / local helper | Qwen local (if up) → normal free chain |
+| normal coding | Gemini Flash → Flash alt → Pro → Nemotron → Argon |
+| complex / architecture | Gemini Pro → Nemotron → Kimi/Argon → DeepSeek PAYG |
+| fixer | Big Pickle (only if available) → Gemini Pro → stronger authorized candidates |
+
+The Router returns ordered candidates with reasons; it never constructs
+LangChain clients (the provider/LLMPool layer does).
+
 ## Financial circuit breaker
 
 Pay-as-you-go models are **never** called implicitly:
@@ -197,8 +229,12 @@ Pay-as-you-go models are **never** called implicitly:
 - Fallback chains are built without `payg` handles unless `ALLOW_PAID=1`.
 - A free-tier `429`/quota that exhausts the chain suspends the run with
   `BudgetSuspended` instead of silently falling back to a paid endpoint.
-- In the TUI, a modal asks which paid model to use; refusing keeps the breaker
-  closed (the step fails, nothing is spent).
+- In the TUI, a modal asks which paid model to use **for that task**; refusing
+  keeps the breaker closed (the step fails, nothing is spent). A task grant
+  never authorizes another task. `--allow-paid` is an explicit run-scoped grant.
+- The router circuit breaker is separate from billing: 3 rate limits →
+  cooldown (respecting `Retry-After`), a half-open probe, persistent state;
+  quota exhaustion and auth failure are distinct states.
 - Headless factory: use `--allow-paid` (or `ALLOW_PAID=1`) to pre-authorize.
 
 ```dotenv
@@ -503,6 +539,7 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `models.toml` | Declarative model identities/profiles/prices (override with `MODELS_CONFIG`) |
 | `attempts.py` | Per-candidate attempt scoreboard (stdlib) |
 | `engine.py` | Engine selection, approvals, dispatch guard, workflow adapters |
+| `router.py` | Route contracts, error classification, circuit breaker, PAYG grants |
 | `peak.py` | Pure peak/off-peak window helpers (shared, no I/O) |
 | `power.py` | Platform dispatcher (Linux vs Windows) |
 | `power_linux.py` | `systemd-inhibit` keep-awake + RTC alarm/suspend gate |
@@ -518,6 +555,7 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 python -m unittest discover -s tests -p "test_p01_*.py"   # core, no deps
 python -m unittest discover -s tests -p "test_p02_*.py"   # core, no deps
 python -m unittest discover -s tests -p "test_p03_*.py"   # registry, no deps
+python -m unittest discover -s tests -p "test_p04_*.py"   # router, no deps
 .venv/bin/python -m unittest discover -s tests -p "test_p0*_integration.py"
 python tests/test_power.py
 python tests/test_budget.py

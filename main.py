@@ -91,6 +91,10 @@ from engine import (
 from store import StateManager
 from state import (ProjectState, StateCorruptError, StateError, from_legacy_factory,
                    new_id)
+from router import (
+    CircuitBreaker, GrantStore, PaidGrant, RouteRequest, RouteResult, RouteChain,
+    Router, RouterExhausted, UnknownModelError, classify_error,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -717,6 +721,15 @@ class LLMPool:
             self.registry_error = str(exc)
         self.openrouter_pricing: dict[str, dict[str, Any]] = {}
         self.probes: dict[tuple[str, str], bool] = {}
+        self._handle_cache: dict[tuple[Any, ...], Any] = {}
+        self.router = Router(
+            self.registry, self._handle_for_identity,
+            breaker=CircuitBreaker(Path(settings.log_dir) / "router_state.json"),
+            grants=GrantStore(allow_paid=bool(settings.allow_paid)),
+            availability=self._identity_available,
+            request_grant=self._request_paid_grant,
+            allow_unknown=self.allow_unknown,
+        )
 
         self.cloud_enabled = bool(settings.opencode_api_key) and settings.opencode_mode != "off"
         self.openrouter_enabled = bool(settings.openrouter_api_key)
@@ -764,6 +777,48 @@ class LLMPool:
         if ref is not None:
             handlers.append(AttemptHandler(ref, self.registry))
         return handlers
+
+    def _handle_for_identity(self, identity: ModelIdentity, tag: str,
+                             max_tokens: int = 8192, thinking: bool = False) -> Any:
+        key = (identity.key, tag, max_tokens, thinking)
+        if key in self._handle_cache:
+            return self._handle_cache[key]
+        profile_name = identity.credential_profile
+        if profile_name == "gemini-plus":
+            llm = self._gemini(identity.model_id, thinking=thinking, tag=tag)
+        elif profile_name == "opencode-go":
+            llm = self._cloud(identity.model_id, tag, thinking=thinking,
+                              max_tokens=max_tokens)
+        elif profile_name == "opencode-free":
+            llm = self._free_cloud(identity.model_id, tag, max_tokens=max_tokens)
+        elif profile_name == "openrouter":
+            llm = self._openrouter(identity.model_id, tag, thinking=thinking,
+                                   max_tokens=max_tokens)
+        elif profile_name == "deepseek-api":
+            llm = self._deepseek(identity.model_id, tag, thinking=thinking,
+                                 max_tokens=max_tokens)
+        elif profile_name == "local":
+            llm = self._local_or_beam(tag) if self.local_up else None
+        else:
+            llm = None
+        self._handle_cache[key] = llm
+        return llm
+
+    def _identity_available(self, identity: ModelIdentity) -> Optional[bool]:
+        if identity.credential_profile == "opencode-free":
+            return self.probes.get((identity.credential_profile, identity.model_id))
+        return None
+
+    def _request_paid_grant(self, request: RouteRequest,
+                            candidate: Any) -> Optional[str]:
+        options = self.payg_options()
+        if candidate.identity.model_id not in options:
+            options = [candidate.identity.model_id] + options
+        reason = (f"PAYG {candidate.identity.model_id} para "
+                  f"{request.task_id or request.role}")
+        if self.on_budget is None:
+            return None
+        return self.on_budget(reason, options)
 
     def _cloud(self, model: str, tag: str, temperature: Optional[float] = None,
                thinking: bool = False, max_tokens: int = 8192) -> Any:
@@ -974,6 +1029,7 @@ class LLMPool:
 
     def _build(self) -> None:
         s = self.settings
+        self._handle_cache.clear()
         self._peak_at_build = self.is_peak()
         # Manager: strong reasoning for the (short) spec step. Gemini Pro is the
         # sunk-cost primary; Go subscription models are last resort unless
@@ -1203,27 +1259,20 @@ class LLMPool:
             raise RuntimeError("model unavailable (missing key/endpoint)")
         meta = meta or {}
         tag = meta.get("tag") or "OVERRIDE"
+        is_route = bool(getattr(llm, "is_route_chain", False))
         refs = iter_model_refs(llm)
         dispatch_refs = refs or [ref_from_handle(llm)]
-        if self.dispatch_guard is not None:
-            # A handle without identity is treated as unknown, never as free.
-            self.dispatch_guard(dispatch_refs)
-        elif not getattr(self, "allow_unknown", False):
-            for ref in dispatch_refs:
-                if ref.billing == MB_UNKNOWN:
-                    raise UnknownBilling(
-                        f"billing desconhecido para {ref.provider}/{ref.endpoint}/"
-                        f"{ref.model_id}; autoriza com ALLOW_UNKNOWN=1/--allow-unknown")
-        # Pre-flight: even a role whose only handle is paid must ask first.
-        if bills_per_token(llm) and not self.allow_paid:
-            choice = self._request_paid(tag, "este papel só tinha um modelo pago disponível")
-            paid = self._payg_model(choice, tag) if choice else None
-            if paid is None:
-                raise BudgetSuspended(
-                    f"{tag}: modelo pago bloqueado pelo circuit breaker; "
-                    "autoriza no TUI ou define ALLOW_PAID=1")
-            llm = paid
-            self._activate_paid()
+        if not is_route:
+            if self.dispatch_guard is not None:
+                # A handle without identity is treated as unknown, never as free.
+                self.dispatch_guard(dispatch_refs)
+            elif not getattr(self, "allow_unknown", False):
+                for ref in dispatch_refs:
+                    if ref.billing == MB_UNKNOWN:
+                        raise UnknownBilling(
+                            f"billing desconhecido para {ref.provider}/{ref.endpoint}/"
+                            f"{ref.model_id}; autoriza com ALLOW_UNKNOWN=1/--allow-unknown")
+            self._ensure_paid(llm, meta, tag)
         collector = AttemptCollector(run_id=str(meta.get("run") or ""),
                                      task=str(meta.get("task") or ""), tag=tag)
         token = _ATTEMPT_CTX.set(collector)
@@ -1246,6 +1295,25 @@ class LLMPool:
                     except Exception:
                         pass
 
+    def _ensure_paid(self, llm: Any, meta: Optional[dict[str, Any]],
+                     tag: str) -> None:
+        ref = ref_from_handle(llm)
+        if ref.billing != BILLING_PAYG:
+            return
+        identity = (ModelIdentity.from_dict(ref.identity) if ref.identity
+                    else self.registry.identity_for(ref.credential_profile, ref.model_id))
+        request = RouteRequest(role=tag, tag=tag,
+                               task_id=str((meta or {}).get("task") or ""),
+                               run_id=str((meta or {}).get("run") or ""))
+        if self.router.grants.allows(request, identity):
+            return
+        choice = self._request_paid(tag, "este papel só tinha um modelo pago disponível")
+        if choice:
+            self.router.grants.approve_task(request, {choice})
+        if not self.router.grants.allows(request, identity):
+            raise BudgetSuspended(
+                f"{tag}: modelo pago bloqueado pelo circuit breaker para esta tarefa")
+
     def _invoke(self, llm: Any, messages: list[Any], meta: Optional[dict[str, Any]],
                 tag: str, allow_breaker: bool) -> str:
         model = self._model_name(llm)
@@ -1263,16 +1331,6 @@ class LLMPool:
                 self.telemetry.record(run, "llm_error", model=model,
                                       tag=tag, task=(meta or {}).get("task"),
                                       kind=kind, error=str(e)[:300])
-            if allow_breaker and kind == "429/quota" and not self.allow_paid:
-                choice = self._request_paid(
-                    tag, f"429/quota em {model}: a cadeia gratuita esgotou-se")
-                paid = self._payg_model(choice, tag) if choice else None
-                if paid is not None:
-                    self._activate_paid()
-                    return self._invoke(paid, messages, meta, tag, allow_breaker=False)
-                raise BudgetSuspended(
-                    f"{tag}: 429/quota sem autorização para usar modelos pagos; "
-                    "autoriza no TUI, ALLOW_PAID=1 ou --allow-paid") from e
             raise
         fallback_ref = ref_from_handle(llm)
         self._record_usage(meta, response, model, int((time.monotonic() - started) * 1000),
@@ -1313,24 +1371,10 @@ class LLMPool:
             return self.on_budget(reason, options)
         return options[0] if self.allow_paid else None
 
-    def _payg_model(self, model: Optional[str], tag: str) -> Any:
-        model = (model or "").strip()
-        if not model:
-            return None
-        if self.deepseek_enabled and model == self.settings.deepseek_model:
-            return self._deepseek(model, tag, max_tokens=16384)
-        if self.openrouter_enabled and ("/" in model or model.endswith(":free")):
-            return self._openrouter(model, tag, max_tokens=16384)
-        if self.cloud_enabled:
-            return self._cloud(model, tag, thinking=False)
-        return None
-
-    def _activate_paid(self) -> None:
-        if not self.allow_paid:
-            self.allow_paid = True
-            self._build()
-
     def _model_name(self, llm: Any) -> str:
+        if getattr(llm, "is_route_chain", False):
+            request = getattr(llm, "request", None)
+            return f"route:{getattr(request, 'role', '?')}"
         for attr in ("model_name", "model"):
             value = getattr(llm, attr, None)
             if isinstance(value, str) and value:
@@ -1392,34 +1436,40 @@ class LLMPool:
             return self.critic_cloud
         return self.critic_gemini or self.critic_cloud
 
-    def team_llm(self, task: Any) -> tuple[Any, str]:
-        """Adaptive routing: local Qwen for tiny/private scripts, Gemini (free, with
-        reasoning) for everything else, paid Go models only as fallbacks."""
-        if getattr(task, "review", False):
-            # reports are long prose: thinking would eat the output budget
-            return (self.reviewer or self.gemini or self.fast_cloud, "REVIEW")
-        team = getattr(task, "team", "programming")
-        if team in ("algorithm", "architect"):
-            return (self.architect, "ARCHITECT")
-        if team == "uiux":
-            return (self.gemini or self.fast_cloud or self.worker,
-                    "GEMINI" if self.gemini else "WORKER")
-        if team == "large_context":
-            return (self.gemini or self.fast_cloud,
-                    "GEMINI" if self.gemini else "WORKER")
-        if team in ("qa", "testing"):
-            return (self.gemini or self.fast_cloud or self.worker, "WORKER")
-        # programming (default): hard tasks -> DeepSeek Pro; small non-front-end scripts
-        # -> local Qwen (free/private); otherwise the Gemini workhorse with reasoning.
-        if self._task_is_hard(task) and self.gemini is not None:
-            return (self.gemini, "GEMINI")
-        if self._task_is_hard(task) and self.escalate is not None:
-            return (self.escalate, "ESCALATE")
+    def _route_complexity(self, task: Any) -> str:
+        raw = str(getattr(task, "complexity", "auto") or "auto").lower()
+        if raw in ("low", "medium", "high", "complex", "hard", "tiny"):
+            return raw
+        if self._task_is_hard(task):
+            return "high"
         if self.local_up and self._task_is_small(task):
-            return (self.worker, "WORKER")
-        if self.gemini is not None:
-            return (self.gemini, "GEMINI")
-        return (self.fast_cloud or self.worker, "WORKER")
+            return "low"
+        return "medium"
+
+    def team_llm(self, task: Any, run_id: str = "") -> tuple[Any, str]:
+        """Route a task through the central policy (fallback inside RouteChain)."""
+        team = getattr(task, "team", "programming")
+        if getattr(task, "review", False):
+            role, tag, complexity = "review", "REVIEW", "medium"
+        elif team in ("algorithm", "architect"):
+            role, tag, complexity = "architecture", "ARCHITECT", "high"
+        elif team in ("uiux", "large_context", "qa", "testing"):
+            role, tag, complexity = "programming", "GEMINI", "medium"
+        else:
+            role, tag, complexity = "programming", "DEV", self._route_complexity(task)
+        request = RouteRequest(
+            role=role, complexity=complexity, tag=tag,
+            required_capabilities=frozenset({"text"}),
+            estimated_context=estimate_tokens(
+                (getattr(task, "description", "") or "") + " " +
+                " ".join(getattr(task, "acceptance", []) or [])),
+            task_id=str(getattr(task, "id", "") or ""),
+            run_id=run_id or "",
+        )
+        routed = self.router.route(request)
+        if not routed.candidates:
+            return None, tag
+        return routed.chain, tag
 
     def _task_is_small(self, task: Any) -> bool:
         """Heuristic: only route to the weak local model for trivial, non-visual scripts."""
@@ -2703,7 +2753,7 @@ class Orchestrator:
         for task in self.spec.tasks:
             self.power.before_step(f"task {task.id}")
             self.pool.refresh_peak()
-            llm, tag = self.pool.team_llm(task)
+            llm, tag = self.pool.team_llm(task, run_id=self.run_id or "")
             if llm is None:
                 task.status = "skipped"
                 self.results[task.id] = {"status": "skipped", "team": task.team}
@@ -2783,7 +2833,7 @@ class Orchestrator:
 
                 self.emit("SYSTEM", f"↻ feedback loop {attempt}/{self.settings.max_verify_loops} for {task.id}")
                 self._record("feedback_loop", task=task.id, attempt=attempt)
-                llm, tag = self.pool.team_llm(task)
+                llm, tag = self.pool.team_llm(task, run_id=self.run_id or "")
                 if llm is None:
                     break
                 try:
@@ -3009,13 +3059,25 @@ class Orchestrator:
 
     def _escalate(self, task: TaskSpec, artifact: str, producer: str,
                   reason: str, objections: list[Any]) -> bool:
-        """Last resort: regenerate with DeepSeek Pro and re-verify once."""
-        esc = self.pool.escalate
-        if esc is None or producer == "ESCALATE":
+        """Quality escalation: a stronger chain, not a technical fallback."""
+        if producer == "ESCALATE":
             return False
+        producer_ref = (ModelRef.from_dict(task.delivered_by)
+                        if getattr(task, "delivered_by", None) else None)
+        request = RouteRequest(
+            role="fixer", complexity="high", escalation=True,
+            required_capabilities=frozenset({"text"}),
+            task_id=task.id, run_id=self.run_id or "", producer=producer_ref,
+            tag="ESCALATE",
+        )
+        routed = self.pool.router.route(request)
+        if not routed.candidates:
+            self.emit("ESCALATE", f"{task.id}: sem candidatos de escalação")
+            return False
+        esc = routed.chain
         self.power.before_step(f"escalate {task.id}")
-        self.emit("ESCALATE", f"{task.id}: camada grátis falhou — a escalar para "
-                              f"{self.settings.fieldmarshal_model} …")
+        self.emit("ESCALATE", f"{task.id}: falha de qualidade — a escalar para "
+                              f"uma cadeia mais forte …")
         self._record("escalate", task=task.id, reason=reason[:160])
         feedback = reason
         if objections:
@@ -3049,7 +3111,7 @@ class Orchestrator:
             if written:
                 self.emit("SYSTEM", f"{task.id} -> {written}")
             return True
-        self.emit("ESCALATE", f"{task.id}: mesmo com DeepSeek Pro não passou")
+        self.emit("ESCALATE", f"{task.id}: mesmo com a cadeia de escalação não passou")
         return False
 
     @staticmethod
@@ -3450,7 +3512,7 @@ class BudgetOverrideModal(ModalScreen[Optional[str]]):
             yield Select([(m, m) for m in self.options], id="budget-select",
                          value=self.options[0] if self.options else Select.BLANK)
             with Horizontal(id="budget-buttons"):
-                yield Button("Autorizar e continuar", id="budget-ok", variant="warning")
+                yield Button("Autorizar para esta tarefa", id="budget-ok", variant="warning")
                 yield Button("Cancelar", id="budget-cancel", variant="error")
 
     @on(Button.Pressed, "#budget-ok")
@@ -4389,6 +4451,12 @@ def main() -> None:
         except UnknownBilling as e:
             print(f"[BILLING] {e}", flush=True)
             raise SystemExit(5)
+        except UnknownModelError as e:
+            print(f"[BILLING] {e}", flush=True)
+            raise SystemExit(5)
+        except RouterExhausted as e:
+            print(f"[ROUTER] {e}", flush=True)
+            raise SystemExit(7)
         except EngineError as e:
             print(f"[ENGINE] {e}", flush=True)
             raise SystemExit(2)

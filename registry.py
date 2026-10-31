@@ -169,6 +169,7 @@ class ModelIdentity:
     credential_profile: str = ""
     billing: str = BILLING_UNKNOWN
     capabilities: frozenset[str] = frozenset()
+    context_window: int = 0
     price: Optional[ModelPrice] = None
     quota_consumed: bool = False
     defined: bool = True
@@ -192,6 +193,7 @@ class ModelIdentity:
             "credential_profile": self.credential_profile,
             "billing": self.billing,
             "capabilities": sorted(self.capabilities),
+            "context_window": self.context_window,
             "price": self.price.to_dict() if self.price else None,
             "quota_consumed": self.quota_consumed,
             "defined": self.defined,
@@ -209,6 +211,7 @@ class ModelIdentity:
             credential_profile=str(data.get("credential_profile") or ""),
             billing=normalize_billing(data.get("billing")),
             capabilities=frozenset(str(c) for c in (data.get("capabilities") or [])),
+            context_window=int(data.get("context_window") or 0),
             price=(ModelPrice.from_dict(data.get("price"))
                    if data.get("price") else None),
             quota_consumed=bool(data.get("quota_consumed")),
@@ -295,13 +298,13 @@ def _price(inp: str, out: str, source: str, updated: str = "2026-10-30") -> Mode
 
 def _identity(profile: str, model_id: str, family: str, billing: str,
               capabilities: list[str], price: Optional[ModelPrice],
-              quota: bool, note: str = "") -> ModelIdentity:
+              quota: bool, note: str = "", context_window: int = 0) -> ModelIdentity:
     p = PROFILES[profile]
     return ModelIdentity(
         provider=p.provider, endpoint=p.endpoint, model_id=model_id,
         family=family, credential_profile=p.name, billing=billing,
-        capabilities=frozenset(capabilities), price=price,
-        quota_consumed=quota, defined=True, note=note,
+        capabilities=frozenset(capabilities), context_window=context_window,
+        price=price, quota_consumed=quota, defined=True, note=note,
     )
 
 
@@ -309,37 +312,47 @@ def default_models() -> dict[tuple[str, str], ModelIdentity]:
     zero_sub = _price("0", "0", "subscription (no PAYG marginal charge)")
     out: list[ModelIdentity] = [
         _identity("local", "qwen3.6-35b-a3b", "local", BILLING_LOCAL,
-                  ["text", "json"], _price("0", "0", "local inference"), False),
+                  ["text", "json"], _price("0", "0", "local inference"), False,
+                  context_window=32768),
         # Gemini Plus subscription (fixed cost, quota consumed).
         _identity("gemini-plus", "gemini-3.5-flash", "gemini", BILLING_SUBSCRIPTION,
-                  ["text", "vision", "json"], zero_sub, True),
+                  ["text", "vision", "json"], zero_sub, True,
+                  context_window=1_000_000),
         _identity("gemini-plus", "gemini-3.8-flash", "gemini", BILLING_SUBSCRIPTION,
-                  ["text", "vision", "json"], zero_sub, True),
+                  ["text", "vision", "json"], zero_sub, True,
+                  context_window=1_000_000),
         _identity("gemini-plus", "gemini-3.1-pro-preview", "gemini",
-                  BILLING_SUBSCRIPTION, ["text", "vision", "json"], zero_sub, True),
+                  BILLING_SUBSCRIPTION, ["text", "vision", "json"], zero_sub, True,
+                  context_window=1_000_000),
         # OpenCode Go subscription models (fixed cost, quota consumed).
         _identity("opencode-go", "deepseek-v4-pro", "deepseek",
-                  BILLING_SUBSCRIPTION, ["text", "json"], zero_sub, True),
+                  BILLING_SUBSCRIPTION, ["text", "json"], zero_sub, True,
+                  context_window=128000),
         _identity("opencode-go", "deepseek-v4.1-flash", "deepseek",
-                  BILLING_SUBSCRIPTION, ["text", "json"], zero_sub, True),
+                  BILLING_SUBSCRIPTION, ["text", "json"], zero_sub, True,
+                  context_window=128000),
         _identity("opencode-go", "kimi-k3.1-pro", "kimi",
-                  BILLING_SUBSCRIPTION, ["text", "json"], zero_sub, True),
+                  BILLING_SUBSCRIPTION, ["text", "json"], zero_sub, True,
+                  context_window=256000),
         _identity("opencode-go", "gemini-4-argon", "gemini",
-                  BILLING_SUBSCRIPTION, ["text", "json"], zero_sub, True),
+                  BILLING_SUBSCRIPTION, ["text", "json"], zero_sub, True,
+                  context_window=128000),
         _identity("opencode-go", "beam-free", "opencode",
-                  BILLING_SUBSCRIPTION, ["text", "json"], zero_sub, True),
+                  BILLING_SUBSCRIPTION, ["text", "json"], zero_sub, True,
+                  context_window=128000),
         # Free zen stealth model (availability probed at startup).
         _identity("opencode-free", "big-pickle", "opencode", BILLING_FREE,
                   ["text", "json"], _price("0", "0", "free zen quota"), True,
-                  "availability probed at startup"),
+                  "availability probed at startup", context_window=128000),
         # OpenRouter: free only if both confirmed prices are zero.
         _identity("openrouter", "nvidia/nemotron-3-ultra", "nvidia",
                   BILLING_FREE, ["text", "json"],
-                  _price("0", "0", "openrouter pricing: prompt=completion=0"), True),
+                  _price("0", "0", "openrouter pricing: prompt=completion=0"), True,
+                  context_window=128000),
         # Direct DeepSeek API (payg, Decimal per 1M tokens).
         _identity("deepseek-api", "deepseek-v4-pro", "deepseek", BILLING_PAYG,
                   ["text", "json"], _price("0.60", "2.20", "DeepSeek API pricing"),
-                  False),
+                  False, context_window=128000),
     ]
     return {i.key: i for i in out}
 
@@ -511,6 +524,7 @@ class ModelRegistry:
                 credential_profile=profile_name or p.name,
                 billing=normalize_billing(raw.get("billing") or p.billing),
                 capabilities=frozenset(str(c) for c in (raw.get("capabilities") or [])),
+                context_window=int(raw.get("context_window") or 0),
                 price=price,
                 quota_consumed=bool(raw.get("quota_consumed")),
                 defined=True,

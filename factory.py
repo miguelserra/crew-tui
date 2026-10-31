@@ -249,18 +249,30 @@ class Factory:
         except Exception:
             self.pool.refresh_peak()
 
-    def _llm(self, role: str) -> tuple[Any, str]:
-        """Route a factory role to a model (never the local model as a thinker)."""
-        pool = self.pool
-        if role == "junior":
-            if pool.local_up and pool.worker is not None:
-                return pool.worker, "WORKER"
-            return (pool.gemini or pool.fast_cloud), "WORKER"
-        if role == "chief":
-            return (pool.architect or pool.gemini), "ARCHITECT"
-        if role in ("senior", "fixer"):
-            return (pool.senior_dev or pool.gemini or pool.architect), "DEV"
-        return (pool.senior_dev or pool.gemini or pool.architect), "DEV"
+    def _llm(self, role: str, task_id: str = "",
+             complexity: str = "auto") -> tuple[Any, str]:
+        """Route a factory role through the central Router policy."""
+        role = (role or "").lower()
+        if role == "analyst":
+            route_role, tag, complexity = "spec", "ANALYST", "medium"
+        elif role == "chief":
+            route_role, tag, complexity = "architecture", "ARCHITECT", "high"
+        elif role in ("fixer", "escalation"):
+            route_role, tag, complexity = "fixer", "DEV", "high"
+        elif role in ("junior", "senior"):
+            route_role, tag = "programming", "DEV"
+        else:
+            route_role, tag = "programming", "DEV"
+        from router import RouteRequest
+        request = RouteRequest(
+            role=route_role, complexity=complexity, tag=tag,
+            required_capabilities=frozenset({"text"}),
+            task_id=task_id, run_id=self.run_id or "",
+        )
+        routed = self.pool.router.route(request)
+        if not routed.candidates:
+            return None, tag
+        return routed.chain, tag
 
     def on_attempt(self, event: Any) -> None:
         """Record every candidate call in the legacy factory state."""
@@ -289,10 +301,10 @@ class Factory:
                     return
 
     def _ask(self, role: str, system: str, user: str, tag: str,
-             task_id: str = "") -> str:
+             task_id: str = "", complexity: str = "auto") -> str:
         self.power.before_step(tag)
         self.pool.refresh_peak()
-        llm, _ = self._llm(role)
+        llm, _ = self._llm(role, task_id=task_id, complexity=complexity)
         if llm is None:
             raise RuntimeError(f"sem modelo para o papel '{role}'")
         meta = {"run": self.run_id or None, "tag": tag}
@@ -341,7 +353,7 @@ Produce the requirements contract. STRICT JSON:
 Rules: acceptance items must be testable by running something (command, browser,
 assert). At most 5 open_questions, each one line, only if it changes the code.
 If the goal is clear, return an empty list."""
-        raw = self._ask("senior", ANALYST_SYSTEM, prompt, "ANALYST")
+        raw = self._ask("analyst", ANALYST_SYSTEM, prompt, "ANALYST")
         req = _json_or_raise(raw, "requirements")
         req.setdefault("objective", self.state.goal)
         req.setdefault("acceptance", [])
@@ -568,7 +580,7 @@ No prose, no placeholders, no elided sections.
 {f"CURRENT CONTENT (keep everything that works, fix what the task asks):{chr(10)}```{fence}{chr(10)}{existing[:12000]}{chr(10)}```" if existing else ""}"""
         try:
             raw = self._ask(task.role, DEV_SYSTEM if task.role == "senior" else JUNIOR_SYSTEM,
-                            prompt, "DEV", task.id)
+                            prompt, "DEV", task.id, task.complexity)
         except Exception as e:
             task.errors.append(f"gerar: {e}")
             self.log("build", f"{task.id} ERRO ao gerar: {e}")
@@ -629,7 +641,7 @@ ERROR OUTPUT (attempt {n}/{attempts}):
 
 Output the COMPLETE corrected file in ONE fenced block."""
             try:
-                raw = self._ask(role, system, prompt, "DEV", task.id)
+                raw = self._ask(role, system, prompt, "DEV", task.id, task.complexity)
             except Exception as e:
                 self.log("fix", f"{task.id} tentativa {n}: modelo falhou: {e}")
                 continue
@@ -660,7 +672,7 @@ UNIT CONTENT:
 Rules: no network, no external services, deterministic, <= 40 lines.
 Output only the test file in one fenced block tagged python."""
         try:
-            raw = self._ask("junior", TEST_SYSTEM, prompt, "TEST", task.id)
+            raw = self._ask("junior", TEST_SYSTEM, prompt, "TEST", task.id, task.complexity)
             code = _one_block(raw, "python")
             test_path.write_text(code, encoding="utf-8")
         except Exception as e:

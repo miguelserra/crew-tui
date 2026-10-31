@@ -80,8 +80,18 @@ def iter_model_refs(llm: Any) -> list[ModelRef]:
         if isinstance(ref, ModelRef):
             add(ref)
             return
+        refs = getattr(obj, "model_refs", None)
+        if isinstance(refs, list):
+            for item in refs:
+                if isinstance(item, ModelRef):
+                    add(item)
+            return
         for candidate in getattr(obj, "candidates", []) or []:
-            walk(candidate)
+            cref = getattr(candidate, "ref", None)
+            if isinstance(cref, ModelRef):
+                add(cref)
+            else:
+                walk(candidate)
         runnable = getattr(obj, "runnable", None)
         if runnable is not None:
             walk(runnable)

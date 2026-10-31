@@ -181,21 +181,37 @@ class FactoryStateIntegrationTests(unittest.TestCase):
 class KnownLaterDefectsTests(unittest.TestCase):
     """Target semantics for P4/P5; expected to fail until then."""
 
-    @unittest.expectedFailure
-    def test_hard_tasks_should_select_escalation(self):
+    def test_hard_tasks_start_complex_chain(self):
+        import router as route_mod
+        import registry as reg_mod
+
+        class H:
+            def invoke(self, messages):
+                return types.SimpleNamespace(content="ok", usage_metadata={})
+
+        registry = reg_mod.ModelRegistry()
+        handles = {m.model_id: H() for m in registry.models.values()}
+        rt = route_mod.Router(
+            registry,
+            lambda identity, tag, max_tokens, thinking: handles.get(identity.model_id),
+            availability=lambda identity: None,
+        )
         pool = object.__new__(main.LLMPool)
-        pool.gemini = object()
-        pool.escalate = object()
-        pool.fast_cloud = None
-        pool.worker = None
+        pool.router = rt
         pool.local_up = False
         pool.settings = types.SimpleNamespace(hard_task_tokens=10,
                                               local_task_tokens=10)
+        pool._task_is_hard = types.MethodType(main.LLMPool._task_is_hard, pool)
+        pool._task_is_small = types.MethodType(main.LLMPool._task_is_small, pool)
+        pool._route_complexity = types.MethodType(main.LLMPool._route_complexity, pool)
         task = types.SimpleNamespace(
             description="x" * 200, acceptance=["a", "b", "c", "d"],
-            team="programming", target_file="a.py", review=False)
+            team="programming", target_file="a.py", review=False,
+            complexity="auto", id="t1")
         llm, _tag = main.LLMPool.team_llm(pool, task)
-        self.assertIs(llm, pool.escalate)
+        self.assertIsNotNone(llm)
+        first = llm.result.candidates[0].identity.model_id
+        self.assertEqual(first, "gemini-3.1-pro-preview")
 
     def _fake_orchestrator(self, critic, test_oracle=None):
         obj = main.Orchestrator.__new__(main.Orchestrator)
