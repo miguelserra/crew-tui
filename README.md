@@ -293,10 +293,11 @@ P7.1 has started extracting native services over canonical `ProjectState`:
 - `requirements.py` (SPEC/answers) — extracted;
 - `architecture.py` (architecture + tasks) — extracted, atomic validation;
 - `executor.py` (BUILD/FIX) — extracted, critic/verification gate reused;
+- `integration.py`, `visual.py`, `signoff.py` — extracted, P5/P6 evidence preserved;
 - scaffold/verification/workspace/publish were already native from P5/P6.
 
-INTEGRATE, VISUAL and SIGN-OFF still run through the legacy `FactoryAdapter`
-until their native services demonstrate equivalence. P7 is not
+NativeAdapter/differential equivalence (P7.1d) is the next step; until it
+passes, the runtime still uses `FactoryAdapter` and removal is not authorized. P7 is not
 a closed gate; legacy migration/conversion remains readable and no silent
 conversion is performed. No prompt/routing/verification policy was changed in
 this extraction.
@@ -627,6 +628,8 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `requirements.py` | Native SPEC/requirements service (P7.1, in progress) |
 | `architecture.py` | Native architecture decomposition (P7.1, in progress) |
 | `executor.py` | Native BUILD/FIX over ProjectState (P7.1b) |
+| `integration.py` / `visual.py` / `signoff.py` | Native remaining phases (P7.1c) |
+| `native_util.py` | Shared native helpers |
 | `context_reader.py` | Bounded, ignore-aware project context |
 | `profiles.py` | Workflow profiles, auto resolution and phase sets |
 | `scaffold.py` | Deterministic scaffold from the approved architecture |
