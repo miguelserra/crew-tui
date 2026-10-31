@@ -660,6 +660,7 @@ class VerificationRecord:
     tests: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     at: str = ""
+    authorized_unverified: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -677,6 +678,7 @@ class VerificationRecord:
             tests=dict(data.get("tests") or {}),
             reason=str(data.get("reason") or ""),
             at=str(data.get("at") or ""),
+            authorized_unverified=bool(data.get("authorized_unverified") or False),
         )
 
 

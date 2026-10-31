@@ -47,6 +47,14 @@ def _safe(root: Path, rel: str) -> Path:
     return dest
 
 
+def _as_ref(value: Any) -> Optional[ModelRef]:
+    if value is None:
+        return None
+    if isinstance(value, ModelRef):
+        return value
+    return ModelRef.from_dict(value)
+
+
 class ExecutorService:
     def __init__(self, settings: Any, pool: Any, verifier: Any, emit: Any,
                  run_id: str = ""):
@@ -147,8 +155,7 @@ No prose, no placeholders, no elided sections.
         request = RouteRequest(role="fixer", complexity="high", escalation=True,
                                required_capabilities=frozenset({"text"}),
                                task_id=task.id, run_id=self.run_id or "",
-                               producer=ModelRef.from_dict(task.delivered_by)
-                               if task.delivered_by else None, tag="DEV")
+                               producer=_as_ref(task.delivered_by), tag="DEV")
         routed = self.pool.router.route(request)
         if not routed.candidates:
             return None
@@ -187,8 +194,8 @@ Output the COMPLETE corrected file in ONE fenced block."""
         artifact = f"```{lang or 'text'}\n{code}\n```"
         oracle = self.verifier.run_oracle(task.id, artifact, self.run_id, suffix=suffix)
         producer = self.pool.last_attempt_model.get(task.id)
-        if producer is None and task.delivered_by:
-            producer = ModelRef.from_dict(task.delivered_by)
+        if producer is None:
+            producer = _as_ref(task.delivered_by)
         critic = self.verifier.run_critic(producer, task, code, self.run_id)
         tests: dict[str, Any] = {"verdict": "SKIP", "advisory": True}
         if suffix == ".py" and self.settings.test_oracle:
@@ -203,6 +210,8 @@ Output the COMPLETE corrected file in ONE fenced block."""
             critic=critic if isinstance(critic, dict) else {},
             visual={"verdict": verify_policy.NA}, tests=tests,
             reason="; ".join(decision.reasons),
+            authorized_unverified=(decision.verdict == verify_policy.UNVERIFIED
+                                   and decision.deliver),
             at=self._now())
         return decision.deliver, "; ".join(decision.reasons), record
 

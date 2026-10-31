@@ -296,13 +296,19 @@ P7.1 has started extracting native services over canonical `ProjectState`:
 - `integration.py`, `visual.py`, `signoff.py` — extracted, P5/P6 evidence preserved;
   unified artifacts go to `.crew/runs/<run_id>`, never `.factory`; shared
   integration fixes are recorded once in `integration.fix_records` with the
-  affected task ids and producer;
+  affected task ids, the producer, and a per-task revalidation (oracle + critic)
+  that invalidates any stale PASS;
 - `native_adapter.py` — composes the native services (no Factory imports);
-  differential smoke covers BUILD/INTEGRATE/SIGNOFF and visual re-review;
+  fail-closed: a pending publish recovery blocks execution, an unknown phase is
+  an error, and the VERIFY checkpoint requires `PASS` for build tasks
+  (an `UNVERIFIED` override only counts when persisted on the record);
+  differential cassettes cover BUILD/VERIFY/INTEGRATE/VISUAL/SIGN-OFF,
+  FAIL→FIX quality recovery, UNVERIFIED blocking and visual re-review;
 - scaffold/verification/workspace/publish were already native from P5/P6.
 
-NativeAdapter and the first differential cassette exist (P7.1d), but the full
-failure/resume matrix is not yet green; the runtime still uses
+NativeAdapter and the first differential cassettes exist (P7.1d), but the
+full failure/resume matrix (fallback, Playwright unavailable,
+interruption/resume, publish) is not yet green; the runtime still uses
 `FactoryAdapter` and removal is not authorized. P7 is not
 a closed gate; legacy migration/conversion remains readable and no silent
 conversion is performed. No prompt/routing/verification policy was changed in

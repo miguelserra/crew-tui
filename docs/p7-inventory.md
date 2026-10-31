@@ -39,7 +39,8 @@ Baseline: `p6.1-gate` (`86f2df1`).
 | `visual.py` | multimodal | P7.1c extraction |
 | `signoff.py` | final sign-off | P7.1c extraction |
 | `native_adapter.py` | native composition | P7.1d extraction; not default |
-| differential cassette | BUILD/INTEGRATE/SIGNOFF + visual retry | first slice green; matrix pending |
+| differential cassette | BUILD/VERIFY/INTEGRATE/VISUAL/SIGNOFF + quality recovery + UNVERIFIED + visual retry | first slices green; fallback/resume/publish pending |
+| integration fixer | one call + affected task ids + producer | revalidates changed artefacts (oracle+critic), invalidates stale PASS |
 
 ## Guardrails
 

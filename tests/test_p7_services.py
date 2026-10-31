@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import integration
 import signoff
 import visual
+import native_adapter
 import state as s
 
 
@@ -30,6 +31,27 @@ class FakePool:
             provider="fake", endpoint="local", model_id="fake-1",
             family="fake", billing="local")
         return self.reply
+
+
+class FakeVerifier:
+    def run_oracle(self, task_id, artifact, run_id=None, suffix=""):
+        return types.SimpleNamespace(passed=True, exit_code=0)
+
+    def run_critic(self, producer, task, code, run_id=None):
+        return {"verdict": "PASS", "critic": {"ok": True},
+                "producer_family": "fake", "critic_family": "critic",
+                "producer_known": True, "objections": []}
+
+    def run_test_oracle(self, *a, **k):
+        return {"verdict": "SKIP", "advisory": True}
+
+
+class FakeFailVerifier(FakeVerifier):
+    def run_critic(self, producer, task, code, run_id=None):
+        return {"verdict": "FAIL", "critic": {"ok": False},
+                "producer_family": "fake", "critic_family": "critic",
+                "producer_known": True,
+                "objections": [{"claim": "still broken", "evidence": "n/a"}]}
 
 
 class ArchitectureBoundaryTests(unittest.TestCase):
@@ -66,8 +88,11 @@ class IntegrationTests(unittest.TestCase):
             reply = ("### FILE: app.py\n```python\nprint('ok')\n```\n"
                      "### FILE: util.py\n```python\nx = 2\n```\n")
             pool = FakePool(reply)
-            settings = types.SimpleNamespace(max_verify_loops=1)
-            svc = integration.IntegrationService(settings, pool, lambda *a: None, "r")
+            settings = types.SimpleNamespace(max_verify_loops=1,
+                                             test_oracle=False,
+                                             allow_unverified=False)
+            svc = integration.IntegrationService(settings, pool, lambda *a: None,
+                                                 "r", verifier=FakeVerifier())
             svc._msg = lambda *a: object()
             orig_blocks = integration.native_util.multi_file_blocks
             integration.native_util.multi_file_blocks = lambda raw: [
@@ -89,12 +114,49 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(len(recs), 1)
             self.assertEqual(recs[0]["task_ids"], ["a", "b"])
             self.assertEqual(recs[0]["files"], ["app.py", "util.py"])
+            self.assertEqual([r["verdict"] for r in recs[0]["revalidations"]],
+                             ["PASS", "PASS"])
             for task in st.tasks:
                 self.assertEqual(task.status, "done")
                 self.assertEqual(task.delivered_by.model_id, "fake-1")
                 self.assertEqual(len(task.attempts), 1)
                 self.assertEqual(task.attempts[0].attempt_id, recs[0]["call_id"])
+                self.assertEqual(st.verifications[task.id].verdict, "PASS")
             self.assertFalse((root / ".factory").exists())
+
+    def test_fixer_revalidation_invalidates_stale_pass(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "app.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
+            st = s.ProjectState(run_id="r", goal="x", engine_kind=s.ENGINE_UNIFIED)
+            st.tasks = [s.Task("a", target_file="app.py")]
+            st.integration = {}
+            st.verifications["a"] = s.VerificationRecord(verdict="PASS")
+            reply = "### FILE: app.py\n```python\nprint('ok')\n```\n"
+            pool = FakePool(reply)
+            settings = types.SimpleNamespace(max_verify_loops=1,
+                                             test_oracle=False,
+                                             allow_unverified=False)
+            svc = integration.IntegrationService(settings, pool, lambda *a: None,
+                                                 "r", verifier=FakeFailVerifier())
+            svc._msg = lambda *a: object()
+            orig_blocks = integration.native_util.multi_file_blocks
+            integration.native_util.multi_file_blocks = lambda raw: [
+                ("app.py", "print('ok')")]
+            self.addCleanup(setattr, integration.native_util,
+                            "multi_file_blocks", orig_blocks)
+            calls = {"n": 0}
+
+            def run_entry(kind, path, root):
+                calls["n"] += 1
+                return {"verdict": "FAIL", "kind": kind, "output": "boom"}
+
+            svc._run_entry = run_entry
+            self.assertFalse(svc.integrate(st, root))
+            self.assertEqual(st.verifications["a"].verdict, "FAIL")
+            self.assertEqual(st.tasks[0].status, "failed")
+            recs = st.integration.get("fix_records", [])
+            self.assertEqual(recs[0]["revalidations"][0]["verdict"], "FAIL")
 
     def test_no_entrypoint_is_skip(self):
         with tempfile.TemporaryDirectory() as td:
@@ -157,6 +219,50 @@ class VisualTests(unittest.TestCase):
                 self.assertFalse(svc.step_visual(st, root))
             finally:
                 visual.playwright_audit = orig
+
+
+class NativeAdapterTests(unittest.TestCase):
+    def _adapter(self, st):
+        pool = types.SimpleNamespace(router=None, telemetry=None,
+                                     attempt_sink=None, dispatch_guard=None)
+        settings = types.SimpleNamespace(allow_unverified=False, test_oracle=False)
+        return native_adapter.NativeAdapter(settings, pool, lambda *a: None, st,
+                                            verifier=FakeVerifier(),
+                                            isolate_workspace=False)
+
+    def test_unknown_phase_raises(self):
+        st = s.ProjectState(run_id="r", goal="x", engine_kind=s.ENGINE_UNIFIED)
+        na = self._adapter(st)
+        with self.assertRaises(native_adapter.NativeAdapterError):
+            na.next_phase("BOGUS")
+        with self.assertRaises(native_adapter.NativeAdapterError):
+            na.step("BOGUS")
+
+    def test_recovery_error_blocks_step(self):
+        st = s.ProjectState(run_id="r", goal="x", engine_kind=s.ENGINE_UNIFIED)
+        na = self._adapter(st)
+        na.recovery_error = "journal corrupto"
+        with self.assertRaises(native_adapter.NativeAdapterError):
+            na.step("BUILD")
+
+    def test_verify_checkpoint_requires_pass(self):
+        st = s.ProjectState(run_id="r", goal="x", engine_kind=s.ENGINE_UNIFIED,
+                            profile="script")
+        st.tasks = [s.Task("a", kind="build", target_file="a.py"),
+                    s.Task("b", kind="build", target_file="b.py")]
+        na = self._adapter(st)
+        st.verifications = {
+            "a": s.VerificationRecord(verdict="PASS"),
+            "b": s.VerificationRecord(verdict="N/A"),
+        }
+        self.assertFalse(na._verify_checkpoint())
+        st.verifications["b"] = s.VerificationRecord(verdict="UNVERIFIED")
+        self.assertFalse(na._verify_checkpoint())
+        st.verifications["b"] = s.VerificationRecord(
+            verdict="UNVERIFIED", authorized_unverified=True)
+        self.assertTrue(na._verify_checkpoint())
+        st.verifications["b"] = s.VerificationRecord(verdict="PASS")
+        self.assertTrue(na._verify_checkpoint())
 
 
 class SignoffTests(unittest.TestCase):

@@ -17,12 +17,17 @@ from requirements import RequirementsService
 from scaffold import scaffold
 from signoff import SignoffService
 from state import ProjectState
+import verify as verify_policy
 from visual import VisualService
 from workspace import (IgnoreRules, default_workspace, prepare_workspace,
                        validate_workspace_integrity)
 
 PHASE_ORDER = ("SPEC", "ARCHITECTURE", "SCAFFOLD", "BUILD", "VERIFY",
                "INTEGRATE", "VISUAL", "SIGNOFF", "DONE")
+
+
+class NativeAdapterError(Exception):
+    """A structural error in the native runtime (recovery pending, bad phase)."""
 
 
 class NativeAdapter:
@@ -70,7 +75,8 @@ class NativeAdapter:
                                         project.run_id or "")
         self.integration = IntegrationService(settings, pool, emit,
                                               project.run_id or "",
-                                              artifact_dir=self.artifact_dir)
+                                              artifact_dir=self.artifact_dir,
+                                              verifier=self.verifier)
         self.visual = VisualService(settings, pool, emit, project.run_id or "",
                                     artifact_dir=self.artifact_dir)
         self.signoff = SignoffService(settings, pool, emit, project.run_id or "")
@@ -85,13 +91,15 @@ class NativeAdapter:
         return list(self.project.requirements.open_questions)
 
     def next_phase(self, phase: str) -> str:
-        try:
-            idx = PHASE_ORDER.index(phase)
-        except ValueError:
-            return "DONE"
+        if phase not in PHASE_ORDER:
+            raise NativeAdapterError(f"fase desconhecida: {phase!r}")
+        idx = PHASE_ORDER.index(phase)
         return PHASE_ORDER[idx + 1] if idx + 1 < len(PHASE_ORDER) else "DONE"
 
     def step(self, phase: str) -> bool:
+        self._ensure_ready()
+        if phase not in PHASE_ORDER:
+            raise NativeAdapterError(f"fase desconhecida: {phase!r}")
         if phase == "ARCHITECTURE":
             return bool(self.architecture.design(self.project, self.workspace_root))
         if phase == "SCAFFOLD":
@@ -111,23 +119,35 @@ class NativeAdapter:
         if phase == "SIGNOFF":
             return bool(self.signoff.signoff(self.project, self.workspace_root,
                                              final_root=self.project.project_root))
-        return True
+        return True  # SPEC / DONE are no-ops here
+
+    def _ensure_ready(self) -> None:
+        if self.recovery_error:
+            raise NativeAdapterError(
+                f"recuperação de publicação pendente: {self.recovery_error}")
 
     def _verify_checkpoint(self) -> bool:
         if self.project.profile == "review":
             return True
         build_tasks = [t for t in self.project.tasks if t.kind == "build"]
-        missing = [t.id for t in build_tasks
-                   if t.id not in self.project.verifications]
-        bad = [t.id for t in build_tasks
-               if self.project.verifications.get(t.id)
-               and self.project.verifications[t.id].verdict == "FAIL"]
-        unverified = [t.id for t in build_tasks
-                      if self.project.verifications.get(t.id)
-                      and self.project.verifications[t.id].verdict == "UNVERIFIED"]
-        if missing or bad or (unverified and not self.settings.allow_unverified):
-            self.emit("VERIFY", f"checkpoint bloqueado: missing={missing} "
-                                f"fail={bad} unverified={unverified}")
+        if not build_tasks:
+            self.emit("VERIFY", "checkpoint OK (sem tarefas build)")
+            return True
+        problems: list[str] = []
+        for t in build_tasks:
+            rec = self.project.verifications.get(t.id)
+            if rec is None:
+                problems.append(f"{t.id}=missing")
+                continue
+            verdict = verify_policy.normalize_verdict(rec.verdict)
+            if verdict == verify_policy.PASS:
+                continue
+            if (verdict == verify_policy.UNVERIFIED
+                    and getattr(rec, "authorized_unverified", False)):
+                continue
+            problems.append(f"{t.id}={verdict}")
+        if problems:
+            self.emit("VERIFY", "checkpoint bloqueado: " + ", ".join(problems))
             return False
         self.emit("VERIFY", f"checkpoint OK ({len(build_tasks)} tarefas)")
         return True

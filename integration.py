@@ -9,10 +9,16 @@ from pathlib import Path
 from typing import Any, Optional
 
 import native_util
+import verify as verify_policy
 from router import RouteRequest
-from state import ProjectState, Task, TaskAttempt, new_id
+from state import ProjectState, Task, TaskAttempt, VerificationRecord, new_id
 from registry import unknown_ref
 from visual import playwright_audit
+
+_LANG_SUFFIX = {
+    ".py": "python", ".js": "javascript", ".mjs": "javascript",
+    ".html": "html", ".css": "css", ".txt": "text", ".md": "text",
+}
 
 FIX_SYSTEM = (
     "You are a senior software engineer fixing runtime defects. Output each corrected "
@@ -26,11 +32,12 @@ CHIEF_FIX_SYSTEM = (
 
 class IntegrationService:
     def __init__(self, settings: Any, pool: Any, emit: Any, run_id: str = "",
-                 artifact_dir: str | Path | None = None):
+                 artifact_dir: str | Path | None = None, verifier: Any = None):
         self.settings = settings
         self.pool = pool
         self.emit = emit
         self.run_id = run_id
+        self.verifier = verifier
         self.artifact_dir = Path(artifact_dir).expanduser() if artifact_dir else None
 
     def _artifacts(self, root: Path) -> Path:
@@ -156,7 +163,7 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
         model = self.pool.last_attempt_model.get("__integration_fix__") or unknown_ref()
         call_id = new_id("intfix_")
         written = 0
-        touched: list[str] = []
+        touched: set[str] = set()
         touched_files: list[str] = []
         for rel, code in native_util.multi_file_blocks(raw):
             if not code.strip():
@@ -171,22 +178,83 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
             touched_files.append(rel)
             for task in project.tasks:
                 if task.target_file == rel:
-                    task.status = "done"
-                    touched.append(task.id)
+                    touched.add(task.id)
                     task.attempts.append(TaskAttempt(
                         attempt_id=call_id, model=model,
                         started_at=native_util.now(), completed_at=native_util.now(),
                         outcome="ok"))
-                    task.delivered_by = model
             written += 1
+        revalidations = []
+        for task in project.tasks:
+            if task.id in touched:
+                revalidations.append(self._revalidate(project, root, task, model))
         if written:
             project.integration.setdefault("fix_records", []).append({
                 "call_id": call_id, "model": model.to_dict(),
-                "task_ids": sorted(set(touched)), "files": sorted(set(touched_files)),
-                "outcome": "ok", "at": native_util.now(),
+                "task_ids": sorted(touched), "files": sorted(set(touched_files)),
+                "outcome": "ok", "revalidations": revalidations,
+                "at": native_util.now(),
             })
         self.emit("INTEG", f"{written} ficheiro(s) corrigido(s) por {role_tag}")
+        if revalidations and not all(r.get("delivered") for r in revalidations):
+            self.emit("INTEG", "revalidação do fixer falhou — integração bloqueada")
+            return False
         return written > 0
+
+    def _revalidate(self, project: ProjectState, root: Path, task: Task,
+                    model: Any) -> dict[str, Any]:
+        """Re-run oracle + cross-family critic on a file changed by the fixer.
+
+        The fix call is a single generation attempt; verification is recorded
+        separately and invalidates any prior evidence for the affected task.
+        """
+        if self.verifier is None:
+            task.status = "failed"
+            return {"task_id": task.id, "verdict": verify_policy.UNVERIFIED,
+                    "delivered": False, "note": "verificador indisponível"}
+        target = (root / task.target_file).resolve()
+        try:
+            target.relative_to(root.resolve())
+        except ValueError:
+            task.status = "failed"
+            return {"task_id": task.id, "verdict": verify_policy.FAIL,
+                    "delivered": False, "note": "alvo fora da raiz"}
+        if not target.is_file():
+            task.status = "failed"
+            return {"task_id": task.id, "verdict": verify_policy.FAIL,
+                    "delivered": False, "note": "ficheiro ausente"}
+        code = target.read_text(encoding="utf-8")
+        lang = _LANG_SUFFIX.get(target.suffix.lower(), "")
+        fence = "" if lang in ("html", "css", "text", "") else lang
+        artifact = f"```{fence or 'text'}\n{code}\n```"
+        oracle = self.verifier.run_oracle(task.id, artifact, self.run_id,
+                                          suffix=target.suffix)
+        critic = self.verifier.run_critic(model, task, code, self.run_id)
+        tests: dict[str, Any] = {"verdict": "SKIP", "advisory": True}
+        if target.suffix == ".py" and self.settings.test_oracle:
+            tests = self.verifier.run_test_oracle(task, artifact, self.run_id)
+            tests["advisory"] = True
+        decision = verify_policy.decide_build(
+            oracle.passed, critic, visual={"verdict": verify_policy.NA},
+            tests=tests, allow_unverified=self.settings.allow_unverified)
+        record = VerificationRecord(
+            verdict=decision.verdict, criterion_ids=list(task.requirement_ids),
+            oracle={"passed": oracle.passed, "exit_code": oracle.exit_code},
+            critic=critic if isinstance(critic, dict) else {},
+            visual={"verdict": verify_policy.NA}, tests=tests,
+            reason="; ".join(decision.reasons),
+            authorized_unverified=(decision.verdict == verify_policy.UNVERIFIED
+                                   and decision.deliver),
+            at=native_util.now())
+        project.verifications[task.id] = record
+        task.verification = record.to_dict()
+        if decision.deliver:
+            task.status = "done"
+            task.delivered_by = model
+        else:
+            task.status = "failed"
+        return {"task_id": task.id, "verdict": decision.verdict,
+                "delivered": decision.deliver}
 
     @staticmethod
     def _runtime_files(project: ProjectState, report: dict[str, Any]) -> list[Task]:
