@@ -65,6 +65,20 @@ PENDING = [
 ]
 
 ADAPTER_PIPELINE = [
+    ("Adapteres D02: dependência inexistente rejeitada sem chamadas",
+     "test_d02_missing_dependency_rejected_without_calls"),
+    ("Adapteres D02: ciclo rejeitado sem chamadas",
+     "test_d02_cycle_rejected_without_calls"),
+    ("Adapteres D02: auto-dependência e ids duplicados rejeitados",
+     "test_d02_self_dependency_and_duplicate_ids_rejected"),
+    ("Adapteres D02: tarefas prontas seguem a ordem declarada",
+     "test_d02_ready_tasks_follow_declared_order"),
+    ("Adapteres D02: resume parcial não repete concluídas",
+     "test_d02_partial_resume_skips_completed_and_orders_dependents"),
+    ("Adapteres D02: dependência falhada bloqueia dependentes",
+     "test_d02_failed_dependency_blocks_dependents"),
+    ("Adapteres D02: dependência skipped não satisfaz",
+     "test_d02_skipped_dependency_does_not_satisfy"),
     ("Adapteres D03: hard task, ordem de candidatos, cadeia esgotada",
      "test_d03_hard_task_candidate_order_and_exhaustion"),
     ("Adapteres D03: qualidade insuficiente -> escalação",
@@ -161,8 +175,8 @@ MATRIX = [
         "PUBLICATION": ("PARTIAL", "test_publication_parity is a separate sandbox, not end-to-end"),
     }),
     ("D02", "Task dependencies and ordering", {
-        "EXECUTION": ("COVERED", "test_task_dependencies_order_match"),
-        "MODELS_BILLING_LEDGER": ("PARTIAL", "fake pool; no routing/ledger parity"),
+        "EXECUTION": ("COVERED", "adapter-level declared-order scheduling; missing/self/duplicate/cyclic graphs rejected before BUILD with no provider call; partial resume skips completed tasks; failed or skipped dependencies never execute dependents"),
+        "MODELS_BILLING_LEDGER": ("COVERED", "both adapters use the real Router/RouteChain and produce the same task/model/call order; graph rejection happens before any ledger or provider call"),
         "VERIFICATION": ("PARTIAL", "BUILD compared; VERIFY not in this scenario"),
         "PUBLICATION": ("N/A", "no publication required"),
     }),

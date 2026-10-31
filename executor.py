@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 import verify as verify_policy
 from state import ProjectState, Task, VerificationRecord
-from state import normalize_target_file
+from state import normalize_target_file, validate_dependencies
 from registry import ModelRef
 
 DEV_SYSTEM = (
@@ -65,10 +65,12 @@ class ExecutorService:
         self.run_id = run_id
 
     def build(self, project: ProjectState, workspace_root: str | Path) -> bool:
+        validate_dependencies(project.tasks)
         root = Path(workspace_root).expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
         pending = [t for t in project.tasks
-                   if t.kind == "build" and t.status not in ("done", "verified")]
+                   if t.kind == "build" and t.status not in ("done", "verified",
+                                                             "skipped")]
         done_ids = {t.id for t in project.tasks
                     if t.status in ("done", "verified")}
         guard = 0
@@ -76,9 +78,16 @@ class ExecutorService:
             guard += 1
             ready = [t for t in pending
                      if all(d in done_ids for d in t.depends_on)]
-            batch = ready or pending  # match Factory: break deadlocks
-            for task in batch:
+            if not ready:
+                for task in pending:
+                    missing = [d for d in task.depends_on
+                               if d not in done_ids]
+                    task.errors.append("dependências não satisfeitas: "
+                                       + ", ".join(missing))
+                return False
+            for task in ready:
                 if not self._build_task(project, root, task):
+                    task.status = "failed"
                     return False
                 if task.status in ("done", "verified"):
                     done_ids.add(task.id)

@@ -175,6 +175,7 @@ class PipelinePool:
         self.local_up = False
         self.last_served = None
         self.last_response = None
+        self.task_order = []
         self.crash_after_confirm = False
         self.request_overrides = None
         self.registry = make_registry(registry_mode)
@@ -221,6 +222,7 @@ class PipelinePool:
         from calls import (clear_call_context, last_call_id,
                            last_served_ref)
         meta = meta or {}
+        self.task_order.append(str(meta.get("task") or ""))
         self.last_served = None
         clear_call_context()
         try:
@@ -253,7 +255,7 @@ class PipelinePool:
         return text
 
 
-def make_state(project, ws, complexity):
+def make_state(project, ws, complexity, tasks=None):
     st = s.ProjectState(run_id="r", project_root=str(project), goal="demo",
                         engine_kind=s.ENGINE_UNIFIED, phase="BUILD",
                         profile="script")
@@ -261,8 +263,9 @@ def make_state(project, ws, complexity):
     st.architecture = s.ArchitectureContract(
         approach="one file", modules=[{"path": "app.py"}],
         interfaces=[{"name": "main", "file": "app.py"}])
-    st.tasks = [s.Task("a", kind="build", target_file="app.py",
-                       complexity=complexity, acceptance=["runs"])]
+    st.tasks = tasks if tasks is not None else [
+        s.Task("a", kind="build", target_file="app.py",
+               complexity=complexity, acceptance=["runs"])]
     st.approve_architecture()
     st.extensions["workspace_root"] = str(ws)
     return st
@@ -305,12 +308,12 @@ def _crash_before_consume(eng):
 def run_pipeline(kind, script, complexity="medium", pre_ledger=None,
                  registry_mode="full", *, crash_after_confirm=False,
                  crash_before_consume=False, request_overrides=None,
-                 verifier_mode="pass"):
+                 verifier_mode="pass", tasks=None):
     base = Path(tempfile.mkdtemp(prefix="p7pipe-"))
     project = base / "project"; project.mkdir()
     ws = base / "ws"
     cfg = settings(base)
-    st = make_state(project, ws, complexity)
+    st = make_state(project, ws, complexity, tasks)
     if pre_ledger is not None:
         pre_ledger(project)
     pool = PipelinePool(script, registry_mode)
@@ -324,15 +327,19 @@ def run_pipeline(kind, script, complexity="medium", pre_ledger=None,
     if crash_before_consume:
         _crash_before_consume(eng)
     crashed = False
+    graph_error = ""
     try:
         result = eng.step()
     except SimulatedCrash:
         crashed = True
         result = "crashed"
+    except engine.EngineError as exc:
+        result = "invalid_graph"
+        graph_error = str(exc)
     return {"base": base, "state": st, "engine": eng, "pool": pool,
             "ledger": eng.call_ledger, "result": result, "kind": kind,
             "transport": pool.transport, "crashed": crashed,
-            "verifier": verifier}
+            "graph_error": graph_error, "verifier": verifier}
 
 
 def resume_run(run, script=None, registry_mode="payg_first", *,
@@ -390,6 +397,101 @@ class AdapterPipelineTests(unittest.TestCase):
                              ["gemini-3.1-pro-preview",
                               "nvidia/nemotron-3-ultra",
                               "deepseek-v4-pro"])
+
+    @staticmethod
+    def _graph_task(tid, deps=(), status="pending", target=None):
+        return s.Task(tid, kind="build", target_file=target or f"{tid}.py",
+                      depends_on=list(deps), status=status,
+                      complexity="medium", acceptance=["runs"])
+
+    def _assert_rejected_graph(self, tasks, kind):
+        run = run_pipeline(kind, {}, tasks=tasks)
+        self.assertEqual(run["result"], "invalid_graph", kind)
+        self.assertIn("grafo de tarefas inválido", run["graph_error"], kind)
+        self.assertEqual(run["transport"], [], kind)
+        self.assertEqual(run["pool"].calls, [], kind)
+        self.assertEqual(run["pool"].task_order, [], kind)
+
+    def test_d02_missing_dependency_rejected_without_calls(self):
+        for kind in ("factory", "native"):
+            self._assert_rejected_graph([
+                self._graph_task("a"),
+                self._graph_task("b", deps=["missing"]),
+            ], kind)
+
+    def test_d02_cycle_rejected_without_calls(self):
+        for kind in ("factory", "native"):
+            self._assert_rejected_graph([
+                self._graph_task("a", deps=["b"]),
+                self._graph_task("b", deps=["c"]),
+                self._graph_task("c", deps=["a"]),
+            ], kind)
+
+    def test_d02_self_dependency_and_duplicate_ids_rejected(self):
+        cases = {
+            "self": [self._graph_task("a", deps=["a"])],
+            "duplicate": [self._graph_task("a"),
+                          self._graph_task("a", target="other.py")],
+        }
+        for name, tasks in cases.items():
+            for kind in ("factory", "native"):
+                with self.subTest(case=name, kind=kind):
+                    self._assert_rejected_graph(tasks, kind)
+
+    def test_d02_ready_tasks_follow_declared_order(self):
+        tasks = [
+            self._graph_task("b"),
+            self._graph_task("c"),
+            self._graph_task("a", deps=["b"]),
+        ]
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, {}, tasks=tasks)
+            self.assertEqual(run["result"], "ok", kind)
+            self.assertEqual(run["pool"].task_order, ["b", "c", "a"], kind)
+            for task in run["state"].tasks:
+                self.assertIn(task.status, ("done", "verified"), kind)
+
+    def test_d02_partial_resume_skips_completed_and_orders_dependents(self):
+        tasks = [
+            self._graph_task("a", status="done"),
+            self._graph_task("b"),
+            self._graph_task("c", deps=["b"]),
+        ]
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, {}, tasks=tasks)
+            self.assertEqual(run["result"], "ok", kind)
+            self.assertEqual(run["pool"].task_order, ["b", "c"], kind)
+            state = {t.id: t for t in run["state"].tasks}
+            self.assertEqual(state["a"].status, "done", kind)
+            self.assertEqual(state["a"].attempts, [], kind)
+            self.assertIn(state["b"].status, ("done", "verified"), kind)
+            self.assertIn(state["c"].status, ("done", "verified"), kind)
+
+    def test_d02_failed_dependency_blocks_dependents(self):
+        tasks = [self._graph_task("a"), self._graph_task("b", deps=["a"])]
+        script = {"gemini-3.5-flash": "bad"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, tasks=tasks)
+            self.assertEqual(run["result"], "failed", kind)
+            self.assertEqual(run["pool"].task_order, ["a"], kind)
+            state = {t.id: t for t in run["state"].tasks}
+            self.assertEqual(state["a"].status, "failed", kind)
+            self.assertEqual(state["b"].status, "pending", kind)
+            self.assertEqual(state["b"].attempts, [], kind)
+
+    def test_d02_skipped_dependency_does_not_satisfy(self):
+        tasks = [
+            self._graph_task("a", status="skipped"),
+            self._graph_task("b", deps=["a"]),
+        ]
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, {}, tasks=tasks)
+            self.assertEqual(run["result"], "failed", kind)
+            self.assertEqual(run["pool"].task_order, [], kind)
+            state = {t.id: t for t in run["state"].tasks}
+            self.assertEqual(state["b"].status, "pending", kind)
+            self.assertTrue(any("dependências não satisfeitas" in err
+                                for err in state["b"].errors), kind)
 
     def test_d03_quality_failure_escalates(self):
         script = {"gemini-3.1-pro-preview": "ok",

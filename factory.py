@@ -40,7 +40,8 @@ from main import (LANG_SUFFIX, LLMPool, Settings, Verifier,
                   extract_code_blocks_typed, extract_json_block, guess_lang)
 import verify as verify_policy
 from registry import ModelRef
-from state import StateCorruptError, VerificationRecord
+from state import (StateCorruptError, validate_dependencies,
+                   VerificationRecord)
 from power import make_power
 
 ROLES = ("ANALYST", "SCAFFOLD", "ARCHITECT", "DEV", "TEST", "INTEG", "VISUAL", "SIGN")
@@ -548,15 +549,24 @@ Rules:
     # -- steps 4-5: build + fix -------------------------------------------- #
 
     def step_build(self) -> bool:
-        pending = [t for t in self.state.tasks if t.status not in ("done", "skipped")]
-        done_ids: set[str] = {t.id for t in self.state.tasks if t.status == "done"}
+        validate_dependencies(self.state.tasks)
+        pending = [t for t in self.state.tasks
+                   if t.status not in ("done", "verified", "skipped")]
+        done_ids: set[str] = {t.id for t in self.state.tasks
+                              if t.status in ("done", "verified")}
         guard = 0
         while pending and guard < 3 * len(self.state.tasks) + 10:
             guard += 1
             ready = [t for t in pending if all(d in done_ids for d in t.depends_on)]
-            batch = ready or pending  # break dependency deadlocks
-            for task in batch:
-                if task.status == "done":
+            if not ready:
+                for task in pending:
+                    missing = [d for d in task.depends_on
+                               if d not in done_ids]
+                    task.errors.append("dependências não satisfeitas: "
+                                       + ", ".join(missing))
+                return False
+            for task in ready:
+                if task.status in ("done", "verified"):
                     continue
                 self.power.before_step(f"build {task.id}")
                 self.emit("DEV", f"{task.id} → {task.target_file} ({task.role}, {task.complexity})")
@@ -567,8 +577,9 @@ Rules:
                 self.save()
                 if not ok:
                     return False
-            pending = [t for t in pending if t.status not in ("done", "skipped")]
-        return all(t.status == "done" for t in self.state.tasks)
+            pending = [t for t in pending
+                       if t.status not in ("done", "verified")]
+        return all(t.status in ("done", "verified") for t in self.state.tasks)
 
     def _build_one(self, task: TaskState) -> bool:
         target = self._safe(task.target_file)

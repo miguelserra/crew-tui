@@ -398,6 +398,12 @@ class WorkflowEngine:
                 self._pause("architecture_approval", self.state.architecture_hash())
                 return "paused"
 
+        if phase == "BUILD":
+            try:
+                validate_dependencies(self.state.tasks)
+            except StateValidationError as exc:
+                raise EngineError(f"grafo de tarefas inválido: {exc}") from exc
+
         ok = self.adapter.step(phase)
         self.adapter.sync_to_project()
         if not ok:
