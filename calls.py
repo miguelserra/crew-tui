@@ -398,6 +398,24 @@ class CallLedger:
                         return rec
         return None
 
+    def failed_refs(self, run_id: str, task: str = "",
+                    tag: str = "") -> set[tuple[str, str]]:
+        """PAYG identities already confirmed-failed for this task/tag.
+
+        A failed PAYG call (automatic or manually resolved) must not be
+        silently repeated when the workflow resumes; routing skips it and
+        moves to the next candidate instead.
+        """
+        with self._lock:
+            return {
+                (rec.credential_profile, rec.model_id)
+                for rec in self._records.values()
+                if rec.state == FAILED
+                and rec.run_id == str(run_id or "")
+                and rec.task == str(task or "")
+                and rec.tag == str(tag or "")
+            }
+
     def recovery_required(self, run_id: Optional[str] = None) -> list[CallRecord]:
         with self._lock:
             out = []

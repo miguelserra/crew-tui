@@ -85,11 +85,16 @@ evidence of routing, provider classification, or PAYG ledger parity.
   connection, server, bad request and PAYG ambiguity (connection/server/empty)
   with one invocation, no retry/fallback, UNKNOWN and manual resolution
   persistence. Verification/publication dimensions remain out of scope.
-- [~] D05 – partially resolved: adapter-level timeout -> UNKNOWN/resume and
-  PENDING/SUBMITTED blocking covered; FAILED fallback, manual resolution and
-  other ledger variants are still outstanding. This also exposed and fixed a
-  real defect: `FactoryAdapter` did not propagate `run_id` to `Factory`,
-  bypassing the ledger on the Factory path.
+- [x] D05 – covered at adapter level: timeout -> UNKNOWN/resume,
+  PENDING/SUBMITTED blocking, confirmed FAILED -> single documented fallback,
+  manual FAILED persistence, resume advancing to the next candidate without
+  repeating the original PAYG call, and guards rejecting incompatible
+  resolutions (including after reload). Provenance stays `resolved_by=manual`.
+  D05 also exposed and fixed a real defect: `FactoryAdapter` did not propagate
+  `run_id` to `Factory`, bypassing the ledger on the Factory path. A second
+  production change makes `RouteChain` skip PAYG identities already recorded
+  as FAILED for the same run/task/tag (`CallLedger.failed_refs`), so a resumed
+  task cannot silently repeat a failed paid call.
 - [~] D06 – partially resolved at shared-routechain level; adapter-level
   replay/resume is still outstanding.
 

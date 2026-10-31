@@ -627,8 +627,12 @@ class RouteChain:
         last_error: Optional[BaseException] = None
         denied_paid = False
         ledger = getattr(self.router, "call_ledger", None)
+        avoid: set[tuple[str, str]] = set()
         fingerprint = invocation_fingerprint(messages, self.request)
         if ledger is not None and self.request.run_id:
+            avoid = ledger.failed_refs(
+                self.request.run_id, self.request.task_id,
+                self.request.tag or self.request.role)
             replay = ledger.find_replay(
                 self.request.run_id, self.request.task_id,
                 self.request.tag or self.request.role, fingerprint)
@@ -641,6 +645,8 @@ class RouteChain:
                     return ReplayedResponse(text, served)
         for candidate in self.result.candidates:
             identity = candidate.identity
+            if (identity.credential_profile, identity.model_id) in avoid:
+                continue
             if self.router is not None and not self.router.breaker.allow(identity):
                 continue
             try:

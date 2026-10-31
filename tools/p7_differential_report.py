@@ -81,6 +81,12 @@ ADAPTER_PIPELINE = [
      "test_d05_pending_and_submitted_block_without_calls"),
     ("Adapteres D05: timeout -> UNKNOWN, resume bloqueia sem retry",
      "test_d05_payg_timeout_unknown_and_resume_blocks"),
+    ("Adapteres D05: FAILED confirmado -> fallback uma vez",
+     "test_d05_confirmed_failure_falls_back_once"),
+    ("Adapteres D05: manual FAILED persiste e resume avança sem repetir",
+     "test_d05_manual_failed_resume_advances_without_repeat"),
+    ("Adapteres D05: resoluções incompatíveis rejeitadas após reload",
+     "test_d05_resolution_guards_reject_incompatible"),
 ]
 
 PIPELINE = [
@@ -147,8 +153,8 @@ MATRIX = [
         "PUBLICATION": ("N/A", "no publication required"),
     }),
     ("D05", "PAYG safety and UNKNOWN", {
-        "EXECUTION": ("PARTIAL", "adapter-level timeout->UNKNOWN/resume + PENDING/SUBMITTED; other PAYG variants missing"),
-        "MODELS_BILLING_LEDGER": ("PARTIAL", "real ledger/UNKNOWN tested in test_p7_pipeline; no adapter ledger parity"),
+        "EXECUTION": ("COVERED", "adapter-level timeout/UNKNOWN/resume, PENDING/SUBMITTED, FAILED fallback once, manual FAILED resume advancing without repeating the original call"),
+        "MODELS_BILLING_LEDGER": ("COVERED", "real ledger state machine through both adapters; UNKNOWN/FAILED/CONFIRMED, resolved_by=manual provenance and incompatible-resolution guards"),
         "VERIFICATION": ("N/A", "no verification involved"),
         "PUBLICATION": ("N/A", "no publication required"),
     }),

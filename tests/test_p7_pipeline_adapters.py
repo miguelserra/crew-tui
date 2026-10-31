@@ -3,7 +3,9 @@
 WorkflowEngine + FactoryAdapter/NativeAdapter, fake provider transport only.
 
 D04: technical fallback and PAYG ambiguity through the real classifier.
-D05: PAYG timeout -> UNKNOWN, single invocation, resume blocks without retry.
+D05: PAYG timeout -> UNKNOWN, single invocation, resume blocks without retry;
+confirmed FAILED falls back once; manual FAILED resolution is durable and the
+resume advances to the next candidate without repeating the original call.
 """
 
 import sys
@@ -357,6 +359,80 @@ class AdapterPipelineTests(unittest.TestCase):
             reloaded = CallLedger(path).get(rec.call_id)
             self.assertEqual(reloaded.state, "FAILED")
             self.assertEqual(reloaded.resolved_by, "manual")
+
+    def test_d05_confirmed_failure_falls_back_once(self):
+        script = {"gemini-3.1-pro-preview": "429",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high",
+                               registry_mode="payg_first")
+            self.assertEqual(run["result"], "ok")
+            self.assertEqual(run["transport"], [
+                ("gemini-3.1-pro-preview", "429"),
+                ("nvidia/nemotron-3-ultra", "ok")])
+            self.assertEqual(run["pool"].calls, ["429", "ok"])
+            recs = run["ledger"].all()
+            self.assertEqual(len(recs), 1)
+            self.assertEqual(recs[0].state, "FAILED")
+            self.assertEqual(recs[0].error_kind, "rate_limit")
+            self.assertEqual(recs[0].resolved_by, "")
+            self.assertEqual(run["ledger"].unresolved("r"), [])
+            self.assertEqual(run["state"].tasks[0].delivered_by.model_id,
+                             "nvidia/nemotron-3-ultra")
+
+    def test_d05_manual_failed_resume_advances_without_repeat(self):
+        script = {"gemini-3.1-pro-preview": "connection",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high",
+                               registry_mode="payg_first")
+            rec = run["ledger"].unresolved("r")[0]
+            self.assertEqual(rec.state, UNKNOWN)
+            resolved = run["ledger"].resolve(rec.call_id, "failed")
+            self.assertEqual(resolved.state, "FAILED")
+            self.assertEqual(resolved.resolved_by, "manual")
+            path = Path(run["base"]) / "project" / ".crew" / "calls.json"
+            reloaded = CallLedger(path).get(rec.call_id)
+            self.assertEqual(reloaded.state, "FAILED")
+            self.assertEqual(reloaded.resolved_by, "manual")
+
+            run["state"].pause = s.PauseState()
+            result = run["engine"].step()
+            self.assertIn(result, ("ok", "done"), kind)
+            self.assertEqual(run["transport"], [
+                ("gemini-3.1-pro-preview", "connection"),
+                ("nvidia/nemotron-3-ultra", "ok")], kind)
+            self.assertIn(run["state"].tasks[0].status, ("done", "verified"))
+            self.assertEqual(run["state"].tasks[0].delivered_by.model_id,
+                             "nvidia/nemotron-3-ultra")
+            self.assertEqual(len(run["ledger"].all()), 1)
+
+    def test_d05_resolution_guards_reject_incompatible(self):
+        script = {"gemini-3.1-pro-preview": "connection",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high",
+                               registry_mode="payg_first")
+            path = Path(run["base"]) / "project" / ".crew" / "calls.json"
+            rec = run["ledger"].unresolved("r")[0]
+            self.assertEqual(rec.state, UNKNOWN)
+            with self.assertRaises(CallLedgerError):
+                run["ledger"].resolve(rec.call_id, "confirmed")
+
+            # Both incompatible resolutions are still rejected after a
+            # restart. The artifact is restored after reload, so the load-time
+            # reconcile does not promote the record before the guard runs.
+            restarted = CallLedger(path)
+            with self.assertRaises(CallLedgerError):
+                restarted.resolve(rec.call_id, "confirmed")
+            restarted._write_result(rec, "recovered text", True)
+            with self.assertRaises(CallLedgerError):
+                restarted.resolve(rec.call_id, "failed")
+            confirmed = restarted.resolve(rec.call_id, "confirmed")
+            self.assertEqual(confirmed.state, "CONFIRMED")
+            self.assertEqual(confirmed.resolved_by, "manual")
+            self.assertEqual(CallLedger(path).get(rec.call_id).state,
+                             "CONFIRMED")
 
     def test_d05_pending_and_submitted_block_without_calls(self):
         for pending_state in ("PENDING", "SUBMITTED"):
