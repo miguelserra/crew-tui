@@ -39,6 +39,13 @@ else:
     DEPS_OK = True
     DEPS_ERR = ""
 
+try:
+    import playwright  # noqa: F401
+except Exception:
+    PLAYWRIGHT_OK = False
+else:
+    PLAYWRIGHT_OK = True
+
 
 class SimulatedCrash(BaseException):
     """Abrupt termination used to test resume/replay boundaries."""
@@ -114,18 +121,23 @@ class FakeVerifier:
         return {"verdict": "SKIP", "advisory": True}
 
 
-def identity(profile, model_id, billing):
+def identity(profile, model_id, billing, vision=False):
+    caps = {"text", "vision"} if vision else {"text"}
     return ModelIdentity(provider=profile, endpoint=profile,
                          model_id=model_id, family=profile.split("-")[0],
                          credential_profile=profile, billing=billing,
-                         capabilities=frozenset({"text"}), defined=True)
+                         capabilities=frozenset(caps), defined=True)
 
 
 def make_registry(mode="full"):
+    vision = mode != "text"
     models = [
-        identity("gemini-plus", "gemini-3.1-pro-preview", BILLING_FREE),
-        identity("gemini-plus", "gemini-3.5-flash", BILLING_FREE),
-        identity("gemini-plus", "gemini-3.8-flash", BILLING_FREE),
+        identity("gemini-plus", "gemini-3.1-pro-preview", BILLING_FREE,
+                 vision=vision),
+        identity("gemini-plus", "gemini-3.5-flash", BILLING_FREE,
+                 vision=vision),
+        identity("gemini-plus", "gemini-3.8-flash", BILLING_FREE,
+                 vision=vision),
         identity("openrouter", "nvidia/nemotron-3-ultra", BILLING_FREE),
         identity("deepseek-api", "deepseek-v4-pro", BILLING_PAYG),
     ]
@@ -1525,7 +1537,7 @@ class D10ResumePipelineTests(unittest.TestCase):
                 "state": st, "store": store}
 
     def _engine(self, kind, run, *, responder=None, verifier=None,
-                visual_check=False):
+                visual_check=False, registry_mode="full"):
         cfg = settings(run["base"])
         cfg.max_verify_loops = 1
         cfg.visual_check = visual_check
@@ -1534,7 +1546,7 @@ class D10ResumePipelineTests(unittest.TestCase):
         if responder is None:
             def responder(ref, messages):
                 raise AssertionError("unexpected model call")
-        pool = PipelinePool({}, responder=responder)
+        pool = PipelinePool({}, registry_mode=registry_mode, responder=responder)
         verifier = verifier or FakeVerifier()
         adapter = _make_adapter(kind, cfg, pool, st, verifier)
         eng = engine.WorkflowEngine(st, run["store"], adapter,
@@ -2788,6 +2800,256 @@ class D12CrashPublicationTests(unittest.TestCase):
                 "durability": journals[0].get("durability"),
             }
         self.assertEqual(outcomes["factory"], outcomes["native"])
+
+
+@unittest.skipUnless(DEPS_OK and PLAYWRIGHT_OK,
+                     "runtime deps or Playwright unavailable")
+class D08VisualBrowserTests(unittest.TestCase):
+    """D08: real browser/visual adapter equivalence through WorkflowEngine."""
+
+    HTML = """<!doctype html><html><head><meta charset="utf-8">
+<style>body{font-family:sans-serif;background:#fff;color:#111}
+#card{border:2px solid #333;padding:20px;margin:20px}</style></head>
+<body><div id="card"><h1 id="title">Visual Fixture</h1>
+<p id="status">ready</p></div></body></html>"""
+
+    def _case(self):
+        return D10ResumePipelineTests("runTest")
+
+    def _run(self, kind, html=None, responder=None, registry_mode="full"):
+        case = self._case()
+        html = html or self.HTML
+        run = case._base(
+            "VISUAL", profile="web",
+            tasks=[s.Task("w", kind="build", target_file="index.html",
+                          acceptance=["renders"], requirement_ids=["ac1"])],
+            files={"index.html": html})
+        st = run["state"]
+        st.tasks[0].status = "done"
+        st.verifications["w"] = s.VerificationRecord(
+            verdict="PASS",
+            oracle={"passed": True, "artifact_sha256": s.artifact_hash(html)})
+        run["store"].save_project(st)
+        eng = case._engine(kind, run, responder=responder,
+                           visual_check=True, registry_mode=registry_mode)
+        return run, eng
+
+    @staticmethod
+    def _png_size(path):
+        import struct
+        data = Path(path).read_bytes()
+        return struct.unpack(">II", data[16:24])
+
+    def _vision(self, sequence=None):
+        calls = []
+
+        def responder(ref, messages):
+            blob = "\n".join(str(getattr(m, "content", m)) for m in messages)
+            if "Check this screenshot" in blob:
+                calls.append({"model": ref.model_id, "billing": ref.billing})
+                if sequence:
+                    return sequence.pop(0)
+                return json.dumps({"verdict": "PASS", "objections": []})
+            if "UI OBJECTIONS" in blob:
+                return "```html\n" + self.HTML.replace("ready", "fixed") + "\n```"
+            raise AssertionError("unexpected non-visual model call")
+
+        return responder, calls
+
+    def _success(self, kind):
+        responder, calls = self._vision()
+        run, eng = self._run(kind, responder=responder)
+        self.assertEqual(eng["engine"].step(), "ok", kind)
+        st = eng["state"]
+        self.assertEqual(st.visual.get("verdict"), "PASS", kind)
+        self.assertEqual(st.visual.get("vision", {}).get("verdict"), "PASS", kind)
+        png = st.visual.get("screenshot")
+        self.assertTrue(png and Path(png).is_file(), kind)
+        self.assertGreater(Path(png).stat().st_size, 1000, kind)
+        self.assertEqual(len(calls), 1, kind)
+        self.assertIn("vision", eng["pool"].registry.identity_for(
+            "gemini-plus", calls[0]["model"]).capabilities)
+        self.assertEqual(st.visual.get("artifact_hashes", {}).get("index.html"),
+                         s.artifact_hash(self.HTML), kind)
+        return run, eng, calls
+
+    def _approve_visual(self, run, eng):
+        st = eng["state"]
+        st.integration = {"verdict": "PASS", "kind": "web", "exit": 0}
+        st.signoff = {"goal": "demo"}
+        st.approve_signoff("reviewer", "visual approved")
+        run["store"].save_project(st)
+        return st
+
+    def test_d08_01_real_browser_visual_pass(self):
+        outcomes = {}
+        for kind in ("factory", "native"):
+            run, eng, calls = self._success(kind)
+            st = eng["state"]
+            self.assertEqual(st.visual["vision"]["vision"]["model_id"],
+                             "gemini-3.5-flash", kind)
+            self.assertEqual(st.visual["vision"]["vision"]["billing"],
+                             "free_quota", kind)
+            self._approve_visual(run, eng)
+            self.assertTrue(st.signoff_approved(), kind)
+            self.assertEqual(len(calls), 1, kind)
+            outcomes[kind] = (run, eng)
+        pngs = []
+        for kind, (run, eng) in outcomes.items():
+            png = eng["state"].visual["screenshot"]
+            pngs.append((self._png_size(png), Path(png).stat().st_size,
+                         Path(png).read_bytes()))
+        self.assertEqual(pngs[0][0], pngs[1][0])
+        self.assertEqual(pngs[0][1], pngs[1][1])
+        self.assertEqual(pngs[0][2], pngs[1][2])
+
+    def test_d08_02_visual_evidence_reload_without_vision_call(self):
+        for kind in ("factory", "native"):
+            run, eng, calls = self._success(kind)
+            self._approve_visual(run, eng)
+            fresh = self._case()._engine(kind, run, responder=lambda *a: (
+                (_ for _ in ()).throw(AssertionError("unexpected model call"))),
+                visual_check=True)
+            self.assertEqual(fresh["engine"].step(), "ok", kind)
+            self.assertEqual(fresh["state"].phase, "DONE", kind)
+            self.assertEqual(fresh["pool"].calls, [], kind)
+            self.assertEqual(fresh["state"].visual.get("verdict"), "PASS", kind)
+            self.assertTrue(Path(fresh["state"].visual["screenshot"]).is_file(), kind)
+
+    def test_d08_03_playwright_unavailable_blocks(self):
+        import visual as visual_mod
+        original = visual_mod.playwright_audit
+        try:
+            for kind in ("factory", "native"):
+                responder, calls = self._vision()
+                run, eng = self._run(kind, responder=responder)
+                bad = {"verdict": "UNAVAILABLE", "note": "playwright unavailable",
+                       "screenshot": ""}
+                if kind == "factory":
+                    eng["adapter"].factory.playwright_audit = lambda root: bad
+                else:
+                    visual_mod.playwright_audit = lambda root, logs, **k: bad
+                self.assertEqual(eng["engine"].step(), "failed", kind)
+                self.assertEqual(eng["state"].pause.reason, "visual_failed", kind)
+                self.assertEqual(eng["state"].visual.get("verdict"),
+                                 "UNAVAILABLE", kind)
+                self.assertEqual(calls, [], kind)
+        finally:
+            visual_mod.playwright_audit = original
+
+    def test_d08_04_browser_launch_failure_blocks(self):
+        for kind in ("factory", "native"):
+            responder, calls = self._vision()
+            run, eng = self._run(kind, responder=responder)
+            bad = {"verdict": "FAIL", "note": "playwright falhou: Error",
+                   "screenshot": ""}
+            if kind == "factory":
+                eng["adapter"].factory.playwright_audit = lambda root: bad
+            else:
+                import visual as visual_mod
+                visual_mod.playwright_audit = lambda root, logs, **k: bad
+            try:
+                self.assertEqual(eng["engine"].step(), "failed", kind)
+            finally:
+                if kind == "native":
+                    import visual as visual_mod
+                    import importlib
+                    importlib.reload(visual_mod)
+            self.assertEqual(eng["state"].visual.get("verdict"), "FAIL", kind)
+            self.assertNotEqual(eng["state"].phase, "SIGNOFF", kind)
+            self.assertEqual(calls, [], kind)
+
+    def test_d08_05_application_error_is_audit_failure(self):
+        html = self.HTML.replace("</body>", "<script>throw new Error('boom')</script></body>")
+        for kind in ("factory", "native"):
+            responder, calls = self._vision()
+            run, eng = self._run(kind, html=html, responder=responder)
+            self.assertEqual(eng["engine"].step(), "failed", kind)
+            visual = eng["state"].visual
+            self.assertEqual(visual.get("verdict"), "FAIL", kind)
+            self.assertTrue(visual.get("page_errors"), kind)
+            self.assertNotEqual(visual.get("verdict"), "PASS", kind)
+            self.assertNotEqual(eng["state"].phase, "SIGNOFF", kind)
+
+    def test_d08_06_navigation_failure_blocks(self):
+        for kind in ("factory", "native"):
+            responder, calls = self._vision()
+            run, eng = self._run(kind, responder=responder)
+            bad = {"verdict": "FAIL", "note": "page.goto timeout",
+                   "screenshot": ""}
+            if kind == "factory":
+                eng["adapter"].factory.playwright_audit = lambda root: bad
+            else:
+                import visual as visual_mod
+                visual_mod.playwright_audit = lambda root, logs, **k: bad
+            try:
+                self.assertEqual(eng["engine"].step(), "failed", kind)
+            finally:
+                if kind == "native":
+                    import importlib, visual as visual_mod
+                    importlib.reload(visual_mod)
+            self.assertEqual(eng["state"].visual.get("verdict"), "FAIL", kind)
+            self.assertNotEqual(eng["state"].phase, "SIGNOFF", kind)
+            self.assertEqual(calls, [], kind)
+
+    def test_d08_07_no_vision_model_is_unverified(self):
+        responder, calls = self._vision()
+        for kind in ("factory", "native"):
+            run, eng = self._run(kind, responder=responder,
+                                 registry_mode="text")
+            self.assertEqual(eng["engine"].step(), "failed", kind)
+            self.assertEqual(eng["state"].visual.get("verdict"), "PASS", kind)
+            self.assertEqual(eng["state"].visual.get("vision", {}).get(
+                "verdict"), "UNVERIFIED", kind)
+            self.assertEqual(calls, [], kind)
+
+    def test_d08_08_vision_timeout_is_unverified(self):
+        def responder(ref, messages):
+            blob = "\n".join(str(getattr(m, "content", m)) for m in messages)
+            if "Check this screenshot" in blob:
+                raise TimeoutError("vision timed out")
+            raise AssertionError("unexpected non-visual model call")
+
+        for kind in ("factory", "native"):
+            run, eng = self._run(kind, responder=responder)
+            self.assertEqual(eng["engine"].step(), "failed", kind)
+            self.assertEqual(eng["state"].visual.get("vision", {}).get(
+                "verdict"), "UNVERIFIED", kind)
+            self.assertNotEqual(eng["state"].phase, "SIGNOFF", kind)
+
+    def test_d08_09_visual_fail_fix_and_review_pass(self):
+        for kind in ("factory", "native"):
+            responder, calls = self._vision([
+                json.dumps({"verdict": "FAIL",
+                            "objections": [{"claim": "wrong status",
+                                            "evidence": "screenshot",
+                                            "fix": "change status"}]}),
+                json.dumps({"verdict": "PASS", "objections": []}),
+            ])
+            run, eng = self._run(kind, responder=responder)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            visual = eng["state"].visual
+            self.assertEqual(visual.get("verdict"), "PASS", kind)
+            self.assertEqual(visual.get("vision_retry", {}).get("verdict"),
+                             "FAIL", kind)
+            self.assertEqual(visual.get("vision", {}).get("verdict"),
+                             "PASS", kind)
+            self.assertEqual(len(calls), 2, kind)
+            self.assertEqual(visual.get("artifact_hashes", {}).get("index.html"),
+                             s.artifact_hash((run["ws"] / "index.html").read_text(
+                                 encoding="utf-8")), kind)
+
+    def test_d08_10_stale_visual_evidence_blocks_signoff(self):
+        for kind in ("factory", "native"):
+            run, eng, _calls = self._success(kind)
+            self._approve_visual(run, eng)
+            (run["ws"] / "index.html").write_text(
+                self.HTML.replace("Visual Fixture", "Changed"), encoding="utf-8")
+            self.assertFalse(eng["state"].signoff_approved(), kind)
+            self.assertTrue(any("visual desatualizado" in b
+                                for b in eng["state"].signoff_blockers()), kind)
+            with self.assertRaises(s.StateValidationError):
+                eng["state"].approve_signoff("reviewer", "stale")
 
 
 if __name__ == "__main__":

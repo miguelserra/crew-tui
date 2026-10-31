@@ -247,6 +247,26 @@ ADAPTER_PIPELINE = [
      "test_d12_09_rollback_impossible_requires_recovery"),
     ("Adapteres D12: publicação normal COMMITTED",
      "test_d12_10_normal_publication_is_committed"),
+    ("Adapteres D08: browser real e visual PASS",
+     "test_d08_01_real_browser_visual_pass"),
+    ("Adapteres D08: evidência visual recarrega sem nova chamada",
+     "test_d08_02_visual_evidence_reload_without_vision_call"),
+    ("Adapteres D08: Playwright indisponível bloqueia",
+     "test_d08_03_playwright_unavailable_blocks"),
+    ("Adapteres D08: falha de launch do browser bloqueia",
+     "test_d08_04_browser_launch_failure_blocks"),
+    ("Adapteres D08: erro de aplicação é falha de auditoria",
+     "test_d08_05_application_error_is_audit_failure"),
+    ("Adapteres D08: falha de navegação bloqueia",
+     "test_d08_06_navigation_failure_blocks"),
+    ("Adapteres D08: sem modelo de visão fica UNVERIFIED",
+     "test_d08_07_no_vision_model_is_unverified"),
+    ("Adapteres D08: timeout de visão fica UNVERIFIED",
+     "test_d08_08_vision_timeout_is_unverified"),
+    ("Adapteres D08: visual FAIL -> fix -> PASS",
+     "test_d08_09_visual_fail_fix_and_review_pass"),
+    ("Adapteres D08: evidência visual stale bloqueia sign-off",
+     "test_d08_10_stale_visual_evidence_blocks_signoff"),
     ("Adapteres D04: 429 -> fallback seguro",
      "test_d04_429_fallback_matches_across_adapters"),
     ("Adapteres D04: auth/connection/server -> fallback",
@@ -365,9 +385,9 @@ MATRIX = [
         "PUBLICATION": ("N/A", "no publication required"),
     }),
     ("D08", "Visual and Playwright", {
-        "EXECUTION": ("PARTIAL", "visual retry differential; other variants single-path"),
-        "MODELS_BILLING_LEDGER": ("PARTIAL", "fake pool; no capability/routing parity"),
-        "VERIFICATION": ("PARTIAL", "unavailable compared; real browser pass/fail not"),
+        "EXECUTION": ("COVERED", "real Playwright browser success, unavailable, launch, application, navigation, fix/retry and reload through both adapters"),
+        "MODELS_BILLING_LEDGER": ("COVERED", "vision-capable selection, ModelRef/billing identity, one vision call on success, no-vision UNVERIFIED and timeout handling"),
+        "VERIFICATION": ("COVERED", "real screenshots, artifact hashes, persisted evidence reload, visual PASS/FAIL/UNVERIFIED and stale-evidence sign-off blocking"),
         "PUBLICATION": ("N/A", "no publication required"),
     }),
     ("D09", "Integration and sign-off", {
@@ -485,6 +505,8 @@ def run_adapter_pipeline() -> list[tuple[str, str, str, str]]:
             class_name = "D11PublicationPipelineTests"
         elif method.startswith("test_d12_"):
             class_name = "D12CrashPublicationTests"
+        elif method.startswith("test_d08_"):
+            class_name = "D08VisualBrowserTests"
         else:
             class_name = "AdapterPipelineTests"
         status = _run_one("tests.test_p7_pipeline_adapters",
