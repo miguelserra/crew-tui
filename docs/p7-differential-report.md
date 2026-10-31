@@ -31,7 +31,7 @@ A cell is `COVERED` only when both adapters execute the scenario and the dimensi
 |---|---|---|---|---|---|
 | D01 | Normal end-to-end | PARTIAL | PARTIAL | COVERED | PARTIAL |
 | D02 | Task dependencies and ordering | COVERED | PARTIAL | PARTIAL | N/A |
-| D03 | Hard task, escalation, routing | PARTIAL | MISSING | PARTIAL | N/A |
+| D03 | Hard task, escalation, routing | PARTIAL | PARTIAL | PARTIAL | N/A |
 | D04 | Technical fallback | COVERED | PARTIAL | PARTIAL | N/A |
 | D05 | PAYG safety and UNKNOWN | PARTIAL | PARTIAL | N/A | N/A |
 | D06 | CONFIRMED replay and recovery | PARTIAL | PARTIAL | N/A | N/A |
@@ -42,7 +42,7 @@ A cell is `COVERED` only when both adapters execute the scenario and the dimensi
 | D11 | Publication conflict and recovery | COVERED | N/A | N/A | PARTIAL |
 | D12 | Publisher crash recovery | PARTIAL | N/A | N/A | PARTIAL |
 
-Cell totals: **5 COVERED**, **29 PARTIAL**, **1 MISSING**, **13 N/A**.
+Cell totals: **5 COVERED**, **30 PARTIAL**, **0 MISSING**, **13 N/A**.
 
 ### Matrix cell evidence and gaps
 
@@ -56,15 +56,15 @@ Cell totals: **5 COVERED**, **29 PARTIAL**, **1 MISSING**, **13 N/A**.
 | D02 | MODELS_BILLING_LEDGER | PARTIAL | fake pool; no routing/ledger parity |
 | D02 | VERIFICATION | PARTIAL | BUILD compared; VERIFY not in this scenario |
 | D02 | PUBLICATION | N/A | no publication required |
-| D03 | EXECUTION | PARTIAL | no adapter-level routing scenario |
-| D03 | MODELS_BILLING_LEDGER | MISSING | router/breaker/escalation not compared through adapters |
+| D03 | EXECUTION | PARTIAL | adapter-level hard task/order/exhaustion covered; escalation missing |
+| D03 | MODELS_BILLING_LEDGER | PARTIAL | real candidate order/breaker observed; escalation not compared |
 | D03 | VERIFICATION | PARTIAL | no escalation-specific verification comparison |
 | D03 | PUBLICATION | N/A | no publication required |
 | D04 | EXECUTION | COVERED | adapter-level 429 + shared quota/timeout/all-unavailable cassettes |
-| D04 | MODELS_BILLING_LEDGER | PARTIAL | real classify_error/RouteChain exercised in test_p7_pipeline; adapter parity still missing |
+| D04 | MODELS_BILLING_LEDGER | PARTIAL | real classify_error/RouteChain through both adapters for 429/auth/bad/connection/server; PAYG ambiguity partial |
 | D04 | VERIFICATION | PARTIAL | no verification in fallback scenarios |
 | D04 | PUBLICATION | N/A | no publication required |
-| D05 | EXECUTION | PARTIAL | adapter-level timeout->UNKNOWN/resume now covered; other PAYG variants missing |
+| D05 | EXECUTION | PARTIAL | adapter-level timeout->UNKNOWN/resume + PENDING/SUBMITTED; other PAYG variants missing |
 | D05 | MODELS_BILLING_LEDGER | PARTIAL | real ledger/UNKNOWN tested in test_p7_pipeline; no adapter ledger parity |
 | D05 | VERIFICATION | N/A | no verification involved |
 | D05 | PUBLICATION | N/A | no publication required |
@@ -131,8 +131,12 @@ These run both `FactoryAdapter` and `NativeAdapter` through `WorkflowEngine`, th
 
 | Caso | Estado | Teste |
 |---|---|---|
-| Adapteres: 429 -> fallback seguro (Router/RouteChain reais) | Verde | `AdapterPipelineTests.test_d04_429_fallback_matches_across_adapters` |
-| Adapteres: PAYG timeout -> UNKNOWN, resume bloqueia sem retry | Verde | `AdapterPipelineTests.test_d05_payg_timeout_unknown_and_resume_blocks` |
+| Adapteres D03: hard task, ordem de candidatos, cadeia esgotada | Verde | `AdapterPipelineTests.test_d03_hard_task_candidate_order_and_exhaustion` |
+| Adapteres D04: 429 -> fallback seguro | Verde | `AdapterPipelineTests.test_d04_429_fallback_matches_across_adapters` |
+| Adapteres D04: auth/connection/server -> fallback | Verde | `AdapterPipelineTests.test_d04_auth_connection_server_fallback` |
+| Adapteres D04: bad request não faz fallback | Verde | `AdapterPipelineTests.test_d04_bad_request_does_not_fall_back` |
+| Adapteres D05: PENDING/SUBMITTED bloqueiam sem chamada | Verde | `AdapterPipelineTests.test_d05_pending_and_submitted_block_without_calls` |
+| Adapteres D05: timeout -> UNKNOWN, resume bloqueia sem retry | Verde | `AdapterPipelineTests.test_d05_payg_timeout_unknown_and_resume_blocks` |
 
 ## Full pipeline (real Router + RouteChain + CallLedger, fake transport)
 

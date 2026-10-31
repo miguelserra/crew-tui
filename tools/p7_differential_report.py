@@ -65,9 +65,17 @@ PENDING = [
 ]
 
 ADAPTER_PIPELINE = [
-    ("Adapteres: 429 -> fallback seguro (Router/RouteChain reais)",
+    ("Adapteres D03: hard task, ordem de candidatos, cadeia esgotada",
+     "test_d03_hard_task_candidate_order_and_exhaustion"),
+    ("Adapteres D04: 429 -> fallback seguro",
      "test_d04_429_fallback_matches_across_adapters"),
-    ("Adapteres: PAYG timeout -> UNKNOWN, resume bloqueia sem retry",
+    ("Adapteres D04: auth/connection/server -> fallback",
+     "test_d04_auth_connection_server_fallback"),
+    ("Adapteres D04: bad request não faz fallback",
+     "test_d04_bad_request_does_not_fall_back"),
+    ("Adapteres D05: PENDING/SUBMITTED bloqueiam sem chamada",
+     "test_d05_pending_and_submitted_block_without_calls"),
+    ("Adapteres D05: timeout -> UNKNOWN, resume bloqueia sem retry",
      "test_d05_payg_timeout_unknown_and_resume_blocks"),
 ]
 
@@ -123,19 +131,19 @@ MATRIX = [
         "PUBLICATION": ("N/A", "no publication required"),
     }),
     ("D03", "Hard task, escalation, routing", {
-        "EXECUTION": ("PARTIAL", "no adapter-level routing scenario"),
-        "MODELS_BILLING_LEDGER": ("MISSING", "router/breaker/escalation not compared through adapters"),
+        "EXECUTION": ("PARTIAL", "adapter-level hard task/order/exhaustion covered; escalation missing"),
+        "MODELS_BILLING_LEDGER": ("PARTIAL", "real candidate order/breaker observed; escalation not compared"),
         "VERIFICATION": ("PARTIAL", "no escalation-specific verification comparison"),
         "PUBLICATION": ("N/A", "no publication required"),
     }),
     ("D04", "Technical fallback", {
         "EXECUTION": ("COVERED", "adapter-level 429 + shared quota/timeout/all-unavailable cassettes"),
-        "MODELS_BILLING_LEDGER": ("PARTIAL", "real classify_error/RouteChain exercised in test_p7_pipeline; adapter parity still missing"),
+        "MODELS_BILLING_LEDGER": ("PARTIAL", "real classify_error/RouteChain through both adapters for 429/auth/bad/connection/server; PAYG ambiguity partial"),
         "VERIFICATION": ("PARTIAL", "no verification in fallback scenarios"),
         "PUBLICATION": ("N/A", "no publication required"),
     }),
     ("D05", "PAYG safety and UNKNOWN", {
-        "EXECUTION": ("PARTIAL", "adapter-level timeout->UNKNOWN/resume now covered; other PAYG variants missing"),
+        "EXECUTION": ("PARTIAL", "adapter-level timeout->UNKNOWN/resume + PENDING/SUBMITTED; other PAYG variants missing"),
         "MODELS_BILLING_LEDGER": ("PARTIAL", "real ledger/UNKNOWN tested in test_p7_pipeline; no adapter ledger parity"),
         "VERIFICATION": ("N/A", "no verification involved"),
         "PUBLICATION": ("N/A", "no publication required"),

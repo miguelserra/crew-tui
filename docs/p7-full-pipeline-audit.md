@@ -79,15 +79,15 @@ evidence of routing, provider classification, or PAYG ledger parity.
 ## 8. Resolution status
 
 - [x] D02 dependency ordering (already fixed and covered in `9e51b4b`).
-- [ ] D03 – outstanding (no adapter-level routing test).
-- [~] D04 – partially resolved: adapter-level 429 fallback now runs through
-  both adapters (`test_p7_pipeline_adapters`); auth/bad-request/connection/
-  server variants are still outstanding.
-- [~] D05 – partially resolved: adapter-level PAYG timeout -> UNKNOWN and
-  resume blocking (no retry) now run through both adapters; other ledger
-  variants are still outstanding. This also exposed and fixed a real defect:
-  `FactoryAdapter` did not propagate `run_id` to `Factory`, bypassing the
-  ledger on the Factory path.
+- [~] D03 – partially resolved: adapter-level hard-task candidate order and
+  exhausted chain covered; quality escalation is still outstanding.
+- [~] D04 – partially resolved: adapter-level 429, auth, connection, server
+  and bad-request variants covered; PAYG ambiguity variants still outstanding.
+- [~] D05 – partially resolved: adapter-level timeout -> UNKNOWN/resume and
+  PENDING/SUBMITTED blocking covered; FAILED fallback, manual resolution and
+  other ledger variants are still outstanding. This also exposed and fixed a
+  real defect: `FactoryAdapter` did not propagate `run_id` to `Factory`,
+  bypassing the ledger on the Factory path.
 - [~] D06 – partially resolved at shared-routechain level; adapter-level
   replay/resume is still outstanding.
 

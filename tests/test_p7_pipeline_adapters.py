@@ -37,6 +37,18 @@ class Http429(Exception):
     status_code = 429
 
 
+class Http401(Exception):
+    status_code = 401
+
+
+class Http400(Exception):
+    status_code = 400
+
+
+class Http500(Exception):
+    status_code = 500
+
+
 class FakeVerifier:
     def run_oracle(self, task_id, artifact, run_id=None, suffix=""):
         return types.SimpleNamespace(passed=True, exit_code=0)
@@ -57,12 +69,19 @@ def identity(profile, model_id, billing):
                          capabilities=frozenset({"text"}), defined=True)
 
 
-def make_registry():
-    return ModelRegistry(models=[
+def make_registry(mode="full"):
+    models = [
+        identity("gemini-plus", "gemini-3.1-pro-preview", BILLING_FREE),
         identity("gemini-plus", "gemini-3.5-flash", BILLING_FREE),
         identity("gemini-plus", "gemini-3.8-flash", BILLING_FREE),
+        identity("openrouter", "nvidia/nemotron-3-ultra", BILLING_FREE),
         identity("deepseek-api", "deepseek-v4-pro", BILLING_PAYG),
-    ])
+    ]
+    if mode == "flash":
+        models = [m for m in models if m.model_id.startswith("gemini-3.")]
+    elif mode == "payg":
+        models = [m for m in models if m.billing == BILLING_PAYG]
+    return ModelRegistry(models=models)
 
 
 class FakeHandle:
@@ -74,8 +93,17 @@ class FakeHandle:
 
     def invoke(self, messages):
         self.log.append(self.behavior)
+        self.owner.transport.append((self.ref.model_id, self.behavior))
         if self.behavior == "429":
             raise Http429("rate limited")
+        if self.behavior == "auth":
+            raise Http401("unauthorized")
+        if self.behavior == "bad":
+            raise Http400("bad request")
+        if self.behavior == "server":
+            raise Http500("server error")
+        if self.behavior == "connection":
+            raise ConnectionError("connection refused")
         if self.behavior == "timeout":
             raise TimeoutError("timed out")
         self.owner.last_served = self.ref
@@ -87,16 +115,17 @@ class FakeHandle:
 class PipelinePool:
     """Pool shim: real Router/RouteChain + canonical attempt/ledger wiring."""
 
-    def __init__(self, script):
+    def __init__(self, script, registry_mode="full"):
         self.script = script
         self.calls = []
+        self.transport = []
         self.telemetry = None
         self.attempt_sink = None
         self.dispatch_guard = None
         self.last_attempt_model = {}
         self.local_up = False
         self.last_served = None
-        self.registry = make_registry()
+        self.registry = make_registry(registry_mode)
 
         def handle_provider(ident, tag, max_tokens, thinking):
             ref = self.registry.ref_for_identity(ident)
@@ -182,13 +211,16 @@ def settings(base):
     return cfg
 
 
-def run_pipeline(kind, script, complexity="medium"):
+def run_pipeline(kind, script, complexity="medium", pre_ledger=None,
+                 registry_mode="full"):
     base = Path(tempfile.mkdtemp(prefix="p7pipe-"))
     project = base / "project"; project.mkdir()
     ws = base / "ws"
     cfg = settings(base)
     st = make_state(project, ws, complexity)
-    pool = PipelinePool(script)
+    if pre_ledger is not None:
+        pre_ledger(project)
+    pool = PipelinePool(script, registry_mode)
     if kind == "factory":
         adapter = engine.FactoryAdapter(cfg, pool, lambda *a: None, st,
                                         isolate_workspace=True)
@@ -202,7 +234,8 @@ def run_pipeline(kind, script, complexity="medium"):
     eng.apply_pool(pool)
     result = eng.step()
     return {"base": base, "state": st, "engine": eng, "pool": pool,
-            "ledger": eng.call_ledger, "result": result, "kind": kind}
+            "ledger": eng.call_ledger, "result": result, "kind": kind,
+            "transport": pool.transport}
 
 
 @unittest.skipUnless(DEPS_OK, f"runtime deps missing: {DEPS_ERR}")
@@ -220,10 +253,77 @@ class AdapterPipelineTests(unittest.TestCase):
             self.assertIn(task.status, ("done", "verified"))
             self.assertEqual(task.delivered_by.model_id, "gemini-3.8-flash")
 
+    def test_d03_hard_task_candidate_order_and_exhaustion(self):
+        ok_script = {"gemini-3.1-pro-preview": "429",
+                     "nvidia/nemotron-3-ultra": "ok"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, ok_script, "high")
+            self.assertEqual(run["result"], "ok")
+            self.assertEqual(run["transport"], [
+                ("gemini-3.1-pro-preview", "429"),
+                ("nvidia/nemotron-3-ultra", "ok")])
+            self.assertEqual(run["state"].tasks[0].delivered_by.model_id,
+                             "nvidia/nemotron-3-ultra")
+
+        dead = {"gemini-3.1-pro-preview": "429",
+                "nvidia/nemotron-3-ultra": "429",
+                "deepseek-v4-pro": "429"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, dead, "high")
+            self.assertEqual(run["result"], "failed")
+            self.assertEqual([m for m, _b in run["transport"]],
+                             ["gemini-3.1-pro-preview",
+                              "nvidia/nemotron-3-ultra",
+                              "deepseek-v4-pro"])
+
+    def test_d04_auth_connection_server_fallback(self):
+        # Compare both adapters rather than hard-coding which candidate the
+        # shared router/breaker selects after the first failure.
+        for behavior in ("auth", "connection", "server"):
+            script = {"gemini-3.5-flash": behavior,
+                      "gemini-3.8-flash": "ok",
+                      "nvidia/nemotron-3-ultra": "ok"}
+            ref = run_pipeline("factory", script, "medium")
+            new = run_pipeline("native", script, "medium")
+            self.assertEqual(ref["result"], "ok", behavior)
+            self.assertEqual(new["result"], "ok", behavior)
+            self.assertEqual(ref["transport"], new["transport"], behavior)
+            self.assertEqual(ref["transport"][0],
+                             ("gemini-3.5-flash", behavior))
+            self.assertEqual(ref["transport"][-1][1], "ok")
+            self.assertEqual(ref["state"].tasks[0].delivered_by.model_id,
+                             new["state"].tasks[0].delivered_by.model_id)
+
+    def test_d04_bad_request_does_not_fall_back(self):
+        script = {"gemini-3.5-flash": "bad", "gemini-3.8-flash": "ok"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "medium")
+            self.assertEqual(run["result"], "failed")
+            self.assertEqual(run["transport"],
+                             [("gemini-3.5-flash", "bad")])
+
+    def test_d05_pending_and_submitted_block_without_calls(self):
+        for pending_state in ("PENDING", "SUBMITTED"):
+            def seed(project, state=pending_state):
+                led = CallLedger(project / ".crew" / "calls.json")
+                ref = make_registry().ref_for_identity(
+                    identity("deepseek-api", "deepseek-v4-pro", BILLING_PAYG))
+                rec = led.intent(run_id="r", role="programming", ref=ref,
+                                 task="a", tag="DEV")
+                if state == "SUBMITTED":
+                    led.submitted(rec.call_id)
+
+            for kind in ("factory", "native"):
+                run = run_pipeline(kind, {}, "medium", pre_ledger=seed)
+                self.assertEqual(run["result"], "paused")
+                self.assertEqual(run["transport"], [])
+                self.assertEqual(run["state"].pause.reason,
+                                 "call_unknown_failed")
+
     def test_d05_payg_timeout_unknown_and_resume_blocks(self):
         script = {"deepseek-v4-pro": "timeout"}
         for kind in ("factory", "native"):
-            run = run_pipeline(kind, script, "high")
+            run = run_pipeline(kind, script, "high", registry_mode="payg")
             self.assertEqual(run["pool"].calls, ["timeout"])
             recs = run["ledger"].unresolved("r")
             self.assertEqual(len(recs), 1)
