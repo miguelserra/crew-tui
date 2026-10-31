@@ -15,6 +15,13 @@ import engine
 import state as s
 from store import StateManager
 
+try:
+    import pydantic  # noqa: F401
+except Exception:
+    MAIN_DEPS_OK = False
+else:
+    MAIN_DEPS_OK = True
+
 
 MINIMAL = {
     "project_name": "Brief Demo",
@@ -185,6 +192,7 @@ class BriefTests(unittest.TestCase):
         self.assertFalse(brief.has_brief(loaded))
         self.assertEqual(loaded.requirements.objective, "")
 
+    @unittest.skipUnless(MAIN_DEPS_OK, "pydantic/runtime deps missing")
     def test_p72a_12_cli_exposes_brief_and_interview_flags(self):
         root = Path(__file__).resolve().parents[1]
         proc = subprocess.run([sys.executable, "main.py", "--help"],
@@ -195,6 +203,7 @@ class BriefTests(unittest.TestCase):
                      "--show-brief"):
             self.assertIn(flag, proc.stdout)
 
+    @unittest.skipUnless(MAIN_DEPS_OK, "pydantic/runtime deps missing")
     def test_p72a_12b_cli_brief_reports_blockers_without_model(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as td:
@@ -210,6 +219,7 @@ class BriefTests(unittest.TestCase):
             self.assertIn("BLOCKING", proc.stdout)
             self.assertIn("q_core_workflows", proc.stdout)
 
+    @unittest.skipUnless(MAIN_DEPS_OK, "pydantic/runtime deps missing")
     def test_p72a_12c_cli_answers_and_defer_clear_blockers(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as td:

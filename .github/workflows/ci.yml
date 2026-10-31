@@ -76,6 +76,8 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p7_differential.py"
       - name: P7 adapter full pipeline
         run: python -m unittest discover -s tests -p "test_p7_pipeline_adapters.py"
+      - name: P7.2a brief/interview tests
+        run: python -m unittest discover -s tests -p "test_p72a_*.py"
 
   windows:
     name: Windows (py3.13)
