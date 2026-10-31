@@ -158,6 +158,23 @@ class IntegrationTests(unittest.TestCase):
             recs = st.integration.get("fix_records", [])
             self.assertEqual(recs[0]["revalidations"][0]["verdict"], "FAIL")
 
+    def test_web_app_failure_is_integration_fail(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "index.html").write_text("<html></html>", encoding="utf-8")
+            st = s.ProjectState(run_id="r", goal="x", engine_kind=s.ENGINE_UNIFIED)
+            settings = types.SimpleNamespace(max_verify_loops=1)
+            orig = integration.playwright_audit
+            integration.playwright_audit = lambda r, d, **k: {
+                "verdict": "FAIL", "errors": ["app não arranca"]}
+            try:
+                svc = integration.IntegrationService(settings, FakePool(),
+                                                     lambda *a: None, "r")
+                self.assertFalse(svc.integrate(st, root))
+            finally:
+                integration.playwright_audit = orig
+            self.assertEqual(st.integration["verdict"], "FAIL")
+
     def test_no_entrypoint_is_skip(self):
         with tempfile.TemporaryDirectory() as td:
             st = s.ProjectState(run_id="r", goal="x", engine_kind=s.ENGINE_UNIFIED)

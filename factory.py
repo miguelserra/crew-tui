@@ -917,12 +917,15 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
         self.state.visual = report
         self.log("visual", json.dumps(report, ensure_ascii=False)[:8000])
         self.save()
-        audit_ok = report.get("verdict") != "FAIL"
+        audit = verify_policy.normalize_verdict(report.get("verdict"))
+        audit_ok = audit == verify_policy.PASS
         vverdict = verify_policy.normalize_verdict(
             vision.get("verdict", verify_policy.NA))
         ok = audit_ok and vverdict in (verify_policy.PASS, verify_policy.NA)
-        if vverdict == verify_policy.UNVERIFIED:
-            ok = bool(self.settings.allow_unverified) and audit_ok
+        if audit == verify_policy.NA and not report.get("screenshot"):
+            ok = True
+        if vverdict == verify_policy.UNVERIFIED or audit == verify_policy.UNVERIFIED:
+            ok = bool(self.settings.allow_unverified) and audit != verify_policy.FAIL
         self.emit("VISUAL", f"audit {report.get('verdict')} · vision {vverdict}")
         return ok
 

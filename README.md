@@ -306,10 +306,16 @@ P7.1 has started extracting native services over canonical `ProjectState`:
   FAIL→FIX quality recovery, UNVERIFIED blocking and visual re-review;
 - scaffold/verification/workspace/publish were already native from P5/P6.
 
-NativeAdapter and the first differential cassettes exist (P7.1d), but the
-full failure/resume matrix (fallback, Playwright unavailable,
-interruption/resume, publish) is not yet green; the runtime still uses
-`FactoryAdapter` and removal is not authorized. P7 is not
+NativeAdapter and the differential cassettes exist (P7.1d). The matrix covers
+normal execution, FAIL→FIX recovery, UNVERIFIED blocking, visual retry,
+technical fallback (quota/timeout/all-unavailable), Playwright unavailable,
+resume-after-BUILD continuity, and publication parity/conflict in disposable
+clones. The machine-generated report lives in
+`docs/p7-differential-report.md` (`tools/p7_differential_report.py`). Still
+pending before the gate opens: the PAYG intent ledger (intent-before-send,
+UNKNOWN ambiguous outcomes, idempotency keys) and full crash-recovery journal
+replay. The runtime still uses `FactoryAdapter` and removal is not authorized.
+P7 is not
 a closed gate; legacy migration/conversion remains readable and no silent
 conversion is performed. No prompt/routing/verification policy was changed in
 this extraction.

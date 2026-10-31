@@ -10,6 +10,7 @@ this file documents and covers the first slices.
 """
 
 import sys
+import json
 import tempfile
 import types
 import unittest
@@ -21,9 +22,11 @@ try:
     import main
     import engine
     import native_adapter
+    import visual as visual_m
     import state as s
     from registry import ModelRef
     from attempts import AttemptEvent
+    from publish import PublishConflict
 except Exception as exc:  # pragma: no cover
     DEPS_OK = False
     DEPS_ERR = str(exc)
@@ -87,11 +90,18 @@ class FakeVerifier:
 
 
 class FakePool:
-    def __init__(self):
+    """Deterministic cassette. Optional fallback_script maps task id -> outcomes.
+
+    Outcomes are consumed in order; "ok" serves that candidate, anything else
+    (quota/timeout/error) emits an attempt and moves to the next candidate.
+    """
+
+    def __init__(self, fallback_script=None):
         self.telemetry = None
         self.attempt_sink = None
         self.dispatch_guard = None
         self.last_attempt_model = {}
+        self.fallback_script = fallback_script
         self.router = types.SimpleNamespace(route=lambda req: types.SimpleNamespace(
             candidates=[object()], chain=None))
 
@@ -104,25 +114,50 @@ class FakePool:
     def team_llm(self, task, run_id=""):
         return ("chain", "DEV")
 
+    @staticmethod
+    def _model(i: int) -> ModelRef:
+        return ModelRef(provider="fake", endpoint=f"ep{i}", model_id=f"fake-{i}",
+                        family="fake", billing="local",
+                        credential_profile="default")
+
+    def _emit(self, task, tag, model, outcome):
+        if not self.attempt_sink:
+            return
+        from state import TaskAttempt, new_id, utc_now
+        ev = AttemptEvent(TaskAttempt(
+            attempt_id=new_id("att_"), model=model,
+            started_at=utc_now(), completed_at=utc_now(),
+            outcome=outcome), task=task, tag=tag, run_id="r")
+        self.attempt_sink(ev)
+
     def complete(self, chain, messages, meta=None):
         meta = meta or {}
         task = meta.get("task") or ""
         tag = meta.get("tag") or ""
-        model = ModelRef(provider="fake", endpoint="local", model_id="fake-1",
-                         family="fake", billing="local",
-                         credential_profile="default")
-        if task:
-            self.last_attempt_model[task] = model
-            if self.attempt_sink:
-                from state import TaskAttempt, new_id, utc_now
-                ev = AttemptEvent(TaskAttempt(
-                    attempt_id=new_id("att_"), model=model,
-                    started_at=utc_now(), completed_at=utc_now(),
-                    outcome="ok"), task=task, tag=tag, run_id="r")
-                self.attempt_sink(ev)
         if tag == "SIGN":
             return '{"what_it_is": "demo", "how_to_run": ["python app.py"]}'
         blob = str(meta.get("prompt") or "") + str(messages)
+        if task and self.fallback_script is not None:
+            outcomes = self.fallback_script.get(task, ["ok"])
+            served = None
+            for i, outcome in enumerate(outcomes, 1):
+                model = self._model(i)
+                self._emit(task, tag, model, outcome)
+                if outcome == "ok":
+                    served = model
+                    break
+            if served is None:
+                raise RuntimeError("all candidates unavailable")
+            self.last_attempt_model[task] = served
+            return self._cassette(blob)
+        model = self._model(1)
+        if task:
+            self.last_attempt_model[task] = model
+            self._emit(task, tag, model, "ok")
+        return self._cassette(blob)
+
+    @staticmethod
+    def _cassette(blob: str) -> str:
         if "Deliverable file: util.py" in blob:
             return "```python\nx = 2\n```"
         return "```python\nprint('ok')\n```"
@@ -157,11 +192,12 @@ class DifferentialSmokeTests(unittest.TestCase):
         settings.log_dir = str(base / "logs")
         return settings
 
-    def _pair(self, base, *, fail_first=False, unverified=False):
+    def _pair(self, base, *, fail_first=False, unverified=False,
+              fallback_script=None):
         proj_f = base / "proj_f"; proj_f.mkdir()
         proj_n = base / "proj_n"; proj_n.mkdir()
-        pool_f = FakePool()
-        pool_n = FakePool()
+        pool_f = FakePool(fallback_script=fallback_script)
+        pool_n = FakePool(fallback_script=fallback_script)
         ver_f = FakeVerifier(fail_first=fail_first, unverified=unverified)
         ver_n = FakeVerifier(fail_first=fail_first, unverified=unverified)
         ref = engine.FactoryAdapter(
@@ -267,6 +303,189 @@ class DifferentialSmokeTests(unittest.TestCase):
             self.assertFalse(native.step("BUILD"))
             self.assertFalse((ws_f / "app.py").exists())
             self.assertFalse((ws_n / "app.py").exists())
+
+    def test_fallback_quota_and_timeout_then_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            script = {"a": ["quota", "ok"], "b": ["timeout", "ok"]}
+            ref, native, (ws_f, ws_n) = self._pair(base,
+                                                   fallback_script=script)
+            self.assertTrue(ref.step("BUILD"))
+            self.assertTrue(native.step("BUILD"))
+            ref.sync_to_project()
+            for a, b in zip(ref.project.tasks, native.project.tasks):
+                self.assertEqual(canon_attempts(a), canon_attempts(b))
+                self.assertEqual(canon_model(a.delivered_by),
+                                 canon_model(b.delivered_by))
+                self.assertEqual(dict(canon_model(a.delivered_by))["model_id"],
+                                 "fake-2")
+                outcomes = [o for _m, o in canon_attempts(a)]
+                self.assertEqual(outcomes, script[a.id])
+
+    def test_fallback_all_unavailable_blocks_both(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            script = {"a": ["timeout"], "b": ["quota"]}
+            ref, native, (ws_f, ws_n) = self._pair(base,
+                                                   fallback_script=script)
+            self.assertFalse(ref.step("BUILD"))
+            self.assertFalse(native.step("BUILD"))
+            ref.sync_to_project()
+            for a, b in zip(ref.project.tasks, native.project.tasks):
+                self.assertEqual(canon_attempts(a), canon_attempts(b))
+                self.assertIsNone(a.delivered_by)
+                self.assertIsNone(b.delivered_by)
+
+    def test_playwright_unavailable_is_unverified(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            ref, native, (ws_f, ws_n) = self._pair(base)
+            for ws in (ws_f, ws_n):
+                (ws / "index.html").write_text("<html></html>", encoding="utf-8")
+            for adapter in (ref, native):
+                adapter.project.profile = "web"
+                adapter.settings.visual_check = True
+                adapter.settings.allow_unverified = False
+            unavailable = {"verdict": "UNAVAILABLE",
+                           "note": "playwright indisponível", "screenshot": ""}
+            orig = visual_m.playwright_audit
+            visual_m.playwright_audit = lambda root, logs, **k: dict(unavailable)
+            ref.factory.playwright_audit = lambda root: dict(unavailable)
+            try:
+                self.assertFalse(ref.step("VISUAL"))
+                self.assertFalse(native.step("VISUAL"))
+            finally:
+                visual_m.playwright_audit = orig
+            ref.sync_to_project()
+            self.assertNotEqual(ref.project.visual.get("verdict"), "PASS")
+            self.assertNotEqual(native.project.visual.get("verdict"), "PASS")
+
+    def test_publication_parity(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj_f = base / "pf"; proj_f.mkdir()
+            proj_n = base / "pn"; proj_n.mkdir()
+            for proj in (proj_f, proj_n):
+                (proj / "keep.txt").write_text("base\n", encoding="utf-8")
+            st_f = self._state(proj_f, base / "ws_f")
+            st_n = self._state(proj_n, base / "ws_n")
+            ref = engine.FactoryAdapter(
+                self._settings(base), FakePool(), lambda *a: None, st_f,
+                isolate_workspace=True)
+            native = native_adapter.NativeAdapter(
+                self._settings(base), FakePool(), lambda *a: None, st_n,
+                verifier=FakeVerifier(), isolate_workspace=True)
+            for ws in (base / "ws_f", base / "ws_n"):
+                (ws / "new.py").write_text("print('new')\n", encoding="utf-8")
+
+            r = ref.publish()
+            n = native.publish()
+            self.assertEqual(r["status"], "COMMITTED")
+            self.assertEqual(n["status"], "COMMITTED")
+            self.assertEqual(r["entries"], n["entries"])
+            self.assertEqual((proj_f / "new.py").read_text(),
+                             (proj_n / "new.py").read_text())
+            self.assertEqual((proj_f / "keep.txt").read_text(),
+                             (proj_n / "keep.txt").read_text())
+            self.assertEqual(self._journal(proj_f), self._journal(proj_n))
+
+    def test_publication_conflict_parity(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj_f = base / "pf"; proj_f.mkdir()
+            proj_n = base / "pn"; proj_n.mkdir()
+            for proj in (proj_f, proj_n):
+                (proj / "keep.txt").write_text("base\n", encoding="utf-8")
+            ref = engine.FactoryAdapter(
+                self._settings(base), FakePool(), lambda *a: None,
+                self._state(proj_f, base / "ws_f"), isolate_workspace=True)
+            native = native_adapter.NativeAdapter(
+                self._settings(base), FakePool(), lambda *a: None,
+                self._state(proj_n, base / "ws_n"), verifier=FakeVerifier(),
+                isolate_workspace=True)
+            for ws in (base / "ws_f", base / "ws_n"):
+                (ws / "new.py").write_text("print('new')\n", encoding="utf-8")
+                (ws / "keep.txt").write_text("generated\n", encoding="utf-8")
+            for proj in (proj_f, proj_n):
+                (proj / "keep.txt").write_text("changed\n", encoding="utf-8")
+            with self.assertRaises(PublishConflict):
+                ref.publish()
+            with self.assertRaises(PublishConflict):
+                native.publish()
+
+    @staticmethod
+    def _journal(project_root: Path):
+        files = sorted((Path(project_root) / ".crew" / "publish").glob(
+            "*/journal.json"))
+        if not files:
+            return None
+        data = json.loads(files[-1].read_text(encoding="utf-8"))
+        return {
+            "status": data.get("status"),
+            "entries": [
+                {k: e.get(k) for k in ("rel", "action", "old_sha",
+                                       "new_sha", "status")}
+                for e in data.get("entries", [])
+            ],
+        }
+
+    def test_resume_after_build_preserves_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            ref, native, (ws_f, ws_n) = self._pair(base)
+            self.assertTrue(ref.step("BUILD"))
+            self.assertTrue(native.step("BUILD"))
+            ref.sync_to_project()
+            before_f = [(t.id, [(dict(canon_model(a.model))["model_id"], a.outcome)
+                               for a in t.attempts])
+                        for t in ref.project.tasks]
+            before_n = [(t.id, [(dict(canon_model(a.model))["model_id"], a.outcome)
+                                for a in t.attempts])
+                        for t in native.project.tasks]
+            ver_f = {k: v.verdict for k, v in ref.project.verifications.items()}
+            ver_n = {k: v.verdict for k, v in native.project.verifications.items()}
+
+            st_f = s.ProjectState.from_dict(ref.project.to_dict())
+            st_n = s.ProjectState.from_dict(native.project.to_dict())
+            pool_f = FakePool()
+            pool_n = FakePool()
+            ref2 = engine.FactoryAdapter(
+                self._settings(base), pool_f, lambda *a: None, st_f,
+                isolate_workspace=True)
+            native2 = native_adapter.NativeAdapter(
+                self._settings(base), pool_n, lambda *a: None, st_n,
+                verifier=FakeVerifier(), isolate_workspace=True)
+            ref2.factory.verifier = FakeVerifier()
+
+            def reference_ask(role, system, user, tag, task_id="", complexity="auto"):
+                return pool_f.complete(None, [], {"tag": tag, "task": task_id,
+                                                  "prompt": user})
+
+            ref2.factory._ask = reference_ask
+
+            def sink(event):
+                task = next((t for t in st_n.tasks if t.id == event.task), None)
+                if task is not None:
+                    task.attempts.append(event.attempt)
+            pool_n.attempt_sink = sink
+
+            for phase in ("INTEGRATE", "VISUAL", "SIGNOFF"):
+                self.assertTrue(ref2.step(phase), phase)
+                self.assertTrue(native2.step(phase), phase)
+            ref2.sync_to_project()
+
+            after_f = [(t.id, [(dict(canon_model(a.model))["model_id"], a.outcome)
+                               for a in t.attempts])
+                       for t in st_f.tasks]
+            after_n = [(t.id, [(dict(canon_model(a.model))["model_id"], a.outcome)
+                               for a in t.attempts])
+                       for t in st_n.tasks]
+            self.assertEqual(before_f, after_f)
+            self.assertEqual(before_n, after_n)
+            self.assertEqual(ver_f, {k: v.verdict for k, v in st_f.verifications.items()})
+            self.assertEqual(ver_n, {k: v.verdict for k, v in st_n.verifications.items()})
+            self.assertEqual(ref2.project.integration.get("verdict"),
+                             native2.project.integration.get("verdict"))
 
 
 if __name__ == "__main__":
