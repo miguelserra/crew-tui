@@ -170,7 +170,9 @@ These run both `FactoryAdapter` and `NativeAdapter` through `WorkflowEngine`, th
 | Adapteres D10: SPEC persistida não regenera | Verde | `D10ResumePipelineTests.test_d10_01a_spec_persisted_without_pause_does_not_regenerate` |
 | Adapteres D10: SPEC incompleta bloqueia sem modelo | Verde | `D10ResumePipelineTests.test_d10_01b_incomplete_spec_pauses_without_model` |
 | Adapteres D10: SPEC aprovada avança sem regenerar | Verde | `D10ResumePipelineTests.test_d10_01c_spec_approval_resume_advances_without_regeneration` |
+| Adapteres D10: SPEC fresca recupera do zero | Verde | `D10ResumePipelineTests.test_d10_01d_fresh_spec_recovers_from_scratch` |
 | Adapteres D10: ARCHITECTURE persistida não redesenha | Verde | `D10ResumePipelineTests.test_d10_02a_architecture_persisted_without_approval_is_not_redesigned` |
+| Adapteres D10: ARCHITECTURE fresca recupera do zero | Verde | `D10ResumePipelineTests.test_d10_02b_fresh_architecture_recovers_from_scratch` |
 | Adapteres D10: SCAFFOLD idempotente preserva ficheiros | Verde | `D10ResumePipelineTests.test_d10_03a_scaffold_is_idempotent_and_preserves_files` |
 | Adapteres D10: BUILD concluído não repete | Verde | `D10ResumePipelineTests.test_d10_04a_completed_build_task_is_not_repeated` |
 | Adapteres D10: PAYG UNKNOWN bloqueia sem retry | Verde | `D10ResumePipelineTests.test_d10_04b_payg_unknown_blocks_without_retry` |

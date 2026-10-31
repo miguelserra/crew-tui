@@ -147,7 +147,7 @@ is a no-op, and the engine persists `ProjectState` after each phase.
 
 ## Final D10 evidence
 
-- 24 D10 tests through `WorkflowEngine` with both adapters.
+- 26 D10 tests through `WorkflowEngine` with both adapters.
 - Real subprocess termination/restart: BUILD after CONFIRMED before attempt, BUILD
   after attempt before consumption, INTEGRATE after fixer write before
   revalidation, SIGNOFF after approval, SIGNOFF after rejection, and

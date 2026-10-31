@@ -1572,6 +1572,51 @@ class D10ResumePipelineTests(unittest.TestCase):
             self.assertEqual(eng.step(), "paused", kind)
             self.assertEqual(eng.state.pause.reason, "spec_questions", kind)
 
+    def test_d10_01d_fresh_spec_recovers_from_scratch(self):
+        spec = json.dumps({
+            "objective": "demo",
+            "scope_in": [], "scope_out": [], "constraints": [],
+            "non_negotiables": [],
+            "acceptance": [{"id": "ac1", "text": "runs"}],
+            "open_questions": [], "assumptions": [], "answers": [],
+        })
+        for kind in ("factory", "native"):
+            run = self._base("SPEC", architecture=False, tasks=[],
+                             requirements=False)
+
+            def responder(ref, messages):
+                return spec
+
+            eng = self._engine(kind, run, responder=responder)
+            self.assertEqual(eng["engine"].step(), "paused", kind)
+            self.assertEqual(eng["state"].pause.reason, "spec_approval", kind)
+            self.assertEqual(eng["state"].requirements.objective, "demo", kind)
+
+    def test_d10_02b_fresh_architecture_recovers_from_scratch(self):
+        arch = json.dumps({
+            "approach": "script",
+            "modules": [{"path": "app.py", "responsibility": "main"}],
+            "interfaces": [{"name": "main", "file": "app.py",
+                            "inputs": [], "outputs": [], "errors": [],
+                            "used_by": []}],
+            "tasks": [{"id": "a", "title": "run", "description": "",
+                       "target_file": "app.py", "acceptance": ["runs"],
+                       "depends_on": [], "requirement_ids": ["ac1"],
+                       "complexity": "low", "role": "junior"}],
+            "test_plan": [],
+        })
+        for kind in ("factory", "native"):
+            run = self._base("ARCHITECTURE", approved=False, architecture=False)
+
+            def responder(ref, messages):
+                return arch
+
+            eng = self._engine(kind, run, responder=responder)
+            self.assertEqual(eng["engine"].step(), "paused", kind)
+            self.assertEqual(eng["state"].pause.reason,
+                             "architecture_approval", kind)
+            self.assertEqual([t.id for t in eng["state"].tasks], ["a"], kind)
+
     def test_d10_02a_architecture_persisted_without_approval_is_not_redesigned(self):
         for kind in ("factory", "native"):
             run = self._base("ARCHITECTURE", approved=False)
