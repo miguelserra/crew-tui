@@ -81,8 +81,10 @@ evidence of routing, provider classification, or PAYG ledger parity.
 - [x] D02 dependency ordering (already fixed and covered in `9e51b4b`).
 - [~] D03 – partially resolved: adapter-level hard-task candidate order and
   exhausted chain covered; quality escalation is still outstanding.
-- [~] D04 – partially resolved: adapter-level 429, auth, connection, server
-  and bad-request variants covered; PAYG ambiguity variants still outstanding.
+- [~] D04 – technical fallback fully covered at adapter level: 429, auth,
+  connection, server, bad request and PAYG ambiguity (connection/server/empty)
+  with one invocation, no retry/fallback, UNKNOWN and manual resolution
+  persistence. Verification/publication dimensions remain out of scope.
 - [~] D05 – partially resolved: adapter-level timeout -> UNKNOWN/resume and
   PENDING/SUBMITTED blocking covered; FAILED fallback, manual resolution and
   other ledger variants are still outstanding. This also exposed and fixed a

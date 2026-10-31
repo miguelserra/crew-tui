@@ -73,6 +73,10 @@ ADAPTER_PIPELINE = [
      "test_d04_auth_connection_server_fallback"),
     ("Adapteres D04: bad request não faz fallback",
      "test_d04_bad_request_does_not_fall_back"),
+    ("Adapteres D04: ambiguidade PAYG sem retry/fallback",
+     "test_d04_payg_ambiguity_blocks_without_retry_or_fallback"),
+    ("Adapteres D04: resolução manual de UNKNOWN persiste",
+     "test_d04_payg_unknown_manual_resolution_persists"),
     ("Adapteres D05: PENDING/SUBMITTED bloqueiam sem chamada",
      "test_d05_pending_and_submitted_block_without_calls"),
     ("Adapteres D05: timeout -> UNKNOWN, resume bloqueia sem retry",
@@ -138,7 +142,7 @@ MATRIX = [
     }),
     ("D04", "Technical fallback", {
         "EXECUTION": ("COVERED", "adapter-level 429 + shared quota/timeout/all-unavailable cassettes"),
-        "MODELS_BILLING_LEDGER": ("PARTIAL", "real classify_error/RouteChain through both adapters for 429/auth/bad/connection/server; PAYG ambiguity partial"),
+        "MODELS_BILLING_LEDGER": ("COVERED", "429/auth/bad/connection/server fallback + PAYG ambiguity (connection/server/empty) with UNKNOWN, one invocation, no fallback and manual resolution through both adapters"),
         "VERIFICATION": ("PARTIAL", "no verification in fallback scenarios"),
         "PUBLICATION": ("N/A", "no publication required"),
     }),
@@ -304,6 +308,7 @@ def matrix_counts():
 
 
 def render(rows, safety, publisher, pipeline, adapter_pipeline) -> str:
+    counts = matrix_counts()
     lines = [
         "# P7 differential equivalence report (P7.1d)",
         "",
@@ -314,8 +319,9 @@ def render(rows, safety, publisher, pipeline, adapter_pipeline) -> str:
         "",
         "## Gate",
         "",
-        "The gate is **CLOSED**. The D01–D12 matrix has 5 COVERED, 29 PARTIAL, "
-        "1 MISSING and 13 N/A cells. Executed comparisons show no DIVERGENT, but "
+        f"The gate is **CLOSED**. The D01–D12 matrix has {counts['COVERED']} "
+        f"COVERED, {counts['PARTIAL']} PARTIAL, {counts['MISSING']} MISSING and "
+        f"{counts['N/A']} N/A cells. Executed comparisons show no DIVERGENT, but "
         "PARTIAL/MISSING cells mean the mandatory matrix is not complete; they "
         "are never counted as PASS. Provider idempotency headers are deferred "
         "hardening, not a P7.1d exit criterion.",
@@ -327,7 +333,6 @@ def render(rows, safety, publisher, pipeline, adapter_pipeline) -> str:
     ]
     for label, name, dims, status in rows:
         lines.append(f"| {label} | {status} | `{name}` | {dims} |")
-    counts = matrix_counts()
     lines += [
         "",
         "## Mandatory matrix (D01–D12)",

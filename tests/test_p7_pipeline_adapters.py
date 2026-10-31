@@ -2,7 +2,7 @@
 """Adapter-level full-pipeline harness: real Router/RouteChain/CallLedger,
 WorkflowEngine + FactoryAdapter/NativeAdapter, fake provider transport only.
 
-D04: technical fallback through the real classifier.
+D04: technical fallback and PAYG ambiguity through the real classifier.
 D05: PAYG timeout -> UNKNOWN, single invocation, resume blocks without retry.
 """
 
@@ -19,7 +19,7 @@ try:
     import engine
     import native_adapter
     import state as s
-    from calls import CallLedger, CONFIRMED, UNKNOWN
+    from calls import CallLedger, CallLedgerError, CONFIRMED, UNKNOWN
     from registry import (BILLING_FREE, BILLING_PAYG, ModelIdentity,
                           ModelRegistry)
     from router import CircuitBreaker, GrantStore, RouteRequest, Router
@@ -81,6 +81,15 @@ def make_registry(mode="full"):
         models = [m for m in models if m.model_id.startswith("gemini-3.")]
     elif mode == "payg":
         models = [m for m in models if m.billing == BILLING_PAYG]
+    elif mode == "payg_first":
+        # Fixture only: reclassify the first COMPLEX_CHAIN candidate as PAYG so
+        # an ambiguous PAYG outcome has a real free candidate behind it. This
+        # exercises the "never fall back silently" guarantee without changing
+        # production routing order.
+        models = [
+            identity("gemini-plus", "gemini-3.1-pro-preview", BILLING_PAYG),
+            identity("openrouter", "nvidia/nemotron-3-ultra", BILLING_FREE),
+        ]
     return ModelRegistry(models=models)
 
 
@@ -106,6 +115,9 @@ class FakeHandle:
             raise ConnectionError("connection refused")
         if self.behavior == "timeout":
             raise TimeoutError("timed out")
+        if self.behavior == "empty":
+            return types.SimpleNamespace(
+                content="", usage_metadata={}, response_metadata={})
         self.owner.last_served = self.ref
         return types.SimpleNamespace(
             content="```python\nprint('ok')\n```",
@@ -301,6 +313,50 @@ class AdapterPipelineTests(unittest.TestCase):
             self.assertEqual(run["result"], "failed")
             self.assertEqual(run["transport"],
                              [("gemini-3.5-flash", "bad")])
+
+    def test_d04_payg_ambiguity_blocks_without_retry_or_fallback(self):
+        # The request is dispatched (ledger SUBMITTED, transport log) before
+        # the ambiguous failure, so this is not a pre-invocation timeout.
+        for behavior in ("connection", "server", "empty"):
+            script = {"gemini-3.1-pro-preview": behavior,
+                      "nvidia/nemotron-3-ultra": "ok"}
+            for kind in ("factory", "native"):
+                run = run_pipeline(kind, script, "high",
+                                   registry_mode="payg_first")
+                self.assertEqual(run["result"], "failed", (kind, behavior))
+                self.assertEqual(run["state"].pause.reason, "build_failed")
+                self.assertEqual(run["pool"].calls, [behavior],
+                                 (kind, behavior))
+                self.assertEqual(run["transport"],
+                                 [("gemini-3.1-pro-preview", behavior)])
+                recs = run["ledger"].unresolved("r")
+                self.assertEqual(len(recs), 1, (kind, behavior))
+                self.assertEqual(recs[0].state, UNKNOWN)
+                self.assertEqual(recs[0].error_kind, behavior)
+                run["state"].pause = s.PauseState()
+                self.assertEqual(run["engine"].step(), "paused")
+                self.assertEqual(run["state"].pause.reason,
+                                 "call_unknown_failed")
+                self.assertEqual(run["transport"],
+                                 [("gemini-3.1-pro-preview", behavior)])
+
+    def test_d04_payg_unknown_manual_resolution_persists(self):
+        script = {"gemini-3.1-pro-preview": "connection",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high",
+                               registry_mode="payg_first")
+            rec = run["ledger"].unresolved("r")[0]
+            self.assertEqual(rec.state, UNKNOWN)
+            with self.assertRaises(CallLedgerError):
+                run["ledger"].resolve(rec.call_id, "confirmed")
+            resolved = run["ledger"].resolve(rec.call_id, "failed")
+            self.assertEqual(resolved.state, "FAILED")
+            self.assertEqual(resolved.resolved_by, "manual")
+            path = Path(run["base"]) / "project" / ".crew" / "calls.json"
+            reloaded = CallLedger(path).get(rec.call_id)
+            self.assertEqual(reloaded.state, "FAILED")
+            self.assertEqual(reloaded.resolved_by, "manual")
 
     def test_d05_pending_and_submitted_block_without_calls(self):
         for pending_state in ("PENDING", "SUBMITTED"):
