@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Protocol
 
 from attempts import AttemptEvent
+import brief as brief_flow
 from calls import CallLedger, CallLedgerError
 from registry import BILLING_UNKNOWN, ModelRef
 from state import (
@@ -268,7 +269,13 @@ class WorkflowEngine:
             return self.state.spec_approved()
         return any(a.kind == kind and a.decision == "approved" for a in self.state.approvals)
 
-    def approve_spec(self, actor: str = "human") -> None:
+    def approve_spec(self, actor: str = "human") -> bool:
+        if brief_flow.has_brief(self.state):
+            brief_flow.sync_contract(self.state)
+            blockers = brief_flow.blockers(self.state)
+            if blockers:
+                self._pause("spec_questions", "; ".join(blockers[:5]))
+                return False
         self.state.approvals.append(Approval(kind="spec", actor=actor,
                                             artifact_hash=self.state.requirements.content_hash(),
                                             decision="approved", timestamp=utc_now()))
@@ -277,6 +284,52 @@ class WorkflowEngine:
         if self.state.phase == "SPEC" and self.adapter is not None:
             self.state.phase = self.next_phase("SPEC")
         self.save()
+        return True
+
+    def start_brief(self, data: dict[str, Any], *,
+                    revision: int = 1) -> dict[str, Any]:
+        brief = brief_flow.ProjectBrief.from_dict(data)
+        brief_flow.install(self.state, brief, revision=revision)
+        if brief.get("main_objective") or brief.get("project_description"):
+            self.state.goal = (brief.get("main_objective")
+                               or brief.get("project_description"))
+        self.save()
+        return brief_flow.summary(self.state)
+
+    def update_brief(self, data: dict[str, Any]) -> dict[str, Any]:
+        brief = brief_flow.brief_of(self.state) if brief_flow.has_brief(
+            self.state) else brief_flow.ProjectBrief()
+        for key, value in (data or {}).items():
+            if key in brief_flow.FIELD_IDS:
+                brief.set(key, value)
+        brief_flow.install(self.state, brief,
+                           brief_flow.interview_of(self.state)
+                           if brief_flow.has_brief(self.state) else None,
+                           revision=(brief_flow.interview_of(self.state).revision
+                                     + 1
+                                     if brief_flow.has_brief(self.state) else 1))
+        if brief.get("main_objective") or brief.get("project_description"):
+            self.state.goal = (brief.get("main_objective")
+                               or brief.get("project_description"))
+        self.save()
+        return brief_flow.summary(self.state)
+
+    def brief_summary(self) -> dict[str, Any]:
+        return brief_flow.summary(self.state)
+
+    def brief_blockers(self) -> list[str]:
+        return brief_flow.blockers(self.state)
+
+    def brief_questions(self) -> list[dict[str, Any]]:
+        return [q.to_dict() for q in brief_flow.interview_of(self.state).questions]
+
+    def answer_brief_question(self, qid: str, answer: str, *,
+                              defer: bool = False,
+                              revise: bool = False) -> dict[str, Any]:
+        result = brief_flow.answer_question(self.state, qid, answer,
+                                            defer=defer, revise=revise)
+        self.save()
+        return result
 
     def approve_architecture(self, actor: str = "human") -> None:
         self.state.approve_architecture(actor=actor)
@@ -333,6 +386,20 @@ class WorkflowEngine:
 
     def spec_step(self, feedback: str = "") -> dict[str, Any]:
         """Run the requirements step and keep the human gate closed."""
+        if brief_flow.has_brief(self.state):
+            brief_flow.sync_contract(self.state)
+            self.save()
+            blockers = brief_flow.blockers(self.state)
+            if blockers:
+                self._pause("spec_questions", "; ".join(blockers[:5]))
+                return {}
+            if not self._has_approval("spec"):
+                self._pause("spec_approval",
+                            "contrato de requisitos do brief pronto")
+                return {}
+            self.state.phase = self.next_phase("SPEC")
+            self.save()
+            return {}
         req = self.adapter.prepare(self.state.goal, feedback)
         self.adapter.sync_to_project()
         self.save()
@@ -370,6 +437,11 @@ class WorkflowEngine:
                             f"{len(unrecoverable)} resultado(s) confirmado(s) sem "
                             f"artefacto recuperável: {ids}")
                 return "paused"
+        if (phase == "SPEC" and brief_flow.has_brief(self.state)
+                and brief_flow.blockers(self.state)):
+            self._pause("spec_questions",
+                        "; ".join(brief_flow.blockers(self.state)[:5]))
+            return "paused"
         if (phase == "SPEC" and self.state.requirements.objective
                 and self._has_approval("spec")):
             self.state.phase = self.next_phase("SPEC")
@@ -381,7 +453,8 @@ class WorkflowEngine:
             self.state.phase = self.next_phase("ARCHITECTURE")
             self.save()
             return "ok"
-        if phase == "SPEC" and self.state.requirements.objective:
+        if (phase == "SPEC" and self.state.requirements.objective
+                and not brief_flow.has_brief(self.state)):
             questions = self.state.requirements.open_questions
             if questions and not self.state.requirements.answers:
                 self._pause("spec_questions", "; ".join(questions[:5]))
@@ -396,6 +469,12 @@ class WorkflowEngine:
         if (phase == "ARCHITECTURE" and _has_architecture(self.state)
                 and self.state.tasks and not self.state.architecture_approved()):
             self._pause("architecture_approval", self.state.architecture_hash())
+            return "paused"
+
+        if (phase == "ARCHITECTURE" and brief_flow.has_brief(self.state)
+                and brief_flow.blockers(self.state)):
+            self._pause("spec_questions",
+                        "; ".join(brief_flow.blockers(self.state)[:5]))
             return "paused"
 
         if phase == "ARCHITECTURE":

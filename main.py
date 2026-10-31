@@ -96,6 +96,7 @@ from store import StateManager
 from state import (ProjectState, StateCorruptError, StateError, VerificationRecord,
                    from_legacy_factory, new_id)
 import verify as verify_policy
+import brief as brief_flow
 from verify import UNVERIFIED, FAIL, NA, PASS as VERIFY_PASS
 from router import (
     CircuitBreaker, GrantStore, PaidGrant, RouteRequest, RouteResult, RouteChain,
@@ -4148,6 +4149,9 @@ class CrewTUIApp(App):
             self._write(tagged("SYSTEM", "a run is already in progress …"))
             return
 
+        if text.startswith("/brief") or text.startswith("/answer ")                 or text.startswith("/defer ") or text == "/approve-spec":
+            self._brief_command(text)
+            return
         if text.lower().strip() in ("/resume", "/retomar"):
             self._start_factory("", resume=True)
             return
@@ -4217,6 +4221,74 @@ class CrewTUIApp(App):
         r"^\s*(o que|que (fizeste|faz|está|houve|se passou)|porque|por que|onde|quando|"
         r"como (ficou|está|funciona)|quem|qual|quais|explica|mostra|diz-me|what|why|where|how)", re.I)
     NEW_PROJECT_RE = re.compile(r"\b(novo projeto|outro projeto|de raiz|from scratch|começa do zero)\b", re.I)
+
+    def _brief_command(self, text: str) -> None:
+        if self.engine is None or not self._factory_mode:
+            self._write(tagged("SYSTEM", "inicia um projeto antes de usar /brief."))
+            return
+        word, _, rest = text.partition(" ")
+        rest = rest.strip()
+        try:
+            if word == "/brief" and rest == "":
+                self._write(tagged("BRIEF", json.dumps(
+                    brief_flow.template(), ensure_ascii=False,
+                    indent=2)[:8000]))
+                return
+            if word == "/brief" and rest == "show":
+                self._write(tagged("BRIEF", json.dumps(
+                    self.engine.brief_summary(), ensure_ascii=False,
+                    indent=2)[:8000]))
+                return
+            if word == "/brief" and rest == "questions":
+                for q in self.engine.brief_questions():
+                    self._write(tagged("BRIEF", f"{q['question_id']} "
+                                               f"[{q['priority']}] {q['question']}"))
+                return
+            if word == "/brief":
+                payload = {}
+                if rest.startswith("{"):
+                    payload = json.loads(rest)
+                else:
+                    for item in re.split(r"[;,]", rest):
+                        if "=" in item:
+                            key, value = item.split("=", 1)
+                            payload[key.strip()] = value.strip()
+                if not payload:
+                    self._write(tagged("SYSTEM", "uso: /brief campo=valor; "
+                                                 "ou /brief {json}; /brief show"))
+                    return
+                self.engine.update_brief(payload)
+                self.engine.spec_step()
+                self._write(tagged("BRIEF", "brief atualizado."))
+                return
+            if word == "/answer" and "=" in rest:
+                qid, answer = rest.split("=", 1)
+                result = self.engine.answer_brief_question(qid.strip(),
+                                                           answer.strip(),
+                                                           revise=True)
+                self._write(tagged("BRIEF", json.dumps(result,
+                                                        ensure_ascii=False)))
+                self.engine.spec_step()
+                return
+            if word == "/defer" and rest:
+                result = self.engine.answer_brief_question(
+                    rest, "Not decided", defer=True)
+                self._write(tagged("BRIEF", json.dumps(result,
+                                                        ensure_ascii=False)))
+                self.engine.spec_step()
+                return
+            if word == "/approve-spec":
+                if self.engine.approve_spec():
+                    self._write(tagged("SYSTEM", "contrato do brief aprovado."))
+                    self._set_phase("PLAN")
+                else:
+                    self._write(tagged("SYSTEM", "aprovação bloqueada: "
+                                                 + "; ".join(self.engine.brief_blockers())))
+                return
+        except Exception as exc:
+            self._write(tagged("SYSTEM", f"/brief: {exc}"))
+            return
+        self._write(tagged("SYSTEM", "comando de brief inválido."))
 
     def _looks_like_question(self, text: str) -> bool:
         return text.strip().endswith("?") or bool(self.QUESTION_RE.match(text))
@@ -4387,19 +4459,37 @@ def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
     print("discover:", pool.status_summary(), flush=True)
     pool.discover()
 
+    brief_data = None
+    if getattr(args, "brief", None):
+        try:
+            brief_data = json.loads(Path(os.path.expanduser(args.brief)).read_text(
+                encoding="utf-8"))
+        except Exception as exc:
+            print(f"[BRIEF] {exc}", flush=True)
+            return 2
+
     root = Path(os.path.expanduser(args.project)) if args.project else None
     if state is not None and state.project_root:
         root = Path(state.project_root)
     if root is None:
-        goal = args.factory or (state.goal if state is not None else "projeto")
+        goal = (args.factory
+                or (brief_data or {}).get("main_objective")
+                or (brief_data or {}).get("project_description")
+                or (brief_data or {}).get("project_name")
+                or (state.goal if state is not None else "projeto"))
         slug = re.sub(r"[^a-z0-9]+", "_", goal.lower()).strip("_")[:40] or "projeto"
         root = Path(os.path.expanduser(settings.project_dir)) / slug
     root.mkdir(parents=True, exist_ok=True)
 
     if state is None:
         if not args.factory:
-            print("uso: crew-tui --factory \"objetivo\" [--project DIR]", flush=True)
-            return 2
+            if brief_data:
+                args.factory = (brief_data.get("main_objective")
+                                or brief_data.get("project_description")
+                                or brief_data.get("project_name"))
+            if not args.factory:
+                print("uso: crew-tui --factory \"objetivo\" [--project DIR]", flush=True)
+                return 2
         state = new_unified_state(args.factory, str(root),
                                   engine_version=ENGINE_VERSION,
                                   profile=settings.workflow_profile)
@@ -4425,6 +4515,26 @@ def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
                          persistence=persistence)
     eng.apply_pool(pool)
     eng.save()
+    if brief_data is not None and not brief_flow.has_brief(state):
+        eng.start_brief(brief_data)
+    for item in getattr(args, "answer", None) or []:
+        if "=" not in item:
+            print(f"[BRIEF] resposta inválida: {item!r}", flush=True)
+            return 2
+        qid, value = item.split("=", 1)
+        try:
+            eng.answer_brief_question(qid.strip(), value.strip(), revise=True)
+        except Exception as exc:
+            print(f"[BRIEF] {exc}", flush=True)
+            return 2
+    for qid in getattr(args, "defer", None) or []:
+        try:
+            eng.answer_brief_question(qid.strip(), "Not decided", defer=True)
+        except Exception as exc:
+            print(f"[BRIEF] {exc}", flush=True)
+            return 2
+    if brief_flow.has_brief(state):
+        eng.save()
 
     for _ in range(16):
         result = eng.run()
@@ -4445,6 +4555,39 @@ def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
                   flush=True)
             return 1
         reason = state.pause.reason
+        if reason in ("spec_questions", "spec_approval") and brief_flow.has_brief(state):
+            if getattr(args, "show_brief", False):
+                print(json.dumps(eng.brief_summary(), ensure_ascii=False,
+                                 indent=2), flush=True)
+            for question in eng.brief_questions():
+                if question.get("status") != "OPEN":
+                    continue
+                if args.yes:
+                    continue
+                print(f"[BRIEF] {question.get('priority')} · "
+                      f"{question.get('category')}: {question.get('question')}",
+                      flush=True)
+                print(f"        reason: {question.get('reason')}", flush=True)
+                try:
+                    answer = input("A: ").strip()
+                except EOFError:
+                    answer = ""
+                if answer:
+                    eng.answer_brief_question(question["question_id"], answer,
+                                              revise=True)
+            blockers = eng.brief_blockers()
+            if blockers:
+                print("[BRIEF] BLOCKED: " + "; ".join(blockers), flush=True)
+                return 4
+            if not getattr(args, "approve_spec", False):
+                print("gate fechado: revê o brief e usa --approve-spec "
+                      "(--yes não o aprova)", flush=True)
+                return 4
+            if not eng.approve_spec():
+                print("[BRIEF] aprovação bloqueada", flush=True)
+                return 4
+            print("[SPEC] contrato do brief aprovado — a avançar", flush=True)
+            continue
         if reason in ("spec_questions", "spec_approval"):
             questions = list(state.requirements.open_questions)
             answered = False
@@ -4653,6 +4796,16 @@ def main() -> None:
                         help="entrega explicitamente artefacts UNVERIFIED")
     parser.add_argument("--profile", metavar="PROFILE",
                         help="workflow: auto|web|library|script|review")
+    parser.add_argument("--brief", metavar="FILE",
+                        help="Project Brief JSON for the structured requirements flow")
+    parser.add_argument("--answer", action="append", metavar="ID=VALUE",
+                        help="answer an adaptive interview question (repeatable)")
+    parser.add_argument("--defer", action="append", metavar="ID",
+                        help="explicitly defer an interview question (repeatable)")
+    parser.add_argument("--approve-spec", action="store_true",
+                        help="explicitly approve the brief RequirementContract")
+    parser.add_argument("--show-brief", action="store_true",
+                        help="print the Project Brief and interview summary")
     parser.add_argument("--approve-architecture", action="store_true",
                         help="aprova a arquitetura (o --yes não a aprova)")
     parser.add_argument("--approve-signoff", action="store_true",
@@ -4701,7 +4854,7 @@ def main() -> None:
         except (StateError, FileNotFoundError) as e:
             print(f"[STATE] {e}", flush=True)
             raise SystemExit(6)
-    if args.factory or args.resume:
+    if args.factory or args.resume or args.brief:
         try:
             raise SystemExit(_factory_cli(args))
         except BudgetSuspended as e:

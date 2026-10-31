@@ -55,3 +55,15 @@ Baseline: `p6.1-gate` (`86f2df1`).
 - Legacy data remains readable; no silent conversion.
 - Runtime unified path must not import `factory.py` after equivalent extraction.
 - Each extraction lands with regression tests before old code is removed.
+
+
+## P7.2a progress
+
+- Project Brief, adaptive interview, provenance, hash-bound SPEC approval and
+  TUI/CLI support implemented.
+- 16 P7.2a tests cover minimal/partial brief, adaptive and non-redundant
+  questions, blocking/deferred decisions, provenance, revision invalidation,
+  approval, resume, legacy compatibility, CLI flags/flow, no fabricated
+  requirements and conflicts.
+- P7.1d remains OPEN/COMPLETE.
+- P7.2b and P7.2c have not started.

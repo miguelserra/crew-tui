@@ -200,7 +200,7 @@ class RequirementContract:
         return out
 
     def content_hash(self) -> str:
-        return sha256_json({
+        payload = {
             "objective": self.objective,
             "scope_in": list(self.scope_in),
             "scope_out": list(self.scope_out),
@@ -209,7 +209,10 @@ class RequirementContract:
             "acceptance": [{"id": c.id, "text": c.text} for c in self.acceptance],
             "assumptions": list(self.assumptions),
             "answers": list(self.answers),
-        })
+        }
+        if "p7_2a" in self.raw:
+            payload["p7_2a"] = self.raw.get("p7_2a")
+        return sha256_json(payload)
 
     def to_legacy_dict(self) -> dict[str, Any]:
         """Shape consumed by the legacy Factory/Orchestrator prompts."""
