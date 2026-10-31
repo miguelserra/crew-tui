@@ -279,6 +279,10 @@ ADAPTER_PIPELINE = [
      "test_d08_09_visual_fail_fix_and_review_pass"),
     ("Adapteres D08: evidência visual stale bloqueia sign-off",
      "test_d08_10_stale_visual_evidence_blocks_signoff"),
+    ("D01 end-to-end: SPEC -> DONE e publicação",
+     "test_d01_normal_lifecycle"),
+    ("D01 end-to-end: falha, FIX, resume, DONE",
+     "test_d01_failure_and_recovery_lifecycle"),
     ("Adapteres D04: 429 -> fallback seguro",
      "test_d04_429_fallback_matches_across_adapters"),
     ("Adapteres D04: auth/connection/server -> fallback",
@@ -359,10 +363,10 @@ PUBLISHER = [
 
 MATRIX = [
     ("D01", "Normal end-to-end", {
-        "EXECUTION": ("PARTIAL", "BUILD/VERIFY/INTEGRATE/VISUAL/SIGNOFF only; no SPEC/ARCH/SCAFFOLD in differential"),
-        "MODELS_BILLING_LEDGER": ("PARTIAL", "fake pool bypasses router/ledger"),
-        "VERIFICATION": ("COVERED", "test_build_integrate_signoff_match compares verdict/evidence"),
-        "PUBLICATION": ("PARTIAL", "test_publication_parity is a separate sandbox, not end-to-end"),
+        "EXECUTION": ("COVERED", "complete SPEC -> ARCHITECTURE -> SCAFFOLD -> BUILD -> VERIFY -> INTEGRATE -> VISUAL -> SIGNOFF -> PUBLICATION -> DONE through both adapters"),
+        "MODELS_BILLING_LEDGER": ("COVERED", "real Router/RouteChain/ledger; full model/transport/call sequence and attempt identities compared"),
+        "VERIFICATION": ("COVERED", "oracle/critic evidence, artifact hashes, visual PASS, approval evidence and final sign-off hash compared"),
+        "PUBLICATION": ("COVERED", "real PublishManager; COMMITTED journals, manifests, hashes and final files compared; project_memory timestamp is documented allowed variance"),
     }),
     ("D02", "Task dependencies and ordering", {
         "EXECUTION": ("COVERED", "adapter-level declared-order scheduling; missing/self/duplicate/cyclic graphs rejected before BUILD with no provider call; partial resume skips completed tasks; failed or skipped dependencies never execute dependents"),
@@ -523,6 +527,8 @@ def run_adapter_pipeline() -> list[tuple[str, str, str, str]]:
             class_name = "D12CrashPublicationTests"
         elif method.startswith("test_d08_"):
             class_name = "D08VisualBrowserTests"
+        elif method.startswith("test_d01_"):
+            class_name = "D01EndToEndTests"
         else:
             class_name = "AdapterPipelineTests"
         status = _run_one("tests.test_p7_pipeline_adapters",
@@ -567,12 +573,18 @@ def render(rows, safety, publisher, pipeline, adapter_pipeline) -> str:
         "",
         "## Gate",
         "",
-        f"The gate is **CLOSED**. The D01–D12 matrix has {counts['COVERED']} "
-        f"COVERED, {counts['PARTIAL']} PARTIAL, {counts['MISSING']} MISSING and "
-        f"{counts['N/A']} N/A cells. Executed comparisons show no DIVERGENT, but "
-        "PARTIAL/MISSING cells mean the mandatory matrix is not complete; they "
-        "are never counted as PASS. Provider idempotency headers are deferred "
-        "hardening, not a P7.1d exit criterion.",
+        (f"The gate is **OPEN**. The D01–D12 matrix has {counts['COVERED']} "
+         f"COVERED, {counts['PARTIAL']} PARTIAL, {counts['MISSING']} MISSING and "
+         f"{counts['N/A']} N/A cells. Executed comparisons show no DIVERGENT; "
+         "every applicable cell is covered. Provider idempotency headers remain "
+         "deferred hardening, not a P7.1d exit criterion."
+         if counts['PARTIAL'] == 0 and counts['MISSING'] == 0 else
+         f"The gate is **CLOSED**. The D01–D12 matrix has {counts['COVERED']} "
+         f"COVERED, {counts['PARTIAL']} PARTIAL, {counts['MISSING']} MISSING and "
+         f"{counts['N/A']} N/A cells. Executed comparisons show no DIVERGENT, but "
+         "PARTIAL/MISSING cells mean the mandatory matrix is not complete; they "
+         "are never counted as PASS. Provider idempotency headers are deferred "
+         "hardening, not a P7.1d exit criterion."),
         "",
         "## Scenarios",
         "",

@@ -68,3 +68,10 @@ COVERED with adapter-level tests. Factory static repair was aligned to one
 fixer attempt with a regression test, removing an extra chief attempt that
 Native did not perform. Global matrix after Stage A: 33 COVERED / 3 PARTIAL /
 0 MISSING / 12 N/A. D01 remains the only open scenario set.
+
+
+## Stage B result
+
+D01 normal and controlled failure/recovery lifecycles are COVERED through both
+adapters. Final matrix: 36 COVERED / 0 PARTIAL / 0 MISSING / 12 N/A. P7.1d
+differential matrix is complete and the gate is OPEN.

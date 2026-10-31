@@ -3207,5 +3207,222 @@ class D08VisualBrowserTests(unittest.TestCase):
                 eng["state"].approve_signoff("reviewer", "stale")
 
 
+@unittest.skipUnless(DEPS_OK and PLAYWRIGHT_OK,
+                     "runtime deps or Playwright unavailable")
+class D01EndToEndTests(unittest.TestCase):
+    """D01: complete SPEC→DONE lifecycle through both adapters."""
+
+    HTML = """<!doctype html><html><head><meta charset="utf-8">
+<style>body{font-family:sans-serif;background:#fff;color:#111}
+#card{border:2px solid #333;padding:20px;margin:20px}</style></head>
+<body><div id="card"><h1 id="title">D01 Fixture</h1>
+<p id="status">ready</p></div></body></html>"""
+    FIXED = HTML.replace("ready", "fixed")
+
+    def _responder(self):
+        def responder(ref, messages):
+            blob = "\n".join(str(getattr(m, "content", m)) for m in messages)
+            if "Produce the requirements contract" in blob:
+                return json.dumps({
+                    "objective": "Build a visual hello page",
+                    "scope_in": ["static web page"],
+                    "scope_out": [],
+                    "constraints": ["no external network"],
+                    "acceptance": ["the page renders visually"],
+                    "assumptions": [],
+                    "open_questions": [],
+                })
+            if "Design the solution" in blob:
+                return json.dumps({
+                    "approach": "static page",
+                    "modules": [{"path": "index.html",
+                                 "responsibility": "visual page"}],
+                    "interfaces": [{"name": "page", "file": "index.html",
+                                    "inputs": [], "outputs": ["html"],
+                                    "errors": [], "used_by": []}],
+                    "tasks": [{
+                        "id": "page", "title": "page", "description": "",
+                        "target_file": "index.html",
+                        "acceptance": ["the page renders visually"],
+                        "depends_on": [], "requirement_ids": ["ac1"],
+                        "complexity": "high", "role": "senior"}],
+                    "test_plan": [], "deletions": [],
+                })
+            if "Check this screenshot" in blob:
+                return json.dumps({"verdict": "PASS", "objections": []})
+            if "handover memory" in blob:
+                return json.dumps({"what_it_is": "demo",
+                                   "how_to_run": ["open index.html"]})
+            if ("VERIFICATION ERROR" in blob or "UI OBJECTIONS" in blob
+                    or "ERROR OUTPUT" in blob):
+                return "```html\n" + self.FIXED + "\n```"
+            if "Deliverable file: index.html" in blob:
+                return "```html\n" + self.HTML + "\n```"
+            raise AssertionError("unexpected D01 model prompt")
+        return responder
+
+    def _start(self, kind):
+        base = Path(tempfile.mkdtemp(prefix=f"d01-{kind}-"))
+        project = base / "project"; project.mkdir()
+        cfg = settings(base)
+        cfg.max_verify_loops = 1
+        cfg.visual_check = True
+        st = engine.new_unified_state("Build a visual hello page",
+                                      str(project), run_id="r")
+        pool = PipelinePool({}, responder=self._responder())
+        verifier = FakeVerifier()
+        adapter = _make_adapter(kind, cfg, pool, st, verifier)
+        store = StateManager(cfg.workspace_dir, cfg.log_dir)
+        eng = engine.WorkflowEngine(st, store, adapter, emit=lambda *a: None)
+        eng.apply_pool(pool)
+        store.save_project(st)
+        return {"kind": kind, "base": base, "project": project,
+                "ws": base / "ws", "settings": cfg, "state": st,
+                "pool": pool, "verifier": verifier, "adapter": adapter,
+                "engine": eng, "store": store}
+
+    def _resume(self, run):
+        cfg = settings(run["base"])
+        cfg.max_verify_loops = 1
+        cfg.visual_check = True
+        st = run["store"].load_project(
+            run["store"].project_state_path(run["state"].project_root))
+        pool = PipelinePool({}, responder=lambda *a: (
+            (_ for _ in ()).throw(AssertionError("unexpected resumed model call"))))
+        verifier = FakeVerifier()
+        adapter = _make_adapter(run["kind"], cfg, pool, st, verifier)
+        eng = engine.WorkflowEngine(st, run["store"], adapter,
+                                    emit=lambda *a: None)
+        eng.apply_pool(pool)
+        return {"base": run["base"], "project": run["project"],
+                "ws": run["ws"], "settings": cfg, "state": st,
+                "pool": pool, "verifier": verifier, "adapter": adapter,
+                "engine": eng, "store": run["store"]}
+
+    def _to_signoff(self, run, verifier_mode="pass"):
+        if verifier_mode == "fail_first":
+            run["verifier"].critic_verdicts = ["FAIL", "PASS"]
+        eng = run["engine"]
+        self.assertEqual(eng.step(), "paused", run["kind"])
+        self.assertEqual(run["state"].pause.reason, "spec_approval",
+                         run["kind"])
+        eng.approve_spec()
+        self.assertEqual(eng.step(), "paused", run["kind"])
+        self.assertEqual(run["state"].pause.reason,
+                         "architecture_approval", run["kind"])
+        eng.approve_architecture()
+        for _ in range(16):
+            result = eng.step()
+            if result in ("paused", "failed", "done"):
+                break
+        self.assertEqual(run["state"].phase, "SIGNOFF", run["kind"])
+        self.assertEqual(run["state"].pause.reason, "signoff_approval",
+                         run["kind"])
+        return run
+
+    def _finish(self, run):
+        eng = run["engine"]
+        eng.approve_signoff("reviewer", "D01 approved")
+        self.assertEqual(eng.run(), "done", run["kind"])
+        return run
+
+    @staticmethod
+    def _semantic_files(project):
+        import hashlib
+        out = {}
+        for path in sorted(project.rglob("*")):
+            if not path.is_file() or ".crew" in path.parts:
+                continue
+            rel = str(path.relative_to(project))
+            if rel == "project_memory.json":
+                continue
+            data = path.read_bytes()
+            out[rel] = hashlib.sha256(data).hexdigest()
+        return out
+
+    @staticmethod
+    def _journal(project):
+        out = []
+        root = project / ".crew" / "publish"
+        for path in sorted(root.glob("*/journal.json")):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            out.append({
+                "status": data.get("status"),
+                "durability": data.get("durability"),
+                "entries": [{k: e.get(k) for k in
+                             ("rel", "action", "old_sha", "new_sha")}
+                            for e in data.get("entries") or []
+                            if e.get("rel") != "project_memory.json"],
+            })
+        return out
+
+    def test_d01_normal_lifecycle(self):
+        outcomes = {}
+        for kind in ("factory", "native"):
+            run = self._start(kind)
+            self._to_signoff(run)
+            self._finish(run)
+            st = run["state"]
+            self.assertEqual(st.phase, "DONE", kind)
+            self.assertEqual(st.integration.get("verdict"), "PASS", kind)
+            self.assertEqual(st.visual.get("verdict"), "PASS", kind)
+            self.assertEqual(st.visual.get("vision", {}).get("verdict"),
+                             "PASS", kind)
+            self.assertTrue(st.signoff_approved(), kind)
+            self.assertEqual(st.extensions.get("publish", {}).get("status"),
+                             "COMMITTED", kind)
+            self.assertTrue((run["project"] / "index.html").is_file(), kind)
+            tasks = {t.id: t for t in st.tasks}
+            self.assertEqual(tasks["page"].status, "done", kind)
+            rec = st.verifications["page"]
+            self.assertEqual(rec.verdict, "PASS", kind)
+            self.assertEqual(rec.oracle.get("artifact_sha256"),
+                             s.artifact_hash((run["project"] / "index.html").read_text(
+                                 encoding="utf-8")), kind)
+            outcomes[kind] = run
+        ref, new = outcomes["factory"], outcomes["native"]
+        self.assertEqual(ref["state"].signoff_hash(),
+                         new["state"].signoff_hash())
+        self.assertEqual([a.artifact_hash for a in ref["state"].approvals
+                          if a.kind == "signoff"],
+                         [a.artifact_hash for a in new["state"].approvals
+                          if a.kind == "signoff"])
+        self.assertEqual(self._semantic_files(ref["project"]),
+                         self._semantic_files(new["project"]))
+        self.assertEqual(self._journal(ref["project"]),
+                         self._journal(new["project"]))
+        self.assertEqual(ref["pool"].calls, new["pool"].calls)
+        self.assertEqual(ref["pool"].transport, new["pool"].transport)
+        self.assertEqual([(a.model.model_id, a.outcome)
+                          for a in ref["state"].tasks[0].attempts],
+                         [(a.model.model_id, a.outcome)
+                          for a in new["state"].tasks[0].attempts])
+
+    def test_d01_failure_and_recovery_lifecycle(self):
+        outcomes = {}
+        for kind in ("factory", "native"):
+            run = self._start(kind)
+            self._to_signoff(run, verifier_mode="fail_first")
+            self.assertTrue(any("critic FAIL" in e
+                                for e in run["state"].tasks[0].errors), kind)
+            self.assertEqual([c["verdict"] for c in run["verifier"].critic_calls],
+                             ["FAIL", "PASS"], kind)
+            # Persist approval, then resume with fresh runtime objects.
+            run["engine"].approve_signoff("reviewer", "after recovery")
+            resumed = self._resume(run)
+            self.assertEqual(resumed["engine"].run(), "done", kind)
+            st = resumed["state"]
+            self.assertEqual(st.phase, "DONE", kind)
+            self.assertEqual(st.verifications["page"].verdict, "PASS", kind)
+            self.assertTrue(any("critic FAIL" in e
+                                for e in st.tasks[0].errors), kind)
+            self.assertEqual(resumed["pool"].calls, [], kind)
+            outcomes[kind] = resumed
+        self.assertEqual(self._semantic_files(outcomes["factory"]["project"]),
+                         self._semantic_files(outcomes["native"]["project"]))
+        self.assertEqual(self._journal(outcomes["factory"]["project"]),
+                         self._journal(outcomes["native"]["project"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
