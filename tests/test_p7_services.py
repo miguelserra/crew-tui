@@ -265,8 +265,8 @@ class NativeAdapterTests(unittest.TestCase):
     def test_verify_checkpoint_requires_pass(self):
         st = s.ProjectState(run_id="r", goal="x", engine_kind=s.ENGINE_UNIFIED,
                             profile="script")
-        st.tasks = [s.Task("a", kind="build", target_file="a.py"),
-                    s.Task("b", kind="build", target_file="b.py")]
+        st.tasks = [s.Task("a", kind="build", target_file="a.py", status="done"),
+                    s.Task("b", kind="build", target_file="b.py", status="done")]
         na = self._adapter(st)
         st.verifications = {
             "a": s.VerificationRecord(verdict="PASS"),

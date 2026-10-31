@@ -946,13 +946,12 @@ class ProjectState:
     def signoff_hash(self) -> str:
         return sha256_json(self.signoff_evidence())
 
-    def signoff_blockers(self) -> list[str]:
+    def verification_blockers(self) -> list[str]:
         blockers: list[str] = []
-        if not self.architecture_approved():
-            blockers.append("arquitetura não aprovada")
-        artifacts = self._signoff_artifacts()
-        build_tasks = [t for t in self.tasks if t.kind == "build"]
-        for task in sorted(build_tasks, key=lambda t: t.id):
+        has_root = bool(self.extensions.get("workspace_root") or self.project_root)
+        artifacts = self._signoff_artifacts() if has_root else {}
+        for task in sorted((t for t in self.tasks if t.kind == "build"),
+                           key=lambda t: t.id):
             if task.status not in ("done", "verified"):
                 blockers.append(f"tarefa incompleta: {task.id}")
             record = self.verifications.get(task.id)
@@ -960,17 +959,45 @@ class ProjectState:
                 blockers.append(f"verificação ausente: {task.id}")
             elif record.verdict == "FAIL":
                 blockers.append(f"verificação falhou: {task.id}")
+            elif record.verdict == "N/A":
+                blockers.append(f"verificação inválida: {task.id}")
             elif (record.verdict == "UNVERIFIED"
                   and not record.authorized_unverified):
                 blockers.append(f"verificação não autorizada: {task.id}")
+            if has_root:
+                artifact = artifacts.get(task.id)
+                if artifact in (None, "<missing>", "<escape>", "<no-root>",
+                                "<no-target>"):
+                    blockers.append(f"artefacto ausente: {task.id}")
+                elif record is not None:
+                    expected = (record.oracle or {}).get("artifact_sha256")
+                    if expected and str(expected) != str(artifact):
+                        blockers.append(f"evidência desatualizada: {task.id}")
+        return blockers
+
+    def stale_verification_tasks(self) -> list[str]:
+        if not (self.extensions.get("workspace_root") or self.project_root):
+            return []
+        artifacts = self._signoff_artifacts()
+        stale: list[str] = []
+        for task in sorted((t for t in self.tasks if t.kind == "build"),
+                           key=lambda t: t.id):
+            record = self.verifications.get(task.id)
             artifact = artifacts.get(task.id)
-            if artifact in (None, "<missing>", "<escape>", "<no-root>",
-                            "<no-target>"):
-                blockers.append(f"artefacto ausente: {task.id}")
-            elif record is not None:
-                expected = (record.oracle or {}).get("artifact_sha256")
-                if expected and str(expected) != str(artifact):
-                    blockers.append(f"evidência desatualizada: {task.id}")
+            if record is None or artifact in (None, "<missing>", "<escape>",
+                                              "<no-root>", "<no-target>"):
+                continue
+            expected = (record.oracle or {}).get("artifact_sha256")
+            if expected and str(expected) != str(artifact):
+                stale.append(task.id)
+        return stale
+
+    def signoff_blockers(self) -> list[str]:
+        blockers: list[str] = []
+        build_tasks = [t for t in self.tasks if t.kind == "build"]
+        if not self.architecture_approved():
+            blockers.append("arquitetura não aprovada")
+        blockers.extend(self.verification_blockers())
         integration = self.integration or {}
         verdict = integration.get("verdict")
         if not integration or not verdict:
@@ -986,6 +1013,13 @@ class ProjectState:
             blockers.append("visual falhou")
         elif visual_verdict == "UNVERIFIED":
             blockers.append("visual não verificado")
+        visual_hashes = (self.visual or {}).get("artifact_hashes") or {}
+        if visual_verdict == "PASS" and visual_hashes:
+            artifacts = self._signoff_artifacts()
+            for task in build_tasks:
+                expected = visual_hashes.get(task.target_file)
+                if expected and artifacts.get(task.id) != expected:
+                    blockers.append(f"visual desatualizado: {task.id}")
         if not self.signoff:
             blockers.append("sign-off não gerado")
         return blockers

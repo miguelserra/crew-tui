@@ -137,6 +137,54 @@ ADAPTER_PIPELINE = [
      "test_d09_05e_incomplete_integration_blocks_approval"),
     ("Adapteres D09: sem aprovação não há DONE nem publicação",
      "test_d09_05f_missing_approval_prevents_done_and_publish"),
+    ("Adapteres D10: SPEC persistida não regenera",
+     "test_d10_01a_spec_persisted_without_pause_does_not_regenerate"),
+    ("Adapteres D10: SPEC incompleta bloqueia sem modelo",
+     "test_d10_01b_incomplete_spec_pauses_without_model"),
+    ("Adapteres D10: SPEC aprovada avança sem regenerar",
+     "test_d10_01c_spec_approval_resume_advances_without_regeneration"),
+    ("Adapteres D10: ARCHITECTURE persistida não redesenha",
+     "test_d10_02a_architecture_persisted_without_approval_is_not_redesigned"),
+    ("Adapteres D10: SCAFFOLD idempotente preserva ficheiros",
+     "test_d10_03a_scaffold_is_idempotent_and_preserves_files"),
+    ("Adapteres D10: BUILD concluído não repete",
+     "test_d10_04a_completed_build_task_is_not_repeated"),
+    ("Adapteres D10: PAYG UNKNOWN bloqueia sem retry",
+     "test_d10_04b_payg_unknown_blocks_without_retry"),
+    ("Adapteres D10: VERIFY recupera evidência persistida",
+     "test_d10_05a_verify_resumes_persisted_evidence"),
+    ("Adapteres D10: VERIFY rejeita evidência em falta/stale",
+     "test_d10_05b_verify_rejects_missing_and_stale_evidence"),
+    ("Adapteres D10: INTEGRATE revalida ficheiro stale",
+     "test_d10_06a_integration_revalidates_stale_file_on_resume"),
+    ("Adapteres D10: INTEGRATE falhado bloqueia sign-off",
+     "test_d10_06b_integration_failure_blocks_signoff"),
+    ("Adapteres D10: VISUAL liga evidência ao artifact hash",
+     "test_d10_07a_visual_evidence_is_bound_to_artifact_hash"),
+    ("Adapteres D10: VISUAL indisponível bloqueia perfil",
+     "test_d10_07b_visual_unavailable_blocks_required_profile"),
+    ("Adapteres D10: aprovação de sign-off retoma sem regenerar",
+     "test_d10_08a_approved_signoff_resume_skips_generation"),
+    ("Adapteres D10: rejeição e aprovação sobrevivem a reload",
+     "test_d10_08b_rejection_then_approval_survives_reload"),
+    ("Adapteres D10: COMMITTED recuperado não repete publicação",
+     "test_d10_09a_recovered_committed_publication_is_not_repeated"),
+    ("Adapteres D10: ROLLED_BACK não é sucesso",
+     "test_d10_09b_rolled_back_journal_is_not_treated_as_success"),
+    ("Adapteres D10: dependências retomam só tarefa pendente",
+     "test_d10_10a_dependency_resume_runs_only_pending_task"),
+    ("Adapteres D10: crash real BUILD CONFIRMED antes de attempt",
+     "test_d10_11a_real_process_build_confirm_before_attempt"),
+    ("Adapteres D10: crash real BUILD attempt antes de consume",
+     "test_d10_11b_real_process_build_attempt_before_consume"),
+    ("Adapteres D10: crash real INTEGRATE fix antes de revalidação",
+     "test_d10_11c_real_process_integration_after_fix_before_revalidation"),
+    ("Adapteres D10: crash real SIGNOFF após aprovação",
+     "test_d10_11d_real_process_signoff_after_approval"),
+    ("Adapteres D10: crash real SIGNOFF após rejeição",
+     "test_d10_11e_real_process_signoff_after_rejection"),
+    ("Adapteres D10: crash real PUBLICATION com recovery pendente",
+     "test_d10_11f_real_process_publication_recovery_pending"),
     ("Adapteres D04: 429 -> fallback seguro",
      "test_d04_429_fallback_matches_across_adapters"),
     ("Adapteres D04: auth/connection/server -> fallback",
@@ -267,10 +315,10 @@ MATRIX = [
         "PUBLICATION": ("COVERED", "no publish before approval; approved run publishes COMMITTED with equal status/entries/durability and approval bound to the evidence/artifact hash"),
     }),
     ("D10", "Interruption and resume", {
-        "EXECUTION": ("PARTIAL", "resume after BUILD only"),
-        "MODELS_BILLING_LEDGER": ("PARTIAL", "no adapter ledger parity across resume"),
-        "VERIFICATION": ("PARTIAL", "no interruption in VERIFY/INTEGRATE/VISUAL/SIGNOFF"),
-        "PUBLICATION": ("PARTIAL", "publisher recovery separate from adapter resume"),
+        "EXECUTION": ("COVERED", "phase-specific and cross-phase resume plus six real subprocess crash/restart cases through both adapters"),
+        "MODELS_BILLING_LEDGER": ("COVERED", "real Router/Chain/ledger; CONFIRMED replay without new calls, attempt de-duplication, PAYG UNKNOWN blocks with one call"),
+        "VERIFICATION": ("COVERED", "artifact-hash freshness, missing/stale evidence, integration revalidation, visual evidence binding and sign-off gates"),
+        "PUBLICATION": ("COVERED", "COMMITTED recovered without repetition, ROLLED_BACK not success, RECOVERY_REQUIRED blocks DONE; full publisher crash parity remains D11/D12"),
     }),
     ("D11", "Publication conflict and recovery", {
         "EXECUTION": ("COVERED", "publication parity/conflict sandbox"),
@@ -367,9 +415,12 @@ def run_safety() -> list[tuple[str, str, str, str]]:
 def run_adapter_pipeline() -> list[tuple[str, str, str, str]]:
     rows = []
     for label, method in ADAPTER_PIPELINE:
-        class_name = ("D09SignoffPipelineTests"
-                      if method.startswith("test_d09_")
-                      else "AdapterPipelineTests")
+        if method.startswith("test_d09_"):
+            class_name = "D09SignoffPipelineTests"
+        elif method.startswith("test_d10_"):
+            class_name = "D10ResumePipelineTests"
+        else:
+            class_name = "AdapterPipelineTests"
         status = _run_one("tests.test_p7_pipeline_adapters",
                           class_name, method)
         rows.append((label, f"{class_name}.{method}", "", status))

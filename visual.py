@@ -10,7 +10,7 @@ from typing import Any
 import verify as verify_policy
 import native_util
 from router import RouteRequest
-from state import ProjectState, Task
+from state import ProjectState, Task, artifact_hash
 
 
 def playwright_audit(root: Path, logs_dir: Path, page: str = "index.html",
@@ -104,6 +104,7 @@ class VisualService:
                 if report.get("screenshot"):
                     vision = self._review(project, Path(report["screenshot"]))
                     report["vision"] = vision
+        report["artifact_hashes"] = self._artifact_hashes(project, root)
         project.visual = report
         v = verify_policy.normalize_verdict(vision.get("verdict", verify_policy.NA))
         audit = verify_policy.normalize_verdict(report.get("verdict"))
@@ -115,6 +116,23 @@ class VisualService:
             ok = bool(self.settings.allow_unverified) and audit != verify_policy.FAIL
         self.emit("VISUAL", f"audit {report.get('verdict')} · vision {v}")
         return ok
+
+
+    @staticmethod
+    def _artifact_hashes(project: ProjectState, root: Path) -> dict[str, str]:
+        hashes: dict[str, str] = {}
+        for task in project.tasks:
+            rel = task.target_file
+            if not rel.endswith((".html", ".htm", ".css", ".js", ".mjs")):
+                continue
+            path = (root / rel).resolve()
+            try:
+                path.relative_to(root.resolve())
+            except ValueError:
+                continue
+            if path.is_file():
+                hashes[rel] = artifact_hash(path.read_text(encoding="utf-8"))
+        return hashes
 
     def _review(self, project: ProjectState, png: Path) -> dict[str, Any]:
         try:

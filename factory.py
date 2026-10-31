@@ -786,9 +786,14 @@ Output only the test file in one fenced block tagged python."""
     # -- step 6-7: integration --------------------------------------------- #
 
     def step_integrate(self) -> bool:
+        if not self._revalidate_stale_integration():
+            return False
         entry = self._entrypoint()
         if entry is None:
-            self.state.integration = {"verdict": "SKIP", "note": "sem entrypoint detetável"}
+            fixes = list(self.state.integration.get("fix_records") or [])
+            self.state.integration = {"verdict": "SKIP",
+                                      "note": "sem entrypoint detetável",
+                                      "fix_records": fixes}
             self.log("integrate", "sem entrypoint detetável")
             self.emit("INTEG", "sem entrypoint detetável — verificação estática apenas")
             return True
@@ -890,6 +895,49 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
             self.emit("INTEG", "revalidação do fixer falhou — integração bloqueada")
             return False
         return written > 0
+
+
+    def _stale_integration_tasks(self) -> list[TaskState]:
+        stale = []
+        for task in sorted(self.state.tasks, key=lambda t: t.id):
+            if not task.verification:
+                continue
+            rec = task.verification.get("oracle") or {}
+            expected = rec.get("artifact_sha256")
+            if not expected:
+                continue
+            path = self._safe(task.target_file)
+            if path is None or not path.is_file():
+                continue
+            if artifact_hash(path.read_text(encoding="utf-8")) != expected:
+                stale.append(task)
+        return stale
+
+    def _revalidate_stale_integration(self) -> bool:
+        stale = self._stale_integration_tasks()
+        if not stale:
+            return True
+        revalidations = []
+        for task in stale:
+            model = self.pool.last_attempt_model.get(task.id)
+            if model is None and task.delivered_by:
+                model = ModelRef.from_dict(task.delivered_by)
+            if model is None:
+                model = unknown_ref()
+            revalidations.append(self._revalidate_integration(task, model))
+        if revalidations:
+            self.state.integration.setdefault("fix_records", []).append({
+                "call_id": new_id("recfix_"),
+                "task_ids": sorted(t.id for t in stale),
+                "files": sorted(t.target_file for t in stale),
+                "outcome": "recovered",
+                "revalidations": revalidations,
+                "at": _now(),
+            })
+        if revalidations and not all(r.get("delivered") for r in revalidations):
+            self.emit("INTEG", "evidência desatualizada não revalidou")
+            return False
+        return True
 
     def _revalidate_integration(self, task: TaskState,
                                 model: ModelRef) -> dict[str, Any]:
@@ -1030,6 +1078,14 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
                 if report.get("screenshot"):
                     vision = self._vision_review(Path(report["screenshot"]))
                     report["vision"] = vision
+        report["artifact_hashes"] = {}
+        for task in self.state.tasks:
+            if not task.target_file.endswith((".html", ".htm", ".css", ".js", ".mjs")):
+                continue
+            path = self._safe(task.target_file)
+            if path is not None and path.is_file():
+                report["artifact_hashes"][task.target_file] = artifact_hash(
+                    path.read_text(encoding="utf-8"))
         self.state.visual = report
         self.log("visual", json.dumps(report, ensure_ascii=False)[:8000])
         self.save()

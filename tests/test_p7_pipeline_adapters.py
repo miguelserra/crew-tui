@@ -11,6 +11,8 @@ missing/non-replayable artifacts, and history deduplication.
 """
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -210,6 +212,7 @@ class PipelinePool:
         self.last_response = None
         self.task_order = []
         self.crash_after_confirm = False
+        self.crash_after_confirm_exit = False
         self.request_overrides = None
         self.registry = make_registry(registry_mode)
 
@@ -266,6 +269,8 @@ class PipelinePool:
         self.last_response = response
         if self.crash_after_confirm:
             self.crash_after_confirm = False
+            if self.crash_after_confirm_exit:
+                os._exit(71)
             raise SimulatedCrash("after ledger confirm, before attempt")
         text = getattr(response, "content", response)
         text = text if isinstance(text, str) else str(text)
@@ -1481,6 +1486,508 @@ class D09SignoffPipelineTests(unittest.TestCase):
             self.assertNotIn("publish", run["state"].extensions, kind)
             self.assertFalse(any(a.kind == "signoff"
                                  for a in run["state"].approvals), kind)
+
+
+@unittest.skipUnless(DEPS_OK, f"runtime deps missing: {DEPS_ERR}")
+class D10ResumePipelineTests(unittest.TestCase):
+    """D10: workflow-level resume and recovery across phases."""
+
+    def _base(self, phase="BUILD", *, approved=True, profile="script",
+              tasks=None, files=None, architecture=True, requirements=True):
+        base = Path(tempfile.mkdtemp(prefix=f"d10-{phase.lower()}-"))
+        project = base / "project"; project.mkdir()
+        ws = base / "ws"
+        st = s.ProjectState(run_id="r", project_root=str(project), goal="demo",
+                            engine_kind=s.ENGINE_UNIFIED, phase=phase,
+                            profile=profile)
+        if requirements:
+            st.requirements = s.RequirementContract(
+                objective="demo",
+                acceptance=[s.AcceptanceCriterion(id="ac1", text="runs")])
+        if architecture:
+            st.architecture = s.ArchitectureContract(
+                approach="script", modules=[{"path": "app.py"}],
+                interfaces=[{"name": "main", "file": "app.py"}])
+            st.tasks = tasks or [
+                s.Task("a", kind="build", target_file="app.py",
+                       acceptance=["runs"], requirement_ids=["ac1"])]
+        for rel, content in (files or {}).items():
+            path = project / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        st.extensions["workspace_root"] = str(ws)
+        if approved and architecture:
+            st.approve_architecture()
+        cfg = settings(base)
+        store = StateManager(cfg.workspace_dir, cfg.log_dir)
+        store.save_project(st)
+        return {"base": base, "project": project, "ws": ws, "settings": cfg,
+                "state": st, "store": store}
+
+    def _engine(self, kind, run, *, responder=None, verifier=None,
+                visual_check=False):
+        cfg = settings(run["base"])
+        cfg.max_verify_loops = 1
+        cfg.visual_check = visual_check
+        st = run["store"].load_project(
+            run["store"].project_state_path(run["state"].project_root))
+        if responder is None:
+            def responder(ref, messages):
+                raise AssertionError("unexpected model call")
+        pool = PipelinePool({}, responder=responder)
+        verifier = verifier or FakeVerifier()
+        adapter = _make_adapter(kind, cfg, pool, st, verifier)
+        eng = engine.WorkflowEngine(st, run["store"], adapter,
+                                    emit=lambda *a: None)
+        eng.apply_pool(pool)
+        return {"kind": kind, "base": run["base"], "project": run["project"],
+                "ws": run["ws"], "settings": cfg, "state": st, "pool": pool,
+                "verifier": verifier, "adapter": adapter, "engine": eng}
+
+    @staticmethod
+    def _verification(st, rel, content):
+        return s.VerificationRecord(
+            verdict="PASS",
+            oracle={"passed": True,
+                    "artifact_sha256": s.artifact_hash(content)})
+
+    def _assert_persisted_blocker(self, st, text):
+        self.assertTrue(any(text in b for b in st.verification_blockers()), st)
+
+    def test_d10_01a_spec_persisted_without_pause_does_not_regenerate(self):
+        for kind in ("factory", "native"):
+            run = self._base("SPEC", architecture=False, tasks=[])
+            eng = self._engine(kind, run)["engine"]
+            self.assertEqual(eng.step(), "paused", kind)
+            st = eng.state
+            self.assertEqual(st.phase, "SPEC", kind)
+            self.assertEqual(st.pause.reason, "spec_approval", kind)
+
+    def test_d10_01b_incomplete_spec_pauses_without_model(self):
+        for kind in ("factory", "native"):
+            run = self._base("SPEC", architecture=False, tasks=[])
+            run["state"].requirements.open_questions = ["which database?"]
+            run["store"].save_project(run["state"])
+            eng = self._engine(kind, run)["engine"]
+            self.assertEqual(eng.step(), "paused", kind)
+            self.assertEqual(eng.state.pause.reason, "spec_questions", kind)
+
+    def test_d10_02a_architecture_persisted_without_approval_is_not_redesigned(self):
+        for kind in ("factory", "native"):
+            run = self._base("ARCHITECTURE", approved=False)
+            before = [t.to_dict() for t in run["state"].tasks]
+            eng = self._engine(kind, run)["engine"]
+            self.assertEqual(eng.step(), "paused", kind)
+            st = eng.state
+            self.assertEqual(st.pause.reason, "architecture_approval", kind)
+            self.assertEqual([t.to_dict() for t in st.tasks], before, kind)
+
+    def test_d10_03a_scaffold_is_idempotent_and_preserves_files(self):
+        for kind in ("factory", "native"):
+            run = self._base("SCAFFOLD", files={"app.py": "keep\n"})
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            first = (run["ws"] / "app.py").read_text(encoding="utf-8")
+            st = eng["state"]
+            manifest = dict(st.scaffold)
+            st.phase = "SCAFFOLD"
+            run["store"].save_project(st)
+            eng2 = self._engine(kind, run)
+            self.assertEqual(eng2["engine"].step(), "ok", kind)
+            self.assertEqual((run["ws"] / "app.py").read_text(encoding="utf-8"),
+                             first, kind)
+            self.assertEqual(first, "keep\n", kind)
+            self.assertEqual(eng2["state"].scaffold, manifest, kind)
+
+    def test_d10_04a_completed_build_task_is_not_repeated(self):
+        content = "print('ok')\n"
+        for kind in ("factory", "native"):
+            run = self._base("BUILD", files={"app.py": content})
+            run["state"].tasks[0].status = "done"
+            run["state"].verifications["a"] = self._verification(
+                run["state"], "app.py", content)
+            run["store"].save_project(run["state"])
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            st = eng["state"]
+            self.assertEqual(st.phase, "VERIFY", kind)
+            self.assertEqual(eng["pool"].calls, [], kind)
+            self.assertEqual(len(st.tasks[0].attempts), 0, kind)
+
+    def test_d10_05a_verify_resumes_persisted_evidence(self):
+        content = "print('ok')\n"
+        for kind in ("factory", "native"):
+            run = self._base("VERIFY", files={"app.py": content})
+            run["state"].tasks[0].status = "done"
+            run["state"].verifications["a"] = self._verification(
+                run["state"], "app.py", content)
+            run["store"].save_project(run["state"])
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            self.assertEqual(eng["state"].phase, "INTEGRATE", kind)
+            self.assertEqual(eng["pool"].calls, [], kind)
+
+    def test_d10_05b_verify_rejects_missing_and_stale_evidence(self):
+        for kind in ("factory", "native"):
+            run = self._base("VERIFY", files={"app.py": "new\n"})
+            run["state"].tasks[0].status = "done"
+            run["store"].save_project(run["state"])
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "failed", kind)
+            self.assertEqual(eng["state"].pause.reason, "verify_failed", kind)
+
+            run = self._base("VERIFY", files={"app.py": "new\n"})
+            run["state"].tasks[0].status = "done"
+            run["state"].verifications["a"] = s.VerificationRecord(
+                verdict="PASS",
+                oracle={"passed": True,
+                        "artifact_sha256": s.artifact_hash("old\n")})
+            run["store"].save_project(run["state"])
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "failed", kind)
+            st = eng["state"]
+            self.assertEqual(st.pause.reason, "verify_failed", kind)
+            self._assert_persisted_blocker(st, "evidência desatualizada")
+
+    def test_d10_06a_integration_revalidates_stale_file_on_resume(self):
+        content = "print('fixed')\n"
+        for kind in ("factory", "native"):
+            run = self._base("INTEGRATE", files={"app.py": content})
+            run["state"].tasks[0].status = "done"
+            run["state"].verifications["a"] = s.VerificationRecord(
+                verdict="PASS",
+                oracle={"passed": True,
+                        "artifact_sha256": s.artifact_hash("old\n")})
+            run["store"].save_project(run["state"])
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            st = eng["state"]
+            self.assertEqual(st.integration.get("verdict"), "PASS", kind)
+            self.assertEqual(st.phase, "SIGNOFF", kind)
+            self.assertEqual(eng["pool"].calls, [], kind)
+            rec = st.verifications["a"]
+            self.assertEqual(rec.oracle.get("artifact_sha256"),
+                             s.artifact_hash(content), kind)
+            fixes = st.integration.get("fix_records") or []
+            self.assertTrue(any(f.get("outcome") == "recovered" for f in fixes),
+                            kind)
+
+    def test_d10_07a_visual_evidence_is_bound_to_artifact_hash(self):
+        import visual as visual_mod
+        old_native_audit = visual_mod.playwright_audit
+        try:
+            visual_mod.playwright_audit = lambda root, logs, **k: {
+                "verdict": "PASS", "screenshot": ""}
+            for kind in ("factory", "native"):
+                run = self._base(
+                    "VISUAL", profile="web",
+                    tasks=[s.Task("a", kind="build", target_file="index.html",
+                                  acceptance=["renders"], requirement_ids=["ac1"])],
+                    files={"index.html": "<html>ok</html>\n"})
+                run["state"].tasks[0].status = "done"
+                run["state"].verifications["a"] = self._verification(
+                    run["state"], "index.html", "<html>ok</html>\n")
+                run["store"].save_project(run["state"])
+                eng = self._engine(kind, run, visual_check=True)
+                if kind == "factory":
+                    eng["adapter"].factory.playwright_audit = lambda root: {
+                        "verdict": "PASS", "screenshot": ""}
+                self.assertEqual(eng["engine"].step(), "ok", kind)
+                st = eng["state"]
+                hashes = st.visual.get("artifact_hashes") or {}
+                self.assertEqual(hashes.get("index.html"),
+                                 s.artifact_hash("<html>ok</html>\n"), kind)
+                (run["ws"] / "index.html").write_text("<html>changed</html>\n",
+                                                      encoding="utf-8")
+                self.assertTrue(any("visual desatualizado" in b
+                                    for b in st.signoff_blockers()), kind)
+        finally:
+            visual_mod.playwright_audit = old_native_audit
+
+    def test_d10_08a_approved_signoff_resume_skips_generation(self):
+        content = "print('ok')\n"
+        for kind in ("factory", "native"):
+            run = self._base("SIGNOFF", files={"app.py": content})
+            seed = self._engine(kind, run)
+            st = seed["state"]
+            st.tasks[0].status = "done"
+            st.verifications["a"] = self._verification(st, "app.py", content)
+            st.integration = {"verdict": "PASS", "kind": "python", "exit": 0}
+            st.visual = {"verdict": "N/A"}
+            st.signoff = {"goal": "demo"}
+            st.approve_signoff("reviewer", "checked")
+            run["store"].save_project(st)
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            self.assertEqual(eng["state"].phase, "DONE", kind)
+            self.assertEqual(eng["pool"].calls, [], kind)
+            self.assertIn("publish", eng["state"].extensions, kind)
+
+    def test_d10_09a_recovered_committed_publication_is_not_repeated(self):
+        content = "print('ok')\n"
+        for kind in ("factory", "native"):
+            run = self._base("SIGNOFF", files={"app.py": content})
+            seed = self._engine(kind, run)
+            st = seed["state"]
+            st.tasks[0].status = "done"
+            st.verifications["a"] = self._verification(st, "app.py", content)
+            st.integration = {"verdict": "PASS", "kind": "python", "exit": 0}
+            st.visual = {"verdict": "N/A"}
+            st.signoff = {"goal": "demo"}
+            st.approve_signoff("reviewer", "checked")
+            run["store"].save_project(st)
+            eng = self._engine(kind, run)
+            first = eng["adapter"].publish()
+            self.assertEqual(first.get("status"), "COMMITTED", kind)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            self.assertEqual(eng["state"].phase, "DONE", kind)
+            recovered = eng["state"].extensions.get("publish") or {}
+            self.assertEqual(recovered.get("id"), first.get("id"), kind)
+            self.assertEqual(eng["pool"].calls, [], kind)
+
+    def _worker(self, mode, kind):
+        base = Path(tempfile.mkdtemp(prefix=f"d10-{mode}-{kind}-"))
+        worker = Path(__file__).resolve().parent / "d10_crash_worker.py"
+        proc = subprocess.run([sys.executable, str(worker), mode, kind,
+                               str(base)], cwd=str(Path(__file__).resolve().parents[1]),
+                              capture_output=True, text=True, timeout=90)
+        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        cfg = settings(base)
+        store = StateManager(cfg.workspace_dir, cfg.log_dir)
+        project = base / "project"
+        st = store.load_project(store.project_state_path(project))
+        return {"base": base, "project": project, "ws": base / "ws",
+                "settings": cfg, "state": st, "store": store}
+
+    def test_d10_11a_real_process_build_confirm_before_attempt(self):
+        for kind in ("factory", "native"):
+            run = self._worker("build-confirm", kind)
+            self.assertEqual(run["state"].phase, "BUILD", kind)
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            self.assertEqual(eng["pool"].calls, [], kind)
+            self.assertEqual(len(eng["state"].tasks[0].attempts), 1, kind)
+            self.assertTrue(eng["engine"].call_ledger.all()[0].consumed, kind)
+
+    def test_d10_11b_real_process_build_attempt_before_consume(self):
+        for kind in ("factory", "native"):
+            run = self._worker("build-consume", kind)
+            self.assertEqual(run["state"].phase, "BUILD", kind)
+            self.assertEqual(len(run["state"].tasks[0].attempts), 1, kind)
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            self.assertEqual(eng["pool"].calls, [], kind)
+            self.assertEqual(len(eng["state"].tasks[0].attempts), 1, kind)
+            call_id = eng["state"].tasks[0].attempts[0].call_id
+            self.assertTrue(eng["engine"].call_ledger.get(call_id).consumed, kind)
+
+    def test_d10_11c_real_process_integration_after_fix_before_revalidation(self):
+        for kind in ("factory", "native"):
+            run = self._worker("integrate-fix", kind)
+            self.assertEqual(run["state"].phase, "INTEGRATE", kind)
+            self.assertEqual(run["state"].verifications["a"].oracle.get(
+                "artifact_sha256"), s.artifact_hash("raise RuntimeError('boom')\n"), kind)
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            st = eng["state"]
+            self.assertEqual(st.integration.get("verdict"), "PASS", kind)
+            self.assertEqual(st.verifications["a"].oracle.get("artifact_sha256"),
+                             s.artifact_hash("print('fixed')\n"), kind)
+            self.assertEqual(eng["pool"].calls, [], kind)
+            self.assertTrue(any(f.get("outcome") == "recovered"
+                                for f in st.integration.get("fix_records") or []),
+                            kind)
+
+    def test_d10_11d_real_process_signoff_after_approval(self):
+        for kind in ("factory", "native"):
+            run = self._worker("signoff-approve", kind)
+            self.assertEqual(run["state"].phase, "SIGNOFF", kind)
+            self.assertTrue(run["state"].signoff_approved(), kind)
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            self.assertEqual(eng["state"].phase, "DONE", kind)
+            self.assertEqual(eng["pool"].calls, [], kind)
+            self.assertIn("publish", eng["state"].extensions, kind)
+
+    def test_d10_11e_real_process_signoff_after_rejection(self):
+        for kind in ("factory", "native"):
+            run = self._worker("signoff-reject", kind)
+            self.assertEqual(run["state"].phase, "SIGNOFF", kind)
+            self.assertEqual(run["state"].pause.reason,
+                             "signoff_rejected", kind)
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "paused", kind)
+            self.assertEqual(eng["state"].phase, "SIGNOFF", kind)
+            self.assertEqual(eng["pool"].calls, [], kind)
+            self.assertTrue(any(a.decision == "rejected"
+                                for a in eng["state"].approvals
+                                if a.kind == "signoff"), kind)
+
+    def test_d10_11f_real_process_publication_recovery_pending(self):
+        for kind in ("factory", "native"):
+            run = self._worker("publication-pending", kind)
+            self.assertTrue(run["state"].signoff_approved(), kind)
+            eng = self._engine(kind, run)
+            try:
+                result = eng["engine"].step()
+            except (engine.EngineError, native_adapter.NativeAdapterError):
+                result = "raised"
+            self.assertIn(result, ("failed", "raised"), kind)
+            self.assertEqual(eng["state"].phase, "SIGNOFF", kind)
+            self.assertNotEqual(eng["state"].phase, "DONE", kind)
+            self.assertNotIn("publish", eng["state"].extensions, kind)
+
+    def test_d10_01c_spec_approval_resume_advances_without_regeneration(self):
+        for kind in ("factory", "native"):
+            run = self._base("SPEC", architecture=False, tasks=[])
+            run["state"].approvals.append(s.Approval(
+                kind="spec", artifact_hash=run["state"].requirements.content_hash(),
+                decision="approved", timestamp=s.utc_now()))
+            run["store"].save_project(run["state"])
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            self.assertEqual(eng["state"].phase, "ARCHITECTURE", kind)
+            self.assertEqual(eng["pool"].calls, [], kind)
+
+    def test_d10_04b_payg_unknown_blocks_without_retry(self):
+        script = {"gemini-3.1-pro-preview": "timeout"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high", registry_mode="payg_first")
+            self.assertEqual(run["result"], "failed", kind)
+            calls = list(run["pool"].calls)
+            run["state"].pause = s.PauseState()
+            self.assertEqual(run["engine"].step(), "paused", kind)
+            self.assertEqual(run["state"].pause.reason,
+                             "call_unknown_failed", kind)
+            self.assertEqual(run["pool"].calls, calls, kind)
+            self.assertEqual(len(calls), 1, kind)
+
+    def test_d10_06b_integration_failure_blocks_signoff(self):
+        for kind in ("factory", "native"):
+            run = self._base("INTEGRATE", files={
+                "app.py": "raise RuntimeError('boom')\n"})
+            run["state"].tasks[0].status = "done"
+            run["state"].verifications["a"] = self._verification(
+                run["state"], "app.py", "raise RuntimeError('boom')\n")
+            run["store"].save_project(run["state"])
+
+            def responder(ref, messages):
+                return ""
+
+            eng = self._engine(kind, run, responder=responder)
+            self.assertEqual(eng["engine"].step(), "failed", kind)
+            self.assertEqual(eng["state"].pause.reason,
+                             "integrate_failed", kind)
+            self.assertNotEqual(eng["state"].phase, "SIGNOFF", kind)
+
+    def test_d10_07b_visual_unavailable_blocks_required_profile(self):
+        import visual as visual_mod
+        old = visual_mod.playwright_audit
+        try:
+            visual_mod.playwright_audit = lambda root, logs, **k: {
+                "verdict": "UNAVAILABLE", "note": "playwright unavailable",
+                "screenshot": ""}
+            for kind in ("factory", "native"):
+                run = self._base(
+                    "VISUAL", profile="web",
+                    tasks=[s.Task("a", kind="build", target_file="index.html",
+                                  acceptance=["renders"], requirement_ids=["ac1"])],
+                    files={"index.html": "<html>ok</html>\n"})
+                run["state"].tasks[0].status = "done"
+                run["state"].verifications["a"] = self._verification(
+                    run["state"], "index.html", "<html>ok</html>\n")
+                run["store"].save_project(run["state"])
+                eng = self._engine(kind, run, visual_check=True)
+                if kind == "factory":
+                    eng["adapter"].factory.playwright_audit = lambda root: {
+                        "verdict": "UNAVAILABLE", "note": "unavailable",
+                        "screenshot": ""}
+                self.assertEqual(eng["engine"].step(), "failed", kind)
+                self.assertEqual(eng["state"].pause.reason,
+                                 "visual_failed", kind)
+        finally:
+            visual_mod.playwright_audit = old
+
+    def test_d10_08b_rejection_then_approval_survives_reload(self):
+        content = "print('ok')\n"
+        for kind in ("factory", "native"):
+            run = self._base("SIGNOFF", files={"app.py": content})
+            seed = self._engine(kind, run)
+            st = seed["state"]
+            st.tasks[0].status = "done"
+            st.verifications["a"] = self._verification(st, "app.py", content)
+            st.integration = {"verdict": "PASS", "kind": "python", "exit": 0}
+            st.visual = {"verdict": "N/A"}
+            st.signoff = {"goal": "demo"}
+            run["store"].save_project(st)
+            eng = self._engine(kind, run)
+            eng["engine"].reject_signoff("human", "not ready")
+            run["store"].save_project(eng["state"])
+            eng2 = self._engine(kind, run)
+            self.assertEqual(eng2["engine"].step(), "paused", kind)
+            eng2["engine"].approve_signoff("reviewer", "ready")
+            run["store"].save_project(eng2["state"])
+            eng3 = self._engine(kind, run)
+            self.assertEqual(eng3["engine"].step(), "ok", kind)
+            decisions = [a for a in eng3["state"].approvals
+                         if a.kind == "signoff"]
+            self.assertEqual([a.decision for a in decisions],
+                             ["rejected", "approved"], kind)
+            self.assertEqual(eng3["pool"].calls, [], kind)
+
+    def test_d10_09b_rolled_back_journal_is_not_treated_as_success(self):
+        content = "print('ok')\n"
+        for kind in ("factory", "native"):
+            run = self._base("SIGNOFF", files={"app.py": content})
+            seed = self._engine(kind, run)
+            st = seed["state"]
+            st.tasks[0].status = "done"
+            st.verifications["a"] = self._verification(st, "app.py", content)
+            st.integration = {"verdict": "PASS", "kind": "python", "exit": 0}
+            st.visual = {"verdict": "N/A"}
+            st.signoff = {"goal": "demo"}
+            st.approve_signoff("reviewer", "checked")
+            run["store"].save_project(st)
+            old_dir = run["project"] / ".crew" / "publish" / "old-rollback"
+            old_dir.mkdir(parents=True, exist_ok=True)
+            (old_dir / "journal.json").write_text(
+                '{"id":"old-rollback","status":"ROLLED_BACK","entries":[]}',
+                encoding="utf-8")
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            self.assertEqual(eng["state"].phase, "DONE", kind)
+            published = eng["state"].extensions.get("publish") or {}
+            self.assertEqual(published.get("status"), "COMMITTED", kind)
+            self.assertNotEqual(published.get("id"), "old-rollback", kind)
+            journal = (old_dir / "journal.json").read_text(encoding="utf-8")
+            self.assertIn("ROLLED_BACK", journal, kind)
+
+    def test_d10_10a_dependency_resume_runs_only_pending_task(self):
+        content = "print('ok')\n"
+        tasks = [
+            s.Task("a", kind="build", target_file="app.py",
+                   acceptance=["runs"], requirement_ids=["ac1"]),
+            s.Task("b", kind="build", target_file="util.py",
+                   acceptance=["runs"], requirement_ids=["ac1"]),
+        ]
+        for kind in ("factory", "native"):
+            run = self._base("BUILD", files={"app.py": content,
+                                             "util.py": "x = 1\n"},
+                             tasks=tasks)
+            run["state"].tasks[0].status = "done"
+            run["state"].verifications["a"] = self._verification(
+                run["state"], "app.py", content)
+            run["store"].save_project(run["state"])
+
+            def responder(ref, messages):
+                return "```python\nx = 2\n```"
+
+            eng = self._engine(kind, run, responder=responder)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            st = eng["state"]
+            self.assertEqual(eng["pool"].task_order, ["b"], kind)
+            self.assertEqual(st.tasks[0].status, "done", kind)
+            self.assertEqual(st.tasks[1].status, "done", kind)
 
 
 if __name__ == "__main__":

@@ -381,9 +381,22 @@ class WorkflowEngine:
             self.state.phase = self.next_phase("ARCHITECTURE")
             self.save()
             return "ok"
+        if phase == "SPEC" and self.state.requirements.objective:
+            questions = self.state.requirements.open_questions
+            if questions and not self.state.requirements.answers:
+                self._pause("spec_questions", "; ".join(questions[:5]))
+            else:
+                self._pause("spec_approval", "contrato de requisitos pronto")
+            return "paused"
+
         if phase == "SPEC":
             self.spec_step()
             return "paused" if self.state.pause.reason else "ok"
+
+        if (phase == "ARCHITECTURE" and _has_architecture(self.state)
+                and self.state.tasks and not self.state.architecture_approved()):
+            self._pause("architecture_approval", self.state.architecture_hash())
+            return "paused"
 
         if phase == "ARCHITECTURE":
             ok = self.adapter.step("ARCHITECTURE")
@@ -421,8 +434,14 @@ class WorkflowEngine:
             except StateValidationError as exc:
                 raise EngineError(f"grafo de tarefas inválido: {exc}") from exc
 
-        ok = self.adapter.step(phase)
-        self.adapter.sync_to_project()
+        if phase == "SIGNOFF" and self.state.signoff_approved():
+            ensure = getattr(self.adapter, "_ensure_ready", None)
+            if ensure is not None:
+                ensure()
+            ok = True
+        else:
+            ok = self.adapter.step(phase)
+            self.adapter.sync_to_project()
         if not ok:
             self._pause(f"{phase.lower()}_failed")
             return "failed"
@@ -786,16 +805,9 @@ class FactoryAdapter:
         if self.project.profile == "review":
             return True
         build_tasks = [t for t in self.project.tasks if t.kind == "build"]
-        missing = [t.id for t in build_tasks if t.id not in self.project.verifications]
-        bad = [t.id for t in build_tasks
-               if self.project.verifications.get(t.id)
-               and self.project.verifications[t.id].verdict == "FAIL"]
-        unverified = [t.id for t in build_tasks
-                      if self.project.verifications.get(t.id)
-                      and self.project.verifications[t.id].verdict == "UNVERIFIED"]
-        if missing or bad or (unverified and not self.settings.allow_unverified):
-            detail = f"missing={missing} fail={bad} unverified={unverified}"
-            self.emit("VERIFY", f"checkpoint bloqueado: {detail}")
+        blockers = self.project.verification_blockers()
+        if blockers:
+            self.emit("VERIFY", "checkpoint bloqueado: " + "; ".join(blockers))
             return False
         self.emit("VERIFY", f"checkpoint OK ({len(build_tasks)} tarefas)")
         return True
@@ -812,6 +824,8 @@ class FactoryAdapter:
         if returned and returned.get("status") in ("RECOVERY_REQUIRED",
                                                    "REVALIDATION_REQUIRED"):
             raise PublishConflict("recuperação de publicação pendente")
+        if returned and returned.get("status") == "COMMITTED":
+            return returned
         manifest = validate_workspace_integrity(
             self.project.project_root, self.workspace_root, origin,
             self.rules, self.project.architecture.deletions)

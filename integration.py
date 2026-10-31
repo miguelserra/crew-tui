@@ -46,9 +46,14 @@ class IntegrationService:
 
     def integrate(self, project: ProjectState, workspace_root: str | Path) -> bool:
         root = Path(workspace_root).expanduser().resolve()
+        if not self._revalidate_stale(project, root):
+            return False
         entry = self._entrypoint(root)
         if entry is None:
-            project.integration = {"verdict": "SKIP", "note": "sem entrypoint detetável"}
+            fixes = list(project.integration.get("fix_records") or [])
+            project.integration = {"verdict": "SKIP",
+                                   "note": "sem entrypoint detetável",
+                                   "fix_records": fixes}
             self.emit("INTEG", "sem entrypoint detetável — verificação estática apenas")
             return True
         kind, path = entry
@@ -201,6 +206,41 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
             self.emit("INTEG", "revalidação do fixer falhou — integração bloqueada")
             return False
         return written > 0
+
+
+    def _stale_model(self, task: Task) -> Any:
+        model = self.pool.last_attempt_model.get(task.id)
+        if model is None:
+            model = task.delivered_by
+        if model is None:
+            from registry import unknown_ref
+            model = unknown_ref()
+        return model
+
+    def _revalidate_stale(self, project: ProjectState, root: Path) -> bool:
+        stale = set(project.stale_verification_tasks())
+        if not stale:
+            return True
+        revalidations = []
+        for task in project.tasks:
+            if task.id in stale:
+                revalidations.append(self._revalidate(
+                    project, root, task, self._stale_model(task)))
+        if revalidations:
+            project.integration.setdefault("fix_records", []).append({
+                "call_id": new_id("recfix_"),
+                "task_ids": sorted(t.id for t in project.tasks
+                                   if t.id in stale),
+                "files": sorted(t.target_file for t in project.tasks
+                                if t.id in stale),
+                "outcome": "recovered",
+                "revalidations": revalidations,
+                "at": native_util.now(),
+            })
+        if revalidations and not all(r.get("delivered") for r in revalidations):
+            self.emit("INTEG", "evidência desatualizada não revalidou")
+            return False
+        return True
 
     def _revalidate(self, project: ProjectState, root: Path, task: Task,
                     model: Any) -> dict[str, Any]:

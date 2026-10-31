@@ -17,7 +17,6 @@ from requirements import RequirementsService
 from scaffold import scaffold
 from signoff import SignoffService
 from state import ProjectState
-import verify as verify_policy
 from visual import VisualService
 from workspace import (IgnoreRules, default_workspace, prepare_workspace,
                        validate_workspace_integrity)
@@ -130,24 +129,9 @@ class NativeAdapter:
         if self.project.profile == "review":
             return True
         build_tasks = [t for t in self.project.tasks if t.kind == "build"]
-        if not build_tasks:
-            self.emit("VERIFY", "checkpoint OK (sem tarefas build)")
-            return True
-        problems: list[str] = []
-        for t in build_tasks:
-            rec = self.project.verifications.get(t.id)
-            if rec is None:
-                problems.append(f"{t.id}=missing")
-                continue
-            verdict = verify_policy.normalize_verdict(rec.verdict)
-            if verdict == verify_policy.PASS:
-                continue
-            if (verdict == verify_policy.UNVERIFIED
-                    and getattr(rec, "authorized_unverified", False)):
-                continue
-            problems.append(f"{t.id}={verdict}")
-        if problems:
-            self.emit("VERIFY", "checkpoint bloqueado: " + ", ".join(problems))
+        blockers = self.project.verification_blockers()
+        if blockers:
+            self.emit("VERIFY", "checkpoint bloqueado: " + "; ".join(blockers))
             return False
         self.emit("VERIFY", f"checkpoint OK ({len(build_tasks)} tarefas)")
         return True
@@ -164,6 +148,8 @@ class NativeAdapter:
         if returned and returned.get("status") in ("RECOVERY_REQUIRED",
                                                    "REVALIDATION_REQUIRED"):
             raise PublishConflict("recuperação de publicação pendente")
+        if returned and returned.get("status") == "COMMITTED":
+            return returned
         manifest = validate_workspace_integrity(
             self.project.project_root, self.workspace_root, origin,
             self.rules, self.project.architecture.deletions)
