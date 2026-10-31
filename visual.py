@@ -71,11 +71,16 @@ def playwright_audit(root: Path, logs_dir: Path, page: str = "index.html",
 
 
 class VisualService:
-    def __init__(self, settings: Any, pool: Any, emit: Any, run_id: str = ""):
+    def __init__(self, settings: Any, pool: Any, emit: Any, run_id: str = "",
+                 artifact_dir: str | Path | None = None):
         self.settings = settings
         self.pool = pool
         self.emit = emit
         self.run_id = run_id
+        self.artifact_dir = Path(artifact_dir).expanduser() if artifact_dir else None
+
+    def _artifacts(self, root: Path) -> Path:
+        return (self.artifact_dir or (root / ".crew" / "runs" / (self.run_id or "latest")))
 
     def step_visual(self, project: ProjectState, workspace_root: str | Path) -> bool:
         root = Path(workspace_root).expanduser().resolve()
@@ -85,16 +90,20 @@ class VisualService:
         if not self.settings.visual_check:
             project.visual = {"verdict": verify_policy.NA, "note": "visual_check off"}
             return True
-        report = playwright_audit(root, root / ".factory" / "logs")
+        report = playwright_audit(root, self._artifacts(root) / "screenshots")
         png = report.get("screenshot")
         vision: dict[str, Any] = {"verdict": verify_policy.NA}
         if png:
             vision = self._review(project, Path(png))
             report["vision"] = vision
             if vision.get("verdict") == verify_policy.FAIL and vision.get("objections"):
+                old = vision
                 self._fix(project, root, vision)
-                report = playwright_audit(root, root / ".factory" / "logs")
-                report["vision_retry"] = vision
+                report = playwright_audit(root, self._artifacts(root) / "screenshots")
+                report["vision_retry"] = old
+                if report.get("screenshot"):
+                    vision = self._review(project, Path(report["screenshot"]))
+                    report["vision"] = vision
         project.visual = report
         v = verify_policy.normalize_verdict(vision.get("verdict", verify_policy.NA))
         audit = verify_policy.normalize_verdict(report.get("verdict"))

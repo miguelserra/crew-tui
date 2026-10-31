@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Byte-compile
-        run: python -m py_compile main.py budget.py factory.py power.py power_linux.py power_win.py peak.py registry.py state.py store.py attempts.py engine.py router.py verify.py profiles.py scaffold.py workspace.py publish.py requirements.py architecture.py executor.py context_reader.py integration.py visual.py signoff.py native_util.py
+        run: python -m py_compile main.py budget.py factory.py power.py power_linux.py power_win.py peak.py registry.py state.py store.py attempts.py engine.py router.py verify.py profiles.py scaffold.py workspace.py publish.py requirements.py architecture.py executor.py context_reader.py integration.py visual.py signoff.py native_util.py native_adapter.py
       - name: Power policy tests
         run: python tests/test_power.py
       - name: Budget breaker tests
@@ -62,6 +62,8 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p0*_integration.py"
       - name: P7 native executor
         run: python -m unittest discover -s tests -p "test_p7_executor.py"
+      - name: P7 differential smoke
+        run: python -m unittest discover -s tests -p "test_p7_differential.py"
 
   windows:
     name: Windows (py3.13)
@@ -72,7 +74,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Byte-compile
-        run: python -m py_compile main.py budget.py factory.py power.py power_linux.py power_win.py peak.py registry.py state.py store.py attempts.py engine.py router.py verify.py profiles.py scaffold.py workspace.py publish.py requirements.py architecture.py executor.py context_reader.py integration.py visual.py signoff.py native_util.py
+        run: python -m py_compile main.py budget.py factory.py power.py power_linux.py power_win.py peak.py registry.py state.py store.py attempts.py engine.py router.py verify.py profiles.py scaffold.py workspace.py publish.py requirements.py architecture.py executor.py context_reader.py integration.py visual.py signoff.py native_util.py native_adapter.py
       - name: Windows backend tests
         run: python tests/test_power_win.py
       - name: Budget breaker tests

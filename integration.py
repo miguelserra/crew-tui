@@ -10,7 +10,8 @@ from typing import Any, Optional
 
 import native_util
 from router import RouteRequest
-from state import ProjectState, Task
+from state import ProjectState, Task, TaskAttempt, new_id
+from registry import unknown_ref
 from visual import playwright_audit
 
 FIX_SYSTEM = (
@@ -24,11 +25,16 @@ CHIEF_FIX_SYSTEM = (
 
 
 class IntegrationService:
-    def __init__(self, settings: Any, pool: Any, emit: Any, run_id: str = ""):
+    def __init__(self, settings: Any, pool: Any, emit: Any, run_id: str = "",
+                 artifact_dir: str | Path | None = None):
         self.settings = settings
         self.pool = pool
         self.emit = emit
         self.run_id = run_id
+        self.artifact_dir = Path(artifact_dir).expanduser() if artifact_dir else None
+
+    def _artifacts(self, root: Path) -> Path:
+        return (self.artifact_dir or (root / ".crew" / "runs" / (self.run_id or "latest")))
 
     def integrate(self, project: ProjectState, workspace_root: str | Path) -> bool:
         root = Path(workspace_root).expanduser().resolve()
@@ -40,7 +46,9 @@ class IntegrationService:
         kind, path = entry
         max_attempts = self.settings.max_verify_loops + 1
         for attempt in range(1, max_attempts + 1):
+            fixes = list(project.integration.get("fix_records") or [])
             report = self._run_entry(kind, path, root)
+            report["fix_records"] = fixes
             project.integration = report
             if report.get("verdict") == "PASS":
                 self.emit("INTEG", f"integração PASS ({kind})")
@@ -80,7 +88,7 @@ class IntegrationService:
 
     def _run_entry(self, kind: str, path: Path, root: Path) -> dict[str, Any]:
         if kind == "web":
-            return playwright_audit(root, root / ".factory" / "logs")
+            return playwright_audit(root, self._artifacts(root) / "logs" / "integration")
         cmd = ([str(Path(sys.executable)), str(path)] if kind == "python"
                else ["node", str(path)])
         try:
@@ -141,10 +149,15 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
             raw = self.pool.complete(routed.chain, [
                 self._msg("SystemMessage", CHIEF_FIX_SYSTEM if role_tag == "chief" else FIX_SYSTEM),
                 self._msg("HumanMessage", prompt),
-            ], meta={"run": self.run_id or None, "tag": "DEV"})
+            ], meta={"run": self.run_id or None, "tag": "DEV",
+                     "task": "__integration_fix__"})
         except Exception:
             return False
+        model = self.pool.last_attempt_model.get("__integration_fix__") or unknown_ref()
+        call_id = new_id("intfix_")
         written = 0
+        touched: list[str] = []
+        touched_files: list[str] = []
         for rel, code in native_util.multi_file_blocks(raw):
             if not code.strip():
                 continue
@@ -155,10 +168,23 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(code.rstrip("\n") + "\n", encoding="utf-8")
+            touched_files.append(rel)
             for task in project.tasks:
                 if task.target_file == rel:
                     task.status = "done"
+                    touched.append(task.id)
+                    task.attempts.append(TaskAttempt(
+                        attempt_id=call_id, model=model,
+                        started_at=native_util.now(), completed_at=native_util.now(),
+                        outcome="ok"))
+                    task.delivered_by = model
             written += 1
+        if written:
+            project.integration.setdefault("fix_records", []).append({
+                "call_id": call_id, "model": model.to_dict(),
+                "task_ids": sorted(set(touched)), "files": sorted(set(touched_files)),
+                "outcome": "ok", "at": native_util.now(),
+            })
         self.emit("INTEG", f"{written} ficheiro(s) corrigido(s) por {role_tag}")
         return written > 0
 

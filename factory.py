@@ -906,10 +906,14 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
             vision = self._vision_review(Path(png))
             report["vision"] = vision
             if vision.get("verdict") == verify_policy.FAIL and vision.get("objections"):
+                old = vision
                 self.power.before_step("visual fix")
                 self._visual_fix(vision)
                 report = self.playwright_audit(self.root)
-                report["vision_retry"] = vision
+                report["vision_retry"] = old
+                if report.get("screenshot"):
+                    vision = self._vision_review(Path(report["screenshot"]))
+                    report["vision"] = vision
         self.state.visual = report
         self.log("visual", json.dumps(report, ensure_ascii=False)[:8000])
         self.save()

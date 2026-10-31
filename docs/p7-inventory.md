@@ -35,9 +35,11 @@ Baseline: `p6.1-gate` (`86f2df1`).
 | `architecture.py` | architecture + tasks | P7.1 extraction (hardened) |
 | `executor.py` | BUILD + fix loop | P7.1b extraction |
 | `context_reader.py` | bounded project context | P7.1a extraction |
-| integration | runtime/integration | pending |
-| visual | multimodal | pending |
-| signoff | final sign-off | pending |
+| `integration.py` | runtime/integration | P7.1c extraction |
+| `visual.py` | multimodal | P7.1c extraction |
+| `signoff.py` | final sign-off | P7.1c extraction |
+| `native_adapter.py` | native composition | P7.1d extraction; not default |
+| differential cassette | BUILD/INTEGRATE/SIGNOFF + visual retry | first slice green; matrix pending |
 
 ## Guardrails
 

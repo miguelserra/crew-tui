@@ -294,10 +294,16 @@ P7.1 has started extracting native services over canonical `ProjectState`:
 - `architecture.py` (architecture + tasks) — extracted, atomic validation;
 - `executor.py` (BUILD/FIX) — extracted, critic/verification gate reused;
 - `integration.py`, `visual.py`, `signoff.py` — extracted, P5/P6 evidence preserved;
+  unified artifacts go to `.crew/runs/<run_id>`, never `.factory`; shared
+  integration fixes are recorded once in `integration.fix_records` with the
+  affected task ids and producer;
+- `native_adapter.py` — composes the native services (no Factory imports);
+  differential smoke covers BUILD/INTEGRATE/SIGNOFF and visual re-review;
 - scaffold/verification/workspace/publish were already native from P5/P6.
 
-NativeAdapter/differential equivalence (P7.1d) is the next step; until it
-passes, the runtime still uses `FactoryAdapter` and removal is not authorized. P7 is not
+NativeAdapter and the first differential cassette exist (P7.1d), but the full
+failure/resume matrix is not yet green; the runtime still uses
+`FactoryAdapter` and removal is not authorized. P7 is not
 a closed gate; legacy migration/conversion remains readable and no silent
 conversion is performed. No prompt/routing/verification policy was changed in
 this extraction.
@@ -630,6 +636,7 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `executor.py` | Native BUILD/FIX over ProjectState (P7.1b) |
 | `integration.py` / `visual.py` / `signoff.py` | Native remaining phases (P7.1c) |
 | `native_util.py` | Shared native helpers |
+| `native_adapter.py` | Native service composition (P7.1d; not runtime default) |
 | `context_reader.py` | Bounded, ignore-aware project context |
 | `profiles.py` | Workflow profiles, auto resolution and phase sets |
 | `scaffold.py` | Deterministic scaffold from the approved architecture |
