@@ -905,6 +905,8 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
             rec = task.verification.get("oracle") or {}
             expected = rec.get("artifact_sha256")
             if not expected:
+                if task.verification.get("verdict") == "PASS":
+                    stale.append(task)
                 continue
             path = self._safe(task.target_file)
             if path is None or not path.is_file():

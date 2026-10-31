@@ -971,7 +971,10 @@ class ProjectState:
                     blockers.append(f"artefacto ausente: {task.id}")
                 elif record is not None:
                     expected = (record.oracle or {}).get("artifact_sha256")
-                    if expected and str(expected) != str(artifact):
+                    if record.verdict == "PASS" and not expected:
+                        blockers.append(
+                            f"evidência sem artifact hash: {task.id}")
+                    elif expected and str(expected) != str(artifact):
                         blockers.append(f"evidência desatualizada: {task.id}")
         return blockers
 
@@ -988,7 +991,9 @@ class ProjectState:
                                               "<no-root>", "<no-target>"):
                 continue
             expected = (record.oracle or {}).get("artifact_sha256")
-            if expected and str(expected) != str(artifact):
+            if record.verdict == "PASS" and not expected:
+                stale.append(task.id)
+            elif expected and str(expected) != str(artifact):
                 stale.append(task.id)
         return stale
 

@@ -1704,6 +1704,54 @@ class D10ResumePipelineTests(unittest.TestCase):
             self.assertEqual(eng["state"].phase, "INTEGRATE", kind)
             self.assertEqual(eng["pool"].calls, [], kind)
 
+    def test_d10_05c_legacy_pass_without_artifact_hash_is_fail_closed(self):
+        content = "print('ok')\n"
+        for kind in ("factory", "native"):
+            run = self._base("VERIFY", files={"app.py": content})
+            run["ws"].mkdir(parents=True, exist_ok=True)
+            (run["ws"] / "app.py").write_text(content, encoding="utf-8")
+            run["state"].tasks[0].status = "done"
+            run["state"].verifications["a"] = s.VerificationRecord(
+                verdict="PASS", oracle={"passed": True})
+            run["store"].save_project(run["state"])
+            reloaded = run["store"].load_project(
+                run["store"].project_state_path(run["state"].project_root))
+            self.assertIn("evidência sem artifact hash: a",
+                          reloaded.verification_blockers(), kind)
+            self.assertEqual(reloaded.stale_verification_tasks(), ["a"], kind)
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "failed", kind)
+            self.assertEqual(eng["state"].pause.reason, "verify_failed", kind)
+
+            run = self._base("VERIFY", files={"app.py": content})
+            run["state"].tasks[0].status = "done"
+            run["state"].verifications["a"] = s.VerificationRecord(
+                verdict="N/A", oracle={"passed": True})
+            run["store"].save_project(run["state"])
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "failed", kind)
+            self.assertIn("verificação inválida: a",
+                          eng["state"].verification_blockers(), kind)
+
+    def test_d10_05d_legacy_pass_without_hash_is_revalidated_on_integrate(self):
+        content = "print('ok')\n"
+        for kind in ("factory", "native"):
+            run = self._base("INTEGRATE", files={"app.py": content})
+            run["ws"].mkdir(parents=True, exist_ok=True)
+            (run["ws"] / "app.py").write_text(content, encoding="utf-8")
+            run["state"].tasks[0].status = "done"
+            run["state"].verifications["a"] = s.VerificationRecord(
+                verdict="PASS", oracle={"passed": True})
+            run["store"].save_project(run["state"])
+            eng = self._engine(kind, run)
+            self.assertEqual(eng["engine"].step(), "ok", kind)
+            st = eng["state"]
+            self.assertEqual(st.verifications["a"].oracle.get(
+                "artifact_sha256"), s.artifact_hash(content), kind)
+            fixes = st.integration.get("fix_records") or []
+            self.assertTrue(any(f.get("outcome") == "recovered" for f in fixes),
+                            kind)
+
     def test_d10_05b_verify_rejects_missing_and_stale_evidence(self):
         for kind in ("factory", "native"):
             run = self._base("VERIFY", files={"app.py": "new\n"})

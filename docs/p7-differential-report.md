@@ -179,6 +179,8 @@ These run both `FactoryAdapter` and `NativeAdapter` through `WorkflowEngine`, th
 | Adapteres D10: PAYG UNKNOWN bloqueia sem retry | Verde | `D10ResumePipelineTests.test_d10_04b_payg_unknown_blocks_without_retry` |
 | Adapteres D10: VERIFY recupera evidência persistida | Verde | `D10ResumePipelineTests.test_d10_05a_verify_resumes_persisted_evidence` |
 | Adapteres D10: VERIFY rejeita evidência em falta/stale | Verde | `D10ResumePipelineTests.test_d10_05b_verify_rejects_missing_and_stale_evidence` |
+| Adapteres D10: PASS legacy sem artifact hash é fail-closed | Verde | `D10ResumePipelineTests.test_d10_05c_legacy_pass_without_artifact_hash_is_fail_closed` |
+| Adapteres D10: PASS legacy sem hash revalida no INTEGRATE | Verde | `D10ResumePipelineTests.test_d10_05d_legacy_pass_without_hash_is_revalidated_on_integrate` |
 | Adapteres D10: INTEGRATE revalida ficheiro stale | Verde | `D10ResumePipelineTests.test_d10_06a_integration_revalidates_stale_file_on_resume` |
 | Adapteres D10: INTEGRATE falhado bloqueia sign-off | Verde | `D10ResumePipelineTests.test_d10_06b_integration_failure_blocks_signoff` |
 | Adapteres D10: VISUAL liga evidência ao artifact hash | Verde | `D10ResumePipelineTests.test_d10_07a_visual_evidence_is_bound_to_artifact_hash` |

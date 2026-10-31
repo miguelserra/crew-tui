@@ -35,8 +35,12 @@ class FakeAdapter:
             self.project.tasks = s.validate_tasks(self.project.tasks)
         if phase == "BUILD":
             self.project.tasks[0].status = "done"
-            self.project.verifications["t1"] = s.VerificationRecord(verdict="PASS")
-            (Path(self.project.project_root) / "app.py").write_text("print('ok')\n",
+            code = "print('ok')\n"
+            self.project.verifications["t1"] = s.VerificationRecord(
+                verdict="PASS",
+                oracle={"passed": True,
+                        "artifact_sha256": s.artifact_hash(code)})
+            (Path(self.project.project_root) / "app.py").write_text(code,
                                                                     encoding="utf-8")
         if phase == "INTEGRATE":
             self.project.integration = {"verdict": "PASS", "kind": "python",
