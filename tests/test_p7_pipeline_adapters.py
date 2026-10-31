@@ -1644,6 +1644,38 @@ class D10ResumePipelineTests(unittest.TestCase):
             self.assertEqual(first, "keep\n", kind)
             self.assertEqual(eng2["state"].scaffold, manifest, kind)
 
+    def test_d10_03b_scaffold_interruption_is_idempotent(self):
+        import engine as engine_mod
+        import native_adapter as native_mod
+        orig_engine = engine_mod.scaffold
+        orig_native = native_mod.scaffold
+        try:
+            for kind in ("factory", "native"):
+                run = self._base("SCAFFOLD")
+                eng = self._engine(kind, run)
+
+                def crash_scaffold(root, *a, **k):
+                    Path(root, "partial.py").write_text("partial\n",
+                                                       encoding="utf-8")
+                    raise SimulatedCrash("during scaffold")
+
+                if kind == "factory":
+                    engine_mod.scaffold = crash_scaffold
+                else:
+                    native_mod.scaffold = crash_scaffold
+                with self.assertRaises(SimulatedCrash):
+                    eng["engine"].step()
+                engine_mod.scaffold = orig_engine
+                native_mod.scaffold = orig_native
+                eng2 = self._engine(kind, run)
+                self.assertEqual(eng2["engine"].step(), "ok", kind)
+                self.assertEqual((run["ws"] / "partial.py").read_text(
+                    encoding="utf-8"), "partial\n", kind)
+                self.assertTrue(eng2["state"].scaffold, kind)
+        finally:
+            engine_mod.scaffold = orig_engine
+            native_mod.scaffold = orig_native
+
     def test_d10_04a_completed_build_task_is_not_repeated(self):
         content = "print('ok')\n"
         for kind in ("factory", "native"):
@@ -1924,6 +1956,45 @@ class D10ResumePipelineTests(unittest.TestCase):
             self.assertEqual(eng["state"].pause.reason,
                              "integrate_failed", kind)
             self.assertNotEqual(eng["state"].phase, "SIGNOFF", kind)
+
+    def test_d10_07c_visual_interruption_during_browser_is_retried(self):
+        import visual as visual_mod
+        orig = visual_mod.playwright_audit
+        try:
+            for kind in ("factory", "native"):
+                run = self._base(
+                    "VISUAL", profile="web",
+                    tasks=[s.Task("a", kind="build", target_file="index.html",
+                                  acceptance=["renders"], requirement_ids=["ac1"])],
+                    files={"index.html": "<html>ok</html>\n"})
+                run["state"].tasks[0].status = "done"
+                run["state"].verifications["a"] = self._verification(
+                    run["state"], "index.html", "<html>ok</html>\n")
+                run["store"].save_project(run["state"])
+                eng = self._engine(kind, run, visual_check=True)
+
+                def crash_audit(*a, **k):
+                    raise SimulatedCrash("during browser")
+
+                if kind == "factory":
+                    eng["adapter"].factory.playwright_audit = crash_audit
+                else:
+                    visual_mod.playwright_audit = crash_audit
+                with self.assertRaises(SimulatedCrash):
+                    eng["engine"].step()
+                visual_mod.playwright_audit = orig
+                eng2 = self._engine(kind, run, visual_check=True)
+                if kind == "factory":
+                    eng2["adapter"].factory.playwright_audit = lambda root: {
+                        "verdict": "PASS", "screenshot": ""}
+                else:
+                    visual_mod.playwright_audit = lambda root, logs, **k: {
+                        "verdict": "PASS", "screenshot": ""}
+                self.assertEqual(eng2["engine"].step(), "ok", kind)
+                self.assertEqual(eng2["state"].visual.get("verdict"), "PASS",
+                                 kind)
+        finally:
+            visual_mod.playwright_audit = orig
 
     def test_d10_07b_visual_unavailable_blocks_required_profile(self):
         import visual as visual_mod

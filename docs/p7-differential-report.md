@@ -174,6 +174,7 @@ These run both `FactoryAdapter` and `NativeAdapter` through `WorkflowEngine`, th
 | Adapteres D10: ARCHITECTURE persistida não redesenha | Verde | `D10ResumePipelineTests.test_d10_02a_architecture_persisted_without_approval_is_not_redesigned` |
 | Adapteres D10: ARCHITECTURE fresca recupera do zero | Verde | `D10ResumePipelineTests.test_d10_02b_fresh_architecture_recovers_from_scratch` |
 | Adapteres D10: SCAFFOLD idempotente preserva ficheiros | Verde | `D10ResumePipelineTests.test_d10_03a_scaffold_is_idempotent_and_preserves_files` |
+| Adapteres D10: interrupção durante SCAFFOLD é retomada | Verde | `D10ResumePipelineTests.test_d10_03b_scaffold_interruption_is_idempotent` |
 | Adapteres D10: BUILD concluído não repete | Verde | `D10ResumePipelineTests.test_d10_04a_completed_build_task_is_not_repeated` |
 | Adapteres D10: PAYG UNKNOWN bloqueia sem retry | Verde | `D10ResumePipelineTests.test_d10_04b_payg_unknown_blocks_without_retry` |
 | Adapteres D10: VERIFY recupera evidência persistida | Verde | `D10ResumePipelineTests.test_d10_05a_verify_resumes_persisted_evidence` |
@@ -182,6 +183,7 @@ These run both `FactoryAdapter` and `NativeAdapter` through `WorkflowEngine`, th
 | Adapteres D10: INTEGRATE falhado bloqueia sign-off | Verde | `D10ResumePipelineTests.test_d10_06b_integration_failure_blocks_signoff` |
 | Adapteres D10: VISUAL liga evidência ao artifact hash | Verde | `D10ResumePipelineTests.test_d10_07a_visual_evidence_is_bound_to_artifact_hash` |
 | Adapteres D10: VISUAL indisponível bloqueia perfil | Verde | `D10ResumePipelineTests.test_d10_07b_visual_unavailable_blocks_required_profile` |
+| Adapteres D10: interrupção durante browser é retomada | Verde | `D10ResumePipelineTests.test_d10_07c_visual_interruption_during_browser_is_retried` |
 | Adapteres D10: aprovação de sign-off retoma sem regenerar | Verde | `D10ResumePipelineTests.test_d10_08a_approved_signoff_resume_skips_generation` |
 | Adapteres D10: rejeição e aprovação sobrevivem a reload | Verde | `D10ResumePipelineTests.test_d10_08b_rejection_then_approval_survives_reload` |
 | Adapteres D10: COMMITTED recuperado não repete publicação | Verde | `D10ResumePipelineTests.test_d10_09a_recovered_committed_publication_is_not_repeated` |
