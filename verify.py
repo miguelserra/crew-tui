@@ -91,6 +91,9 @@ def decide_build(oracle_ok: bool, critic: dict[str, Any],
     if tverdict == FAIL and not advisory:
         reasons.append("testes determinísticos FAIL")
 
+    if not oracle_ok:
+        return Decision(FAIL, False, reasons or ["oracle falhou"], valid, executed)
+
     unverified = (not executed or not valid) or vverdict == UNVERIFIED
     if unverified:
         return Decision(UNVERIFIED, allow_unverified, reasons or ["UNVERIFIED"],

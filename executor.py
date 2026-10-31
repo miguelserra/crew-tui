@@ -155,14 +155,19 @@ No prose, no placeholders, no elided sections.
             self.emit("SYSTEM", f"{task.id}: UNVERIFIED — não entregue")
             return False
         # Quality FAIL: one native fix attempt, then re-verify.
-        objections = (record.critic.get("objections")
-                      if isinstance(record.critic, dict) else [])
-        detail = "; ".join(
-            str(o.get("claim") or o.get("why_wrong") or o)
-            if isinstance(o, dict) else str(o)
-            for o in objections)
-        error = record.reason or "critic FAIL"
-        task.errors.append(f"critic FAIL: {detail or error}")
+        oracle_failed = not record.oracle.get("passed", True)
+        if oracle_failed:
+            error = record.reason or "oracle falhou"
+            task.errors.append(f"oracle FAIL: {error}")
+        else:
+            objections = (record.critic.get("objections")
+                          if isinstance(record.critic, dict) else [])
+            detail = "; ".join(
+                str(o.get("claim") or o.get("why_wrong") or o)
+                if isinstance(o, dict) else str(o)
+                for o in objections)
+            error = record.reason or "critic FAIL"
+            task.errors.append(f"critic FAIL: {detail or error}")
         try:
             fixed = self._fix(project, task, code, error, root)
         except Exception as exc:
@@ -227,7 +232,11 @@ Output the COMPLETE corrected file in ONE fenced block."""
         producer = self.pool.last_attempt_model.get(task.id)
         if producer is None:
             producer = _as_ref(task.delivered_by)
-        critic = self.verifier.run_critic(producer, task, code, self.run_id)
+        if not oracle.passed:
+            critic: dict[str, Any] = {"verdict": verify_policy.NA,
+                                      "note": "oracle falhou — crítico não executado"}
+        else:
+            critic = self.verifier.run_critic(producer, task, code, self.run_id)
         tests: dict[str, Any] = {"verdict": "SKIP", "advisory": True}
         if suffix == ".py" and self.settings.test_oracle:
             tests = self.verifier.run_test_oracle(task, artifact, self.run_id)

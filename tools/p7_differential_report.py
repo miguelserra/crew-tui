@@ -93,6 +93,14 @@ ADAPTER_PIPELINE = [
      "test_d03_quality_billing_parity"),
     ("Adapteres D03: evidência e histórico da escalação",
      "test_d03_quality_evidence_and_history"),
+    ("Adapteres D07: oracle FAIL -> FIX -> revalidação",
+     "test_d07_oracle_failure_fixes_and_revalidates"),
+    ("Adapteres D07: oracle FAIL esgotado nunca passa",
+     "test_d07_oracle_failure_exhausted_never_passes"),
+    ("Adapteres D07: allow_unverified não contorna oracle FAIL",
+     "test_d07_allow_unverified_cannot_bypass_oracle_fail"),
+    ("Adapteres D07: paridade de evidência de falha",
+     "test_d07_failure_evidence_parity"),
     ("Adapteres D04: 429 -> fallback seguro",
      "test_d04_429_fallback_matches_across_adapters"),
     ("Adapteres D04: auth/connection/server -> fallback",
@@ -207,7 +215,7 @@ MATRIX = [
     ("D07", "Verification PASS/FAIL/FIX", {
         "EXECUTION": ("COVERED", "quality recovery differential"),
         "MODELS_BILLING_LEDGER": ("PARTIAL", "fake pool; no ledger parity"),
-        "VERIFICATION": ("PARTIAL", "oracle-fail and fixer revalidation are single-path tests"),
+        "VERIFICATION": ("COVERED", "oracle FAIL -> FIX -> revalidation differential through both adapters; failure evidence preserved in task.errors; exhausted repair never passes; allow_unverified cannot bypass oracle failure"),
         "PUBLICATION": ("N/A", "no publication required"),
     }),
     ("D08", "Visual and Playwright", {

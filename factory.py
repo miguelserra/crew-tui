@@ -628,8 +628,21 @@ No prose, no placeholders, no elided sections.
         cand.write_text(code, encoding="utf-8")
         ok, error = self._check_file(cand, lang)
         if not ok:
-            task.errors.append(error)
+            task.errors.append(f"oracle FAIL: {error}")
             self.log("build", f"{task.id} check falhou:\n{error}")
+            # Record the static/oracle failure as a verification record
+            record = VerificationRecord(
+                verdict=verify_policy.FAIL,
+                criterion_ids=list(task.requirement_ids),
+                oracle={"passed": False, "kind": "static", "error": error},
+                critic={},
+                visual={"verdict": verify_policy.NA},
+                tests={"verdict": "SKIP", "advisory": True},
+                reason=f"oracle falhou: {error}",
+                at=_now(),
+            )
+            task.verification = record.to_dict()
+            self.save()
             fixed = self._fix(task, cand, error, attempts=2)
             if fixed is None:
                 return False

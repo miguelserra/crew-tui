@@ -64,9 +64,22 @@ class FakeVerifier:
         self.mode = mode
         self.critic_calls = []
         self._calls = {}
+        self.oracle_calls = []
 
     def run_oracle(self, task_id, artifact, run_id=None, suffix=""):
-        return types.SimpleNamespace(passed=True, exit_code=0)
+        # Fail if artifact contains syntactically invalid Python pattern
+        is_invalid = "def broken(" in artifact
+        result = types.SimpleNamespace(
+            passed=not is_invalid,
+            exit_code=1 if is_invalid else 0,
+            stderr="syntax error" if is_invalid else "",
+            stdout=""
+        )
+        self.oracle_calls.append({
+            "task": task_id, "passed": result.passed,
+            "exit_code": result.exit_code, "artifact": artifact[:500]
+        })
+        return result
 
     def run_critic(self, producer, task, code, run_id=None, review=False):
         key = getattr(task, "id", task)
@@ -154,6 +167,11 @@ class FakeHandle:
             return types.SimpleNamespace(
                 content="tool-output",
                 tool_calls=[{"name": "tool", "args": {}}],
+                usage_metadata={}, response_metadata={})
+        if self.behavior == "invalid":
+            self.owner.last_served = self.ref
+            return types.SimpleNamespace(
+                content="```python\ndef broken(:\n    pass\n```",
                 usage_metadata={}, response_metadata={})
         self.owner.last_served = self.ref
         return types.SimpleNamespace(
@@ -603,6 +621,114 @@ class AdapterPipelineTests(unittest.TestCase):
             self.assertIsNotNone(final, kind)
             self.assertEqual(final.verdict, "PASS", kind)
             self.assertEqual(final.critic.get("verdict"), "PASS", kind)
+
+    def test_d07_oracle_failure_fixes_and_revalidates(self):
+        # Initial artifact is syntactically invalid (def broken); both adapters
+        # must reject via oracle/static check, fix via escalation, re-validate,
+        # and install. Evidence must show "oracle FAIL" in task.errors.
+        script = {
+            "gemini-3.1-pro-preview": "invalid",  # producer - initial invalid
+            "nvidia/nemotron-3-ultra": "ok",      # fixer (escalation excludes producer)
+        }
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high")
+            self.assertEqual(run["result"], "ok", kind)
+            self.assertEqual(run["transport"], [
+                ("gemini-3.1-pro-preview", "invalid"),
+                ("nvidia/nemotron-3-ultra", "ok")], kind)
+            task = run["state"].tasks[0]
+            self.assertIn(task.status, ("done", "verified"), kind)
+            self.assertEqual(task.delivered_by.model_id,
+                             "nvidia/nemotron-3-ultra", kind)
+            # Evidence: oracle FAIL recorded in task.errors
+            self.assertTrue(any(err.startswith("oracle FAIL:")
+                                for err in task.errors), kind)
+            # Final verification PASS with critic approval
+            final = run["state"].verifications.get(task.id)
+            self.assertIsNotNone(final, kind)
+            self.assertEqual(final.verdict, "PASS", kind)
+            self.assertEqual(final.critic.get("verdict"), "PASS", kind)
+            # Native oracle calls: first fails, second passes
+            if kind == "native":
+                self.assertEqual(len(run["verifier"].oracle_calls), 2, kind)
+                self.assertFalse(run["verifier"].oracle_calls[0]["passed"])
+                self.assertTrue(run["verifier"].oracle_calls[1]["passed"])
+            # Factory uses static check, no oracle calls
+            if kind == "factory":
+                self.assertEqual(len(run["verifier"].oracle_calls), 0, kind)
+
+    def test_d07_oracle_failure_exhausted_never_passes(self):
+        # Both initial and fix artifacts invalid - both adapters must fail
+        # without delivering, with oracle FAIL evidence.
+        script = {
+            "gemini-3.1-pro-preview": "invalid",
+            "nvidia/nemotron-3-ultra": "invalid",
+            "gemini-3.8-flash": "invalid",  # chief attempt for factory
+        }
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high")
+            self.assertEqual(run["result"], "failed", kind)
+            task = run["state"].tasks[0]
+            self.assertEqual(task.status, "failed", kind)
+            # No file installed
+            self.assertFalse((Path(run["base"]) / "project" / "app.py").exists(), kind)
+            # Evidence of oracle failure
+            self.assertTrue(any(err.startswith("oracle FAIL:")
+                                for err in task.errors), kind)
+            # Final verification FAIL
+            final = run["state"].verifications.get(task.id)
+            self.assertIsNotNone(final, kind)
+            self.assertEqual(final.verdict, "FAIL", kind)
+
+    def test_d07_allow_unverified_cannot_bypass_oracle_fail(self):
+        # Even with allow_unverified=True, oracle failure must block delivery
+        script = {"gemini-3.1-pro-preview": "invalid",
+                  "nvidia/nemotron-3-ultra": "invalid"}
+        base = Path(tempfile.mkdtemp(prefix="p7d07-"))
+        project = base / "project"; project.mkdir()
+        ws = base / "ws"
+        for kind in ("factory", "native"):
+            cfg = settings(base)
+            cfg.allow_unverified = True
+            st = make_state(project, ws, "high")
+            pool = PipelinePool(script)
+            verifier = FakeVerifier()
+            if kind == "factory":
+                adapter = engine.FactoryAdapter(cfg, pool, lambda *a: None, st,
+                                                isolate_workspace=True)
+                adapter.factory.verifier = verifier
+            else:
+                adapter = native_adapter.NativeAdapter(
+                    cfg, pool, lambda *a: None, st, verifier=verifier,
+                    isolate_workspace=True)
+            store = StateManager(cfg.workspace_dir, cfg.log_dir)
+            eng = engine.WorkflowEngine(st, store, adapter, emit=lambda *a: None)
+            eng.apply_pool(pool)
+            result = eng.step()
+            self.assertEqual(result, "failed", kind)
+            task = st.tasks[0]
+            self.assertEqual(task.status, "failed", kind)
+            self.assertTrue(any(err.startswith("oracle FAIL:")
+                                for err in task.errors), kind)
+            final = st.verifications.get(task.id)
+            self.assertIsNotNone(final, kind)
+            self.assertEqual(final.verdict, "FAIL", kind)
+
+    def test_d07_failure_evidence_parity(self):
+        # Compare the structure of failure evidence between adapters
+        script = {"gemini-3.1-pro-preview": "invalid",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        ref = run_pipeline("factory", script, "high")
+        new = run_pipeline("native", script, "high")
+        # Both have oracle FAIL in errors
+        for kind, run in (("factory", ref), ("native", new)):
+            task = run["state"].tasks[0]
+            self.assertTrue(any(err.startswith("oracle FAIL:")
+                                for err in task.errors), kind)
+            final = run["state"].verifications.get(task.id)
+            self.assertEqual(final.verdict, "PASS", kind)
+            self.assertEqual(final.critic.get("verdict"), "PASS", kind)
+            self.assertEqual(final.oracle.get("passed"), True, kind)
 
     def test_d04_auth_connection_server_fallback(self):
         # Compare both adapters rather than hard-coding which candidate the

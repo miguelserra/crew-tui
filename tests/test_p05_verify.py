@@ -47,6 +47,15 @@ class BuildGateTests(unittest.TestCase):
         self.assertFalse(v.decide_build(False, critic()).deliver)
         self.assertFalse(v.decide_build(True, critic(verdict="FAIL")).deliver)
 
+    def test_oracle_failure_cannot_be_authorized_unverified(self):
+        d = v.decide_build(False, critic(verdict="UNAVAILABLE", identity=False),
+                           allow_unverified=True)
+        self.assertEqual(d.verdict, v.FAIL)
+        self.assertFalse(d.deliver)
+        d = v.decide_build(False, critic(), allow_unverified=True)
+        self.assertEqual(d.verdict, v.FAIL)
+        self.assertFalse(d.deliver)
+
     def test_visual_na_vs_unverified(self):
         d = v.decide_build(True, critic(), visual={"verdict": v.NA})
         self.assertTrue(d.deliver)
