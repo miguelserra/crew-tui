@@ -9,6 +9,8 @@ Remaining matrix slots (fallback, interruption/resume, publish) are still open;
 this file documents and covers the first slices.
 """
 
+from __future__ import annotations
+
 import sys
 import json
 import tempfile
