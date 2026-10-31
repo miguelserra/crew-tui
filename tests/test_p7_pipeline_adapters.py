@@ -2158,8 +2158,9 @@ class D10ResumePipelineTests(unittest.TestCase):
 class D11PublicationPipelineTests(unittest.TestCase):
     """D11: adapter-level publication conflicts, deletions, orphans and gates."""
 
-    def _base(self, *, files=None, deletion=None, tasks=None):
-        base = Path(tempfile.mkdtemp(prefix="d11-"))
+    def _base(self, *, files=None, deletion=None, tasks=None, base=None):
+        base = Path(base) if base is not None else Path(
+            tempfile.mkdtemp(prefix="d11-"))
         project = base / "project"; project.mkdir()
         ws = base / "ws"
         st = s.ProjectState(run_id="r", project_root=str(project), goal="demo",
@@ -2582,6 +2583,211 @@ class D11PublicationPipelineTests(unittest.TestCase):
                 result = "raised"
             self.assertIn(result, ("failed", "raised"), kind)
             self.assertNotEqual(eng["state"].phase, "DONE", kind)
+
+
+@unittest.skipUnless(DEPS_OK, f"runtime deps missing: {DEPS_ERR}")
+class D12CrashPublicationTests(unittest.TestCase):
+    """D12: real process crashes at publication boundaries through both adapters."""
+
+    OLD = {"app.py": "old-a\n", "util.py": "old-b\n"}
+    NEW = {"app.py": "new-a\n", "util.py": "new-b\n"}
+
+    def _worker(self, mode, kind):
+        base = Path(tempfile.mkdtemp(prefix=f"d12-{mode}-{kind}-"))
+        worker = Path(__file__).resolve().parent / "d12_crash_worker.py"
+        proc = subprocess.run(
+            [sys.executable, str(worker), mode, kind, str(base)],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True, text=True, timeout=120)
+        return base, proc
+
+    def _run(self, base):
+        cfg = settings(base)
+        store = StateManager(cfg.workspace_dir, cfg.log_dir)
+        project = base / "project"
+        st = store.load_project(store.project_state_path(project))
+        return {"base": base, "project": project, "ws": base / "ws",
+                "settings": cfg, "state": st, "store": store}
+
+    def _fresh(self, kind, base):
+        case = D11PublicationPipelineTests("runTest")
+        return case._engine(kind, self._run(base))
+
+    @staticmethod
+    def _journals(base):
+        out = []
+        root = base / "project" / ".crew" / "publish"
+        if not root.is_dir():
+            return out
+        for path in sorted(root.glob("*/journal.json")):
+            out.append(json.loads(path.read_text(encoding="utf-8")))
+        return out
+
+    @staticmethod
+    def _texts(base):
+        return {rel: (base / "project" / rel).read_text(encoding="utf-8")
+                for rel in ("app.py", "util.py")}
+
+    def _recovery_outcome(self, kind, base):
+        eng = self._fresh(kind, base)
+        journals = self._journals(base)
+        return {
+            "kind": kind,
+            "phase": eng["state"].phase,
+            "texts": self._texts(base),
+            "journals": journals,
+            "recovery_error": eng["adapter"].recovery_error,
+            "publish": eng["state"].extensions.get("publish"),
+            "engine": eng,
+        }
+
+    def _rolled_back(self, mode, expected_before):
+        outcomes = {}
+        for kind in ("factory", "native"):
+            base, proc = self._worker(mode, kind)
+            self.assertNotEqual(proc.returncode, 0, (kind, proc.stderr))
+            before = self._journals(base)
+            self.assertEqual([j["status"] for j in before], expected_before,
+                             (kind, mode))
+            outcome = self._recovery_outcome(kind, base)
+            journals = outcome["journals"]
+            self.assertEqual([j["status"] for j in journals], ["ROLLED_BACK"],
+                             (kind, mode))
+            self.assertEqual(outcome["texts"], self.OLD, (kind, mode))
+            self.assertEqual(outcome["phase"], "SIGNOFF", (kind, mode))
+            self.assertNotEqual(outcome["phase"], "DONE", (kind, mode))
+            outcomes[kind] = outcome
+        self.assertEqual(outcomes["factory"]["texts"], outcomes["native"]["texts"])
+        self.assertEqual(
+            [j["status"] for j in outcomes["factory"]["journals"]],
+            [j["status"] for j in outcomes["native"]["journals"]])
+
+    def test_d12_01_crash_before_journal(self):
+        for kind in ("factory", "native"):
+            base, proc = self._worker("before-journal", kind)
+            self.assertNotEqual(proc.returncode, 0, (kind, proc.stderr))
+            self.assertEqual(self._journals(base), [], kind)
+            outcome = self._recovery_outcome(kind, base)
+            self.assertEqual(outcome["texts"], self.OLD, kind)
+            self.assertEqual(outcome["phase"], "SIGNOFF", kind)
+            self.assertEqual(outcome["journals"], [], kind)
+
+    def test_d12_02_crash_after_prepared(self):
+        self._rolled_back("after-journal", ["PREPARED"])
+
+    def test_d12_03_crash_after_publishing(self):
+        self._rolled_back("after-publishing", ["PUBLISHING"])
+
+    def test_d12_04_crash_during_backup(self):
+        for kind in ("factory", "native"):
+            base, proc = self._worker("after-backup", kind)
+            self.assertNotEqual(proc.returncode, 0, (kind, proc.stderr))
+            self.assertEqual(self._journals(base), [], kind)
+            outcome = self._recovery_outcome(kind, base)
+            self.assertEqual(outcome["texts"], self.OLD, kind)
+            self.assertEqual(outcome["journals"], [], kind)
+            self.assertEqual(outcome["phase"], "SIGNOFF", kind)
+
+    def test_d12_05_crash_during_replacement(self):
+        for kind in ("factory", "native"):
+            base, proc = self._worker("partial-apply", kind)
+            self.assertNotEqual(proc.returncode, 0, (kind, proc.stderr))
+            before = self._journals(base)
+            self.assertEqual([j["status"] for j in before], ["PUBLISHING"], kind)
+            self.assertEqual(self._texts(base)["app.py"], self.NEW["app.py"], kind)
+            self.assertEqual(self._texts(base)["util.py"], self.OLD["util.py"], kind)
+            outcome = self._recovery_outcome(kind, base)
+            self.assertEqual([j["status"] for j in outcome["journals"]],
+                             ["ROLLED_BACK"], kind)
+            self.assertEqual(outcome["texts"], self.OLD, kind)
+            self.assertEqual(outcome["phase"], "SIGNOFF", kind)
+
+    def test_d12_06_crash_after_all_replacements_before_commit(self):
+        for kind in ("factory", "native"):
+            base, proc = self._worker("before-commit", kind)
+            self.assertNotEqual(proc.returncode, 0, (kind, proc.stderr))
+            self.assertEqual(self._texts(base), self.NEW, kind)
+            self.assertEqual([j["status"] for j in self._journals(base)],
+                             ["PUBLISHING"], kind)
+            outcome = self._recovery_outcome(kind, base)
+            self.assertEqual([j["status"] for j in outcome["journals"]],
+                             ["ROLLED_BACK"], kind)
+            self.assertEqual(outcome["texts"], self.OLD, kind)
+            self.assertEqual(outcome["phase"], "SIGNOFF", kind)
+
+    def test_d12_07_crash_during_rollback_is_resumed(self):
+        for kind in ("factory", "native"):
+            base, proc = self._worker("rollback", kind)
+            self.assertNotEqual(proc.returncode, 0, (kind, proc.stderr))
+            self.assertEqual([j["status"] for j in self._journals(base)],
+                             ["ROLLING_BACK"], kind)
+            outcome = self._recovery_outcome(kind, base)
+            self.assertEqual([j["status"] for j in outcome["journals"]],
+                             ["ROLLED_BACK"], kind)
+            self.assertEqual(outcome["texts"], self.OLD, kind)
+            self.assertEqual(outcome["phase"], "SIGNOFF", kind)
+
+    def test_d12_08_crash_after_committed_is_not_repeated(self):
+        outcomes = {}
+        for kind in ("factory", "native"):
+            base, proc = self._worker("after-commit", kind)
+            self.assertNotEqual(proc.returncode, 0, (kind, proc.stderr))
+            before = self._journals(base)
+            self.assertEqual([j["status"] for j in before], ["COMMITTED"], kind)
+            self.assertEqual(self._texts(base), self.NEW, kind)
+            outcome = self._recovery_outcome(kind, base)
+            self.assertEqual(outcome["texts"], self.NEW, kind)
+            self.assertEqual(outcome["phase"], "SIGNOFF", kind)
+            self.assertEqual(outcome["engine"]["engine"].step(), "ok", kind)
+            self.assertEqual(outcome["engine"]["state"].phase, "DONE", kind)
+            published = outcome["engine"]["state"].extensions.get("publish") or {}
+            self.assertEqual(published.get("status"), "COMMITTED", kind)
+            self.assertEqual(published.get("id"), before[0]["id"], kind)
+            self.assertEqual(len(self._journals(base)), 1, kind)
+            outcome["publish"] = published
+            outcomes[kind] = outcome
+        self.assertEqual(outcomes["factory"]["texts"], outcomes["native"]["texts"])
+
+    def test_d12_09_rollback_impossible_requires_recovery(self):
+        for kind in ("factory", "native"):
+            base, proc = self._worker("rollback-impossible", kind)
+            self.assertNotEqual(proc.returncode, 0, (kind, proc.stderr))
+            journal = self._journals(base)[0]
+            run_dir = base / "project" / ".crew" / "publish" / journal["id"]
+            backup = run_dir / "backup" / "app.py"
+            self.assertTrue(backup.is_file(), kind)
+            backup.unlink()
+            eng = self._fresh(kind, base)
+            with self.assertRaises((engine.EngineError,
+                                    native_adapter.NativeAdapterError)):
+                eng["engine"].step()
+            current = self._journals(base)
+            self.assertEqual([j["status"] for j in current],
+                             ["RECOVERY_REQUIRED"], kind)
+            self.assertNotEqual(eng["state"].phase, "DONE", kind)
+            self.assertTrue(eng["adapter"].recovery_error, kind)
+
+    def test_d12_10_normal_publication_is_committed(self):
+        outcomes = {}
+        for kind in ("factory", "native"):
+            base, proc = self._worker("normal", kind)
+            self.assertEqual(proc.returncode, 0, (kind, proc.stderr))
+            journals = self._journals(base)
+            self.assertEqual([j["status"] for j in journals], ["COMMITTED"], kind)
+            state = self._run(base)["state"]
+            self.assertEqual(state.phase, "DONE", kind)
+            published = state.extensions.get("publish") or {}
+            self.assertEqual(published.get("status"), "COMMITTED", kind)
+            self.assertEqual(published.get("durability"),
+                             journals[0].get("durability"), kind)
+            outcomes[kind] = {
+                "texts": self._texts(base),
+                "entries": [{k: e.get(k) for k in
+                             ("rel", "action", "old_sha", "new_sha", "status")}
+                            for e in journals[0].get("entries", [])],
+                "durability": journals[0].get("durability"),
+            }
+        self.assertEqual(outcomes["factory"], outcomes["native"])
 
 
 if __name__ == "__main__":

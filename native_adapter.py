@@ -41,6 +41,7 @@ class NativeAdapter:
         self.isolated = bool(isolate_workspace)
         self.rules = None
         self.recovery_error = ""
+        self.publication_fault = None
         if self.isolated and project.project_root:
             self.rules = IgnoreRules.from_project(project.project_root)
             ws = str(project.extensions.get("workspace_root") or
@@ -141,7 +142,11 @@ class NativeAdapter:
         return PublishManager(self.project.project_root, self.workspace_root,
                               Path(self.project.project_root) / ".crew", origin,
                               rules=self.rules,
-                              deletions=self.project.architecture.deletions)
+                              deletions=self.project.architecture.deletions,
+                              fault=self.publication_fault)
+
+    def recover_publication(self) -> Optional[dict[str, Any]]:
+        return self._publication_manager().recover()
 
     def publication_orphans(self) -> list[dict[str, Any]]:
         return self._publication_manager().orphans()

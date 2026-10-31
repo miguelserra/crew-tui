@@ -393,10 +393,17 @@ class PublishManager:
             journal["status"] = STATUS_COMMITTED
             if self._write_journal(run_dir, journal) == "unsupported":
                 self.durability_unconfirmed = True
+            journal["durability"] = ("unconfirmed" if self.durability_unconfirmed
+                                     else "confirmed")
+            if self._write_journal(run_dir, journal) == "unsupported":
+                self.durability_unconfirmed = True
+                journal["durability"] = "unconfirmed"
+                self._write_journal(run_dir, journal)
             self._clear_marker()
             self._checkpoint("after_commit", run_dir=run_dir.name)
             return {"id": run_dir.name, "status": STATUS_COMMITTED,
-                    "entries": len(entries), "path": str(run_dir)}
+                    "entries": len(entries), "path": str(run_dir),
+                    "durability": journal["durability"]}
         except Exception as exc:
             journal["status"] = STATUS_ROLLING_BACK
             self._write_journal(run_dir, journal)
@@ -465,6 +472,8 @@ class PublishManager:
                 return {"id": run_dir.name, "status": STATUS_REVALIDATION}
             if status not in (STATUS_PREPARED, STATUS_PUBLISHING, STATUS_ROLLING_BACK):
                 last = {"id": run_dir.name, "status": status or "UNKNOWN"}
+                if data.get("durability"):
+                    last["durability"] = data["durability"]
                 continue
             data["status"] = STATUS_ROLLING_BACK
             self._write_journal(run_dir, data)

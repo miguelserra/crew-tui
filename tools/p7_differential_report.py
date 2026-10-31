@@ -227,6 +227,26 @@ ADAPTER_PIPELINE = [
      "test_d11_14_stale_approval_cannot_publish"),
     ("Adapteres D11: recovery existente bloqueia publicação",
      "test_d11_15_existing_recovery_blocks_publication"),
+    ("Adapteres D12: crash antes do journal",
+     "test_d12_01_crash_before_journal"),
+    ("Adapteres D12: crash após PREPARED",
+     "test_d12_02_crash_after_prepared"),
+    ("Adapteres D12: crash após PUBLISHING",
+     "test_d12_03_crash_after_publishing"),
+    ("Adapteres D12: crash durante backup",
+     "test_d12_04_crash_during_backup"),
+    ("Adapteres D12: crash durante substituição",
+     "test_d12_05_crash_during_replacement"),
+    ("Adapteres D12: crash após todas as substituições antes de COMMITTED",
+     "test_d12_06_crash_after_all_replacements_before_commit"),
+    ("Adapteres D12: crash durante rollback é retomado",
+     "test_d12_07_crash_during_rollback_is_resumed"),
+    ("Adapteres D12: crash após COMMITTED não repete publicação",
+     "test_d12_08_crash_after_committed_is_not_repeated"),
+    ("Adapteres D12: rollback impossível exige recovery",
+     "test_d12_09_rollback_impossible_requires_recovery"),
+    ("Adapteres D12: publicação normal COMMITTED",
+     "test_d12_10_normal_publication_is_committed"),
     ("Adapteres D04: 429 -> fallback seguro",
      "test_d04_429_fallback_matches_across_adapters"),
     ("Adapteres D04: auth/connection/server -> fallback",
@@ -369,10 +389,10 @@ MATRIX = [
         "PUBLICATION": ("COVERED", "manifests, hashes, conflicts, authorized/unauthorized deletions, rollback, orphan discovery/cleanup and recovered publication compared through both adapters"),
     }),
     ("D12", "Publisher crash recovery", {
-        "EXECUTION": ("PARTIAL", "P6.1 unit matrix, not through both adapters"),
-        "MODELS_BILLING_LEDGER": ("N/A", "no model/billing operation"),
-        "VERIFICATION": ("N/A", "no verification operation"),
-        "PUBLICATION": ("PARTIAL", "fault matrix is publisher-level; adapter integration not compared"),
+        "EXECUTION": ("COVERED", "ten real subprocess crash boundaries through both adapters, fresh engine/adapter recovery and terminal-state comparison"),
+        "MODELS_BILLING_LEDGER": ("N/A", "publisher crash recovery invokes no provider and no ledger mutation"),
+        "VERIFICATION": ("N/A", "recovery does not re-evaluate verification; the existing sign-off/approval gate is preserved and covered by D11"),
+        "PUBLICATION": ("COVERED", "PREPARED/PUBLISHING/backup/partial-apply/before-commit/rollback/COMMITTED/RECOVERY_REQUIRED journals, backups, hashes, durability and final filesystem compared"),
     }),
 ]
 
@@ -463,6 +483,8 @@ def run_adapter_pipeline() -> list[tuple[str, str, str, str]]:
             class_name = "D10ResumePipelineTests"
         elif method.startswith("test_d11_"):
             class_name = "D11PublicationPipelineTests"
+        elif method.startswith("test_d12_"):
+            class_name = "D12CrashPublicationTests"
         else:
             class_name = "AdapterPipelineTests"
         status = _run_one("tests.test_p7_pipeline_adapters",
