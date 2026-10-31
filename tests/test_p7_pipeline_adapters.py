@@ -543,6 +543,63 @@ class AdapterPipelineTests(unittest.TestCase):
             self.assertTrue(any("dependências não satisfeitas" in err
                                 for err in state["b"].errors), kind)
 
+    def test_d02_v_verified_dependency_chain(self):
+        tasks = [
+            self._graph_task("a", target="a.py"),
+            self._graph_task("b", deps=["a"], target="b.py"),
+        ]
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, {}, tasks=tasks)
+            self.assertEqual(run["result"], "ok", kind)
+            self.assertEqual(run["pool"].task_order, ["a", "b"], kind)
+            state = {t.id: t for t in run["state"].tasks}
+            for tid in ("a", "b"):
+                rec = run["state"].verifications[tid]
+                self.assertEqual(rec.verdict, "PASS", (kind, tid))
+                self.assertEqual(rec.oracle.get("artifact_sha256"),
+                                 s.artifact_hash((Path(run["base"]) / "ws" /
+                                                  f"{tid}.py").read_text(
+                                     encoding="utf-8")), (kind, tid))
+                self.assertEqual(rec.critic.get("verdict"), "PASS", (kind, tid))
+                self.assertIn(state[tid].status, ("done", "verified"), (kind, tid))
+
+    def test_d02_v_oracle_failure_blocks_dependent(self):
+        invalid = {"gemini-3.5-flash": "invalid",
+                   "gemini-3.8-flash": "invalid",
+                   "gemini-3.1-pro-preview": "invalid",
+                   "nvidia/nemotron-3-ultra": "invalid"}
+        tasks = [self._graph_task("a"), self._graph_task("b", deps=["a"])]
+        runs = {}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, invalid, tasks=tasks)
+            self.assertEqual(run["result"], "failed", kind)
+            state = {t.id: t for t in run["state"].tasks}
+            self.assertEqual(state["a"].status, "failed", kind)
+            self.assertEqual(state["b"].status, "pending", kind)
+            self.assertEqual(state["b"].attempts, [], kind)
+            self.assertTrue(any(err.startswith("oracle FAIL:")
+                                for err in state["a"].errors), kind)
+            self.assertEqual(run["state"].verifications["a"].verdict,
+                             "FAIL", kind)
+            self.assertNotIn("b", run["pool"].task_order, kind)
+            runs[kind] = run
+        self.assertEqual(runs["factory"]["pool"].task_order,
+                         runs["native"]["pool"].task_order)
+        self.assertEqual(runs["factory"]["transport"], runs["native"]["transport"])
+
+    def test_d02_v_critic_failure_blocks_dependent(self):
+        tasks = [self._graph_task("a"), self._graph_task("b", deps=["a"])]
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, {}, tasks=tasks,
+                               verifier_mode="always_fail")
+            self.assertEqual(run["result"], "failed", kind)
+            state = {t.id: t for t in run["state"].tasks}
+            self.assertEqual(state["a"].status, "failed", kind)
+            self.assertEqual(state["b"].status, "pending", kind)
+            self.assertEqual(run["state"].verifications["a"].verdict,
+                             "FAIL", kind)
+            self.assertNotIn("b", run["pool"].task_order, kind)
+
     def test_d03_quality_failure_escalates(self):
         script = {"gemini-3.1-pro-preview": "ok",
                   "nvidia/nemotron-3-ultra": "ok"}
@@ -761,6 +818,104 @@ class AdapterPipelineTests(unittest.TestCase):
             self.assertEqual(final.verdict, "PASS", kind)
             self.assertEqual(final.critic.get("verdict"), "PASS", kind)
             self.assertEqual(final.oracle.get("passed"), True, kind)
+
+    def test_d04_v_fallback_artifact_is_verified(self):
+        script = {"gemini-3.5-flash": "429", "gemini-3.8-flash": "ok"}
+        runs = {}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "medium")
+            self.assertEqual(run["result"], "ok", kind)
+            self.assertEqual(run["transport"], [
+                ("gemini-3.5-flash", "429"),
+                ("gemini-3.8-flash", "ok")], kind)
+            rec = run["state"].verifications["a"]
+            self.assertEqual(rec.verdict, "PASS", kind)
+            self.assertEqual(rec.oracle.get("artifact_sha256"),
+                             s.artifact_hash((Path(run["base"]) / "ws" /
+                                              "app.py").read_text(
+                                 encoding="utf-8")), kind)
+            self.assertEqual(rec.critic.get("verdict"), "PASS", kind)
+            self.assertEqual(run["state"].tasks[0].delivered_by.model_id,
+                             "gemini-3.8-flash", kind)
+            runs[kind] = run
+        self.assertEqual(runs["factory"]["transport"],
+                         runs["native"]["transport"])
+
+    def test_d04_v_fallback_critic_failure_then_fix(self):
+        script = {"gemini-3.5-flash": "429", "gemini-3.8-flash": "ok",
+                  "gemini-3.1-pro-preview": "ok",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "medium",
+                               verifier_mode="fail_first")
+            self.assertEqual(run["result"], "ok", kind)
+            self.assertEqual(run["state"].tasks[0].status, "done", kind)
+            final = run["state"].verifications["a"]
+            self.assertEqual(final.verdict, "PASS", kind)
+            self.assertEqual([c["verdict"] for c in
+                              run["verifier"].critic_calls],
+                             ["FAIL", "PASS"], kind)
+            self.assertTrue(any("critic FAIL" in err
+                                for err in run["state"].tasks[0].errors), kind)
+
+    def test_d07_b_payg_oracle_failure_ledger_parity(self):
+        script = {"gemini-3.1-pro-preview": "invalid",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        runs = {}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high",
+                               registry_mode="payg_first")
+            self.assertEqual(run["result"], "ok", kind)
+            self.assertEqual(run["transport"],
+                             [("gemini-3.1-pro-preview", "invalid"),
+                              ("nvidia/nemotron-3-ultra", "ok")], kind)
+            task = run["state"].tasks[0]
+            self.assertEqual([a.model.model_id for a in task.attempts],
+                             ["gemini-3.1-pro-preview",
+                              "nvidia/nemotron-3-ultra"], kind)
+            self.assertTrue(any(err.startswith("oracle FAIL:")
+                                for err in task.errors), kind)
+            ledger = run["ledger"].all()
+            self.assertEqual(len(ledger), 1, kind)
+            self.assertEqual(ledger[0].state, "CONFIRMED", kind)
+            self.assertTrue(ledger[0].consumed, kind)
+            rec = run["state"].verifications["a"]
+            self.assertEqual(rec.verdict, "PASS", kind)
+            self.assertEqual(rec.oracle.get("artifact_sha256"),
+                             s.artifact_hash((Path(run["base"]) / "ws" /
+                                              "app.py").read_text(
+                                 encoding="utf-8")), kind)
+            runs[kind] = run
+        self.assertEqual([(r.state, r.billing, r.consumed)
+                          for r in runs["factory"]["ledger"].all()],
+                         [(r.state, r.billing, r.consumed)
+                          for r in runs["native"]["ledger"].all()])
+
+    def test_d07_b_payg_unknown_blocks_fix_chain(self):
+        script = {"gemini-3.1-pro-preview": "timeout",
+                  "nvidia/nemotron-3-ultra": "ok"}
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, script, "high",
+                               registry_mode="payg_first")
+            self.assertEqual(run["result"], "failed", kind)
+            self.assertEqual(run["pool"].calls, ["timeout"], kind)
+            recs = run["ledger"].unresolved("r")
+            self.assertEqual(len(recs), 1, kind)
+            self.assertEqual(recs[0].state, UNKNOWN, kind)
+            self.assertEqual(run["state"].tasks[0].status, "failed", kind)
+            self.assertEqual(run["state"].verifications, {}, kind)
+
+    def test_d07_b_confirmed_replay_during_verification(self):
+        for kind in ("factory", "native"):
+            run, _script = self._crash_after_confirm_run(kind)
+            self.assertEqual(run["result"], "crashed", kind)
+            resumed = resume_run(run, {})
+            self.assertEqual(resumed["transport"], [], kind)
+            self.assertEqual(resumed["pool"].calls, [], kind)
+            rec = resumed["ledger"].all()[0]
+            self.assertEqual(rec.state, "CONFIRMED", kind)
+            self.assertTrue(rec.consumed, kind)
+            self.assertEqual(len(resumed["state"].tasks[0].attempts), 1, kind)
 
     def test_d04_auth_connection_server_fallback(self):
         # Compare both adapters rather than hard-coding which candidate the

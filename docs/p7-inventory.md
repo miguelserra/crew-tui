@@ -43,7 +43,7 @@ Baseline: `p6.1-gate` (`86f2df1`).
 | differential cassette | normal, FAIL→FIX, UNVERIFIED, visual retry, fallback, Playwright, resume, publish parity/conflict, D09 integration/sign-off | D09 success/failure, fixer revalidation, approval/rejection and gate bypass green; PAYG ledger/recovery and publisher crash-recovery covered; idempotency header pending |
 | differential report | generated matrix + uncovered items | `docs/p7-differential-report.md` |
 | publisher recovery | fault injection at each journal/apply/rollback boundary + real os._exit subprocess | rollback-only; COMMITTED/ROLLED_BACK/RECOVERY_REQUIRED; never false COMMITTED; orphans detected/cleaned explicitly |
-| P7.1d gate | D01–D12 matrix | **CLOSED**: 30 COVERED / 6 PARTIAL / 0 MISSING / 12 N/A; no DIVERGENT in executed cells |
+| P7.1d gate | D01–D12 matrix | **CLOSED**: 33 COVERED / 3 PARTIAL / 0 MISSING / 12 N/A; no DIVERGENT in executed cells |
 | full pipeline harness | real Router/RouteChain/CallLedger + fake transport | `tests/test_p7_pipeline.py`: 429 fallback, PAYG timeout→UNKNOWN, CONFIRMED replay; shared-component evidence, not adapter parity |
 | adapter full pipeline | WorkflowEngine + both adapters + real Router/RouteChain/CallLedger | `tests/test_p7_pipeline_adapters.py`: D02–D08, D09, D10 phase/cross-phase resume, D11 publication and D12 real publisher crashes; `tests/d10_crash_worker.py` adds six real subprocess crash/restart boundaries |
 | `calls.py` | durable PAYG call ledger + result artifacts | PENDING/SUBMITTED/CONFIRMED/UNKNOWN/FAILED; text-only replay with full invocation fingerprint; history dedup; no silent PAYG retry; resume gate |

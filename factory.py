@@ -644,7 +644,7 @@ No prose, no placeholders, no elided sections.
             )
             task.verification = record.to_dict()
             self.save()
-            fixed = self._fix(task, cand, error, attempts=2)
+            fixed = self._fix(task, cand, error, attempts=1)
             if fixed is None:
                 return False
             cand, code = fixed
@@ -713,7 +713,7 @@ No prose, no placeholders, no elided sections.
         current = cand
         for n in range(1, attempts + 1):
             task.attempts += 1
-            role = "chief" if n == attempts else "fixer"
+            role = "chief" if attempts > 1 and n == attempts else "fixer"
             system = CHIEF_FIX_SYSTEM if role == "chief" else FIX_SYSTEM
             target = self._safe(task.target_file)
             lang = guess_lang(current)
