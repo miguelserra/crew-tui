@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from budget import BudgetSuspended
-from calls import (CallOutcomeUnknown, invocation_fingerprint,
-                   set_call_context)
+from calls import (CallOutcomeUnknown, full_identity_key,
+                   invocation_fingerprint, set_call_context)
 from registry import (
     BILLING_LOCAL,
     BILLING_PAYG,
@@ -135,8 +135,8 @@ def breaker_key(identity: ModelIdentity) -> str:
 
 def identity_key(identity: ModelIdentity) -> str:
     """Unambiguous PAYG identity: provider + endpoint + profile + model."""
-    return (f"{identity.provider}|{identity.endpoint}|"
-            f"{identity.credential_profile}|{identity.model_id}")
+    return full_identity_key(identity.provider, identity.endpoint,
+                             identity.credential_profile, identity.model_id)
 
 
 @dataclass
@@ -387,6 +387,8 @@ class RouteRequest:
     tag: str = ""
     max_tokens: int = 8192
     thinking: bool = False
+    tools: Any = None
+    response_format: Any = None
 
 
 @dataclass
@@ -627,7 +629,7 @@ class RouteChain:
         last_error: Optional[BaseException] = None
         denied_paid = False
         ledger = getattr(self.router, "call_ledger", None)
-        avoid: set[tuple[str, str]] = set()
+        avoid: set[str] = set()
         fingerprint = invocation_fingerprint(messages, self.request)
         if ledger is not None and self.request.run_id:
             avoid = ledger.failed_refs(
@@ -645,7 +647,7 @@ class RouteChain:
                     return ReplayedResponse(text, served)
         for candidate in self.result.candidates:
             identity = candidate.identity
-            if (identity.credential_profile, identity.model_id) in avoid:
+            if identity_key(identity) in avoid:
                 continue
             if self.router is not None and not self.router.breaker.allow(identity):
                 continue

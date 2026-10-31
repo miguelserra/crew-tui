@@ -87,6 +87,20 @@ ADAPTER_PIPELINE = [
      "test_d05_manual_failed_resume_advances_without_repeat"),
     ("Adapteres D05: resoluções incompatíveis rejeitadas após reload",
      "test_d05_resolution_guards_reject_incompatible"),
+    ("Adapteres D05: failed_refs usa a identidade completa",
+     "test_d05_failed_ref_requires_full_identity"),
+    ("Adapteres D06: CONFIRMED replay sem nova invocação",
+     "test_d06_confirmed_replays_without_new_invocation"),
+    ("Adapteres D06: crash após confirm antes da TaskAttempt",
+     "test_d06_crash_after_confirm_before_attempt"),
+    ("Adapteres D06: crash após tentativa antes de consumed, sem duplicar",
+     "test_d06_crash_after_attempt_before_consume_dedupes"),
+    ("Adapteres D06: fingerprint alterada força nova chamada",
+     "test_d06_changed_fingerprint_forces_new_call"),
+    ("Adapteres D06: artefacto ausente bloqueia fail-closed",
+     "test_d06_missing_artifact_fails_closed"),
+    ("Adapteres D06: tool_calls não replayable bloqueia fail-closed",
+     "test_d06_tool_calls_are_not_replayable"),
 ]
 
 PIPELINE = [
@@ -159,8 +173,8 @@ MATRIX = [
         "PUBLICATION": ("N/A", "no publication required"),
     }),
     ("D06", "CONFIRMED replay and recovery", {
-        "EXECUTION": ("PARTIAL", "P4 ledger/replay tests, not adapter differential"),
-        "MODELS_BILLING_LEDGER": ("PARTIAL", "real replay tested in test_p7_pipeline; no adapter ledger parity"),
+        "EXECUTION": ("COVERED", "adapter-level CONFIRMED replay after confirm/attempt crash boundaries; changed fingerprints force a fresh call; missing/non-replayable artifacts fail closed"),
+        "MODELS_BILLING_LEDGER": ("COVERED", "real ledger replay/consumption and history dedup through both adapters; non-replayable tool_calls and artifact loss are explicit"),
         "VERIFICATION": ("N/A", "no verification involved"),
         "PUBLICATION": ("N/A", "no publication required"),
     }),

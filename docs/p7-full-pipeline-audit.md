@@ -94,9 +94,14 @@ evidence of routing, provider classification, or PAYG ledger parity.
   `run_id` to `Factory`, bypassing the ledger on the Factory path. A second
   production change makes `RouteChain` skip PAYG identities already recorded
   as FAILED for the same run/task/tag (`CallLedger.failed_refs`), so a resumed
-  task cannot silently repeat a failed paid call.
-- [~] D06 – partially resolved at shared-routechain level; adapter-level
-  replay/resume is still outstanding.
+  task cannot silently repeat a failed paid call. The key is the full
+  provider+endpoint+profile+model identity, so two endpoints sharing a
+  credential profile and model id do not suppress each other.
+- [x] D06 – covered at adapter level: CONFIRMED replay without a provider
+  call after crashes before the TaskAttempt and after the attempt but before
+  `mark_consumed`; history/attempt deduplication; changed fingerprints
+  (max_tokens, thinking, tools, response_format) force a fresh call; missing
+  artifacts and non-replayable tool_calls fail closed with no retry.
 
 Full-pipeline tests live in `tests/test_p7_pipeline.py` and use the real
 `Router`, `RouteChain` and `CallLedger` with a scripted `handle_provider` as

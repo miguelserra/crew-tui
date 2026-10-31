@@ -6,6 +6,8 @@ D04: technical fallback and PAYG ambiguity through the real classifier.
 D05: PAYG timeout -> UNKNOWN, single invocation, resume blocks without retry;
 confirmed FAILED falls back once; manual FAILED resolution is durable and the
 resume advances to the next candidate without repeating the original call.
+D06: CONFIRMED result replay after crash boundaries, fingerprint changes,
+missing/non-replayable artifacts, and history deduplication.
 """
 
 import sys
@@ -33,6 +35,10 @@ except Exception as exc:  # pragma: no cover
 else:
     DEPS_OK = True
     DEPS_ERR = ""
+
+
+class SimulatedCrash(BaseException):
+    """Abrupt termination used to test resume/replay boundaries."""
 
 
 class Http429(Exception):
@@ -120,6 +126,12 @@ class FakeHandle:
         if self.behavior == "empty":
             return types.SimpleNamespace(
                 content="", usage_metadata={}, response_metadata={})
+        if self.behavior == "tool":
+            self.owner.last_served = self.ref
+            return types.SimpleNamespace(
+                content="tool-output",
+                tool_calls=[{"name": "tool", "args": {}}],
+                usage_metadata={}, response_metadata={})
         self.owner.last_served = self.ref
         return types.SimpleNamespace(
             content="```python\nprint('ok')\n```",
@@ -139,6 +151,9 @@ class PipelinePool:
         self.last_attempt_model = {}
         self.local_up = False
         self.last_served = None
+        self.last_response = None
+        self.crash_after_confirm = False
+        self.request_overrides = None
         self.registry = make_registry(registry_mode)
 
         def handle_provider(ident, tag, max_tokens, thinking):
@@ -150,6 +165,18 @@ class PipelinePool:
                              grants=GrantStore(allow_paid=True),
                              breaker=CircuitBreaker(),
                              availability=lambda i: True)
+        # Inject effective generation parameters at the router boundary. The
+        # Factory adapter has no knob for these, so this is harness-level
+        # control of the request that both adapters actually route.
+        base_route = self.router.route
+
+        def route(request):
+            if self.request_overrides:
+                for key, value in self.request_overrides.items():
+                    setattr(request, key, value)
+            return base_route(request)
+
+        self.router.route = route
 
     def is_peak(self):
         return False
@@ -178,6 +205,10 @@ class PipelinePool:
         except Exception:
             clear_call_context()
             raise
+        self.last_response = response
+        if self.crash_after_confirm:
+            self.crash_after_confirm = False
+            raise SimulatedCrash("after ledger confirm, before attempt")
         text = getattr(response, "content", response)
         text = text if isinstance(text, str) else str(text)
         served = last_served_ref() or self.last_served
@@ -225,16 +256,7 @@ def settings(base):
     return cfg
 
 
-def run_pipeline(kind, script, complexity="medium", pre_ledger=None,
-                 registry_mode="full"):
-    base = Path(tempfile.mkdtemp(prefix="p7pipe-"))
-    project = base / "project"; project.mkdir()
-    ws = base / "ws"
-    cfg = settings(base)
-    st = make_state(project, ws, complexity)
-    if pre_ledger is not None:
-        pre_ledger(project)
-    pool = PipelinePool(script, registry_mode)
+def _make_adapter(kind, cfg, pool, st):
     if kind == "factory":
         adapter = engine.FactoryAdapter(cfg, pool, lambda *a: None, st,
                                         isolate_workspace=True)
@@ -243,12 +265,64 @@ def run_pipeline(kind, script, complexity="medium", pre_ledger=None,
         adapter = native_adapter.NativeAdapter(
             cfg, pool, lambda *a: None, st, verifier=FakeVerifier(),
             isolate_workspace=True)
+    return adapter
+
+
+def _crash_before_consume(eng):
+    original = eng.call_ledger.mark_consumed
+
+    def crash(call_id):
+        eng.call_ledger.mark_consumed = original
+        raise SimulatedCrash("after attempt save, before mark_consumed")
+
+    eng.call_ledger.mark_consumed = crash
+
+
+def run_pipeline(kind, script, complexity="medium", pre_ledger=None,
+                 registry_mode="full", *, crash_after_confirm=False,
+                 crash_before_consume=False, request_overrides=None):
+    base = Path(tempfile.mkdtemp(prefix="p7pipe-"))
+    project = base / "project"; project.mkdir()
+    ws = base / "ws"
+    cfg = settings(base)
+    st = make_state(project, ws, complexity)
+    if pre_ledger is not None:
+        pre_ledger(project)
+    pool = PipelinePool(script, registry_mode)
+    pool.crash_after_confirm = crash_after_confirm
+    pool.request_overrides = request_overrides
+    adapter = _make_adapter(kind, cfg, pool, st)
+    store = StateManager(cfg.workspace_dir, cfg.log_dir)
+    eng = engine.WorkflowEngine(st, store, adapter, emit=lambda *a: None)
+    eng.apply_pool(pool)
+    if crash_before_consume:
+        _crash_before_consume(eng)
+    crashed = False
+    try:
+        result = eng.step()
+    except SimulatedCrash:
+        crashed = True
+        result = "crashed"
+    return {"base": base, "state": st, "engine": eng, "pool": pool,
+            "ledger": eng.call_ledger, "result": result, "kind": kind,
+            "transport": pool.transport, "crashed": crashed}
+
+
+def resume_run(run, script=None, registry_mode="payg_first", *,
+               request_overrides=None):
+    """New engine/adapter over the same project ledger and canonical state."""
+    base = run["base"]
+    cfg = settings(base)
+    st = run["state"]
+    pool = PipelinePool(script or {}, registry_mode)
+    pool.request_overrides = request_overrides
+    adapter = _make_adapter(run["kind"], cfg, pool, st)
     store = StateManager(cfg.workspace_dir, cfg.log_dir)
     eng = engine.WorkflowEngine(st, store, adapter, emit=lambda *a: None)
     eng.apply_pool(pool)
     result = eng.step()
     return {"base": base, "state": st, "engine": eng, "pool": pool,
-            "ledger": eng.call_ledger, "result": result, "kind": kind,
+            "ledger": eng.call_ledger, "result": result, "kind": run["kind"],
             "transport": pool.transport}
 
 
@@ -407,6 +481,35 @@ class AdapterPipelineTests(unittest.TestCase):
                              "nvidia/nemotron-3-ultra")
             self.assertEqual(len(run["ledger"].all()), 1)
 
+    def test_d05_failed_ref_requires_full_identity(self):
+        # Same credential_profile + model_id, different provider/endpoint: the
+        # failed record must not suppress the current candidate.
+        def seed(project):
+            led = CallLedger(project / ".crew" / "calls.json")
+            other = ModelIdentity(
+                provider="other-provider", endpoint="other-endpoint",
+                model_id="gemini-3.1-pro-preview", family="other",
+                credential_profile="gemini-plus", billing=BILLING_PAYG,
+                capabilities=frozenset({"text"}), defined=True)
+            ref = ModelRegistry(models=[]).ref_for_identity(other)
+            rec = led.intent(run_id="r", role="programming", ref=ref,
+                             task="a", tag="DEV")
+            led.submitted(rec.call_id)
+            led.fail(rec.call_id, "server error", "server", ambiguous=False)
+
+        for kind in ("factory", "native"):
+            run = run_pipeline(kind, {"gemini-3.1-pro-preview": "ok"},
+                               "high", pre_ledger=seed,
+                               registry_mode="payg_first")
+            self.assertEqual(run["result"], "ok", kind)
+            self.assertEqual(run["transport"],
+                             [("gemini-3.1-pro-preview", "ok")], kind)
+            self.assertEqual(run["state"].tasks[0].delivered_by.model_id,
+                             "gemini-3.1-pro-preview")
+            self.assertTrue(any(
+                rec.state == "FAILED" and rec.provider == "other-provider"
+                for rec in run["ledger"].all()))
+
     def test_d05_resolution_guards_reject_incompatible(self):
         script = {"gemini-3.1-pro-preview": "connection",
                   "nvidia/nemotron-3-ultra": "ok"}
@@ -467,6 +570,127 @@ class AdapterPipelineTests(unittest.TestCase):
             self.assertEqual(result, "paused")
             self.assertEqual(run["state"].pause.reason, "call_unknown_failed")
             self.assertEqual(run["pool"].calls, ["timeout"])
+
+    def _crash_after_confirm_run(self, kind, behavior="ok", overrides=None):
+        script = {"gemini-3.1-pro-preview": behavior,
+                  "nvidia/nemotron-3-ultra": "ok"}
+        run = run_pipeline(kind, script, "high",
+                           registry_mode="payg_first",
+                           crash_after_confirm=True,
+                           request_overrides=overrides)
+        self.assertTrue(run["crashed"], kind)
+        return run, script
+
+    def test_d06_confirmed_replays_without_new_invocation(self):
+        for kind in ("factory", "native"):
+            run, _script = self._crash_after_confirm_run(kind)
+            rec = run["ledger"].all()[0]
+            self.assertEqual(rec.state, CONFIRMED)
+            self.assertFalse(rec.consumed)
+            self.assertIsNotNone(run["ledger"].result_text(rec.call_id))
+
+            resumed = resume_run(run, {})
+            self.assertIn(resumed["result"], ("ok", "done"), kind)
+            self.assertEqual(resumed["transport"], [], kind)
+            self.assertEqual(resumed["pool"].calls, [])
+            rec2 = resumed["ledger"].get(rec.call_id)
+            self.assertEqual(rec2.state, CONFIRMED)
+            self.assertTrue(rec2.consumed)
+            self.assertTrue(resumed["pool"].last_response.response_metadata
+                            .get("replayed"))
+
+    def test_d06_crash_after_confirm_before_attempt(self):
+        for kind in ("factory", "native"):
+            run, _script = self._crash_after_confirm_run(kind)
+            self.assertEqual(run["state"].tasks[0].attempts, [])
+            resumed = resume_run(run, {})
+            self.assertEqual(resumed["transport"], [], kind)
+            self.assertEqual(len(resumed["state"].tasks[0].attempts), 1)
+            self.assertTrue(resumed["ledger"].all()[0].consumed)
+
+    def test_d06_crash_after_attempt_before_consume_dedupes(self):
+        for kind in ("factory", "native"):
+            script = {"gemini-3.1-pro-preview": "ok",
+                      "nvidia/nemotron-3-ultra": "ok"}
+            run = run_pipeline(kind, script, "high",
+                               registry_mode="payg_first",
+                               crash_before_consume=True)
+            self.assertTrue(run["crashed"], kind)
+            attempts = run["state"].tasks[0].attempts
+            self.assertEqual(len(attempts), 1)
+            call_id = attempts[0].call_id
+            self.assertTrue(call_id)
+            rec = run["ledger"].get(call_id)
+            self.assertEqual(rec.state, CONFIRMED)
+            self.assertFalse(rec.consumed)
+
+            resumed = resume_run(run, {})
+            self.assertEqual(resumed["transport"], [], kind)
+            self.assertEqual(len(resumed["state"].tasks[0].attempts), 1)
+            self.assertEqual(resumed["state"].tasks[0].attempts[0].call_id,
+                             call_id)
+            self.assertTrue(resumed["ledger"].get(call_id).consumed)
+            history = [e for e in resumed["state"].history
+                       if e.get("kind") == "attempt"
+                       and e.get("attempt", {}).get("call_id") == call_id]
+            self.assertEqual(history, [], kind)
+
+    def test_d06_changed_fingerprint_forces_new_call(self):
+        cases = [
+            ("max_tokens", {"max_tokens": 2048}),
+            ("thinking", {"thinking": True}),
+            ("tools", {"tools": [{"name": "x"}]}),
+            ("response_format", {"response_format": {"type": "json_object"}}),
+        ]
+        for name, overrides in cases:
+            for kind in ("factory", "native"):
+                run, script = self._crash_after_confirm_run(kind)
+                old = run["ledger"].all()[0]
+                self.assertEqual(old.state, CONFIRMED)
+                self.assertFalse(old.consumed)
+
+                resumed = resume_run(run, script,
+                                     request_overrides=overrides)
+                self.assertEqual(resumed["transport"],
+                                 [("gemini-3.1-pro-preview", "ok")],
+                                 (kind, name))
+                records = resumed["ledger"].all()
+                self.assertEqual(len(records), 2, (kind, name))
+                self.assertEqual(
+                    resumed["ledger"].get(old.call_id).state, CONFIRMED)
+                self.assertFalse(
+                    resumed["ledger"].get(old.call_id).consumed)
+                fresh = [r for r in records if r.call_id != old.call_id][0]
+                self.assertEqual(fresh.state, CONFIRMED)
+                self.assertTrue(fresh.consumed)
+
+    def test_d06_missing_artifact_fails_closed(self):
+        for kind in ("factory", "native"):
+            run, _script = self._crash_after_confirm_run(kind)
+            rec = run["ledger"].all()[0]
+            path = (Path(run["base"]) / "project" / ".crew" /
+                    "call_results" / f"{rec.call_id}.json")
+            path.unlink()
+            resumed = resume_run(run, {})
+            self.assertEqual(resumed["result"], "paused", kind)
+            self.assertEqual(resumed["state"].pause.reason,
+                             "call_recovery_failed")
+            self.assertEqual(resumed["transport"], [])
+            self.assertFalse(resumed["ledger"].get(rec.call_id).consumed)
+
+    def test_d06_tool_calls_are_not_replayable(self):
+        for kind in ("factory", "native"):
+            run, _script = self._crash_after_confirm_run(kind, "tool")
+            rec = run["ledger"].all()[0]
+            self.assertEqual(rec.state, CONFIRMED)
+            self.assertFalse(rec.replayable)
+            self.assertIsNone(run["ledger"].result_text(rec.call_id))
+            resumed = resume_run(run, {})
+            self.assertEqual(resumed["result"], "paused", kind)
+            self.assertEqual(resumed["state"].pause.reason,
+                             "call_recovery_failed")
+            self.assertEqual(resumed["transport"], [])
+            self.assertFalse(resumed["ledger"].get(rec.call_id).consumed)
 
 
 if __name__ == "__main__":

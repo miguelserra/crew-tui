@@ -74,6 +74,12 @@ def message_text(message: Any) -> str:
     return str(content)
 
 
+def full_identity_key(provider: str, endpoint: str,
+                      credential_profile: str, model_id: str) -> str:
+    """Canonical model identity shared by ledger, router and registry flows."""
+    return f"{provider}|{endpoint}|{credential_profile}|{model_id}"
+
+
 def request_fingerprint(messages: Iterable[Any]) -> str:
     payload = [message_text(m) for m in messages]
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -399,16 +405,19 @@ class CallLedger:
         return None
 
     def failed_refs(self, run_id: str, task: str = "",
-                    tag: str = "") -> set[tuple[str, str]]:
-        """PAYG identities already confirmed-failed for this task/tag.
+                    tag: str = "") -> set[str]:
+        """Full PAYG identities already confirmed-failed for this task/tag.
 
-        A failed PAYG call (automatic or manually resolved) must not be
+        The key is provider+endpoint+profile+model on purpose: two endpoints
+        that share a credential profile and model id must not suppress each
+        other. A failed PAYG call (automatic or manually resolved) must not be
         silently repeated when the workflow resumes; routing skips it and
         moves to the next candidate instead.
         """
         with self._lock:
             return {
-                (rec.credential_profile, rec.model_id)
+                full_identity_key(rec.provider, rec.endpoint,
+                                  rec.credential_profile, rec.model_id)
                 for rec in self._records.values()
                 if rec.state == FAILED
                 and rec.run_id == str(run_id or "")
