@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """P7.2a: Project Brief, adaptive interview, provenance and approval."""
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -210,11 +211,12 @@ class BriefTests(unittest.TestCase):
             brief_path = Path(td) / "brief.json"
             brief_path.write_text(__import__("json").dumps(MINIMAL),
                                   encoding="utf-8")
+            env = dict(os.environ, PYTHONIOENCODING="utf-8")
             proc = subprocess.run(
                 [sys.executable, "main.py", "--project",
                  str(Path(td) / "project"), "--brief", str(brief_path)],
                 cwd=str(root), input="", capture_output=True, text=True,
-                timeout=40)
+                timeout=40, env=env)
             self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
             self.assertIn("BLOCKING", proc.stdout)
             self.assertIn("q_core_workflows", proc.stdout)
@@ -226,6 +228,7 @@ class BriefTests(unittest.TestCase):
             brief_path = Path(td) / "brief.json"
             brief_path.write_text(__import__("json").dumps(MINIMAL),
                                   encoding="utf-8")
+            env = dict(os.environ, PYTHONIOENCODING="utf-8")
             proc = subprocess.run(
                 [sys.executable, "main.py", "--project",
                  str(Path(td) / "project"), "--brief", str(brief_path),
@@ -234,7 +237,7 @@ class BriefTests(unittest.TestCase):
                  "--defer", "q_application_type",
                  "--defer", "q_preferred_language"],
                 cwd=str(root), input="", capture_output=True, text=True,
-                timeout=40)
+                timeout=40, env=env)
             self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
             self.assertNotIn("BLOCKED: decisão bloqueante", proc.stdout)
             self.assertIn("--approve-spec", proc.stdout)
