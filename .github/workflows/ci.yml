@@ -66,6 +66,8 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p7_executor.py"
       - name: P7 differential smoke
         run: python -m unittest discover -s tests -p "test_p7_differential.py"
+      - name: P7 adapter full pipeline
+        run: python -m unittest discover -s tests -p "test_p7_pipeline_adapters.py"
 
   windows:
     name: Windows (py3.13)

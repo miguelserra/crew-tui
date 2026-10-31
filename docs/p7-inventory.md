@@ -44,6 +44,7 @@ Baseline: `p6.1-gate` (`86f2df1`).
 | publisher recovery | fault injection at each journal/apply/rollback boundary + real os._exit subprocess | rollback-only; COMMITTED/ROLLED_BACK/RECOVERY_REQUIRED; never false COMMITTED; orphans detected/cleaned explicitly |
 | P7.1d gate | D01–D12 matrix | **CLOSED**: 5 COVERED / 29 PARTIAL / 1 MISSING / 13 N/A; no DIVERGENT in executed cells |
 | full pipeline harness | real Router/RouteChain/CallLedger + fake transport | `tests/test_p7_pipeline.py`: 429 fallback, PAYG timeout→UNKNOWN, CONFIRMED replay; shared-component evidence, not adapter parity |
+| adapter full pipeline | WorkflowEngine + both adapters + real Router/RouteChain/CallLedger | `tests/test_p7_pipeline_adapters.py`: D04 429 fallback, D05 timeout→UNKNOWN + resume block; other variants outstanding |
 | `calls.py` | durable PAYG call ledger + result artifacts | PENDING/SUBMITTED/CONFIRMED/UNKNOWN/FAILED; text-only replay with full invocation fingerprint; history dedup; no silent PAYG retry; resume gate |
 | integration fixer | one call + affected task ids + producer | revalidates changed artefacts (oracle+critic), invalidates stale PASS |
 

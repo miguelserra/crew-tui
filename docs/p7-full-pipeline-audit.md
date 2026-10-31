@@ -80,12 +80,16 @@ evidence of routing, provider classification, or PAYG ledger parity.
 
 - [x] D02 dependency ordering (already fixed and covered in `9e51b4b`).
 - [ ] D03 – outstanding (no adapter-level routing test).
-- [~] D04 – partially resolved: `test_p7_pipeline` proves real 429 fallback
-  through Router/RouteChain; adapter parity still outstanding.
-- [~] D05 – partially resolved: real timeout -> UNKNOWN with a single
-  invocation through the real ledger; adapter parity still outstanding.
-- [~] D06 – partially resolved: real CONFIRMED replay without a new
-  invocation; adapter parity still outstanding.
+- [~] D04 – partially resolved: adapter-level 429 fallback now runs through
+  both adapters (`test_p7_pipeline_adapters`); auth/bad-request/connection/
+  server variants are still outstanding.
+- [~] D05 – partially resolved: adapter-level PAYG timeout -> UNKNOWN and
+  resume blocking (no retry) now run through both adapters; other ledger
+  variants are still outstanding. This also exposed and fixed a real defect:
+  `FactoryAdapter` did not propagate `run_id` to `Factory`, bypassing the
+  ledger on the Factory path.
+- [~] D06 – partially resolved at shared-routechain level; adapter-level
+  replay/resume is still outstanding.
 
 Full-pipeline tests live in `tests/test_p7_pipeline.py` and use the real
 `Router`, `RouteChain` and `CallLedger` with a scripted `handle_provider` as

@@ -60,11 +60,11 @@ Cell totals: **5 COVERED**, **29 PARTIAL**, **1 MISSING**, **13 N/A**.
 | D03 | MODELS_BILLING_LEDGER | MISSING | router/breaker/escalation not compared through adapters |
 | D03 | VERIFICATION | PARTIAL | no escalation-specific verification comparison |
 | D03 | PUBLICATION | N/A | no publication required |
-| D04 | EXECUTION | COVERED | quota/timeout/all-unavailable differential cassettes |
+| D04 | EXECUTION | COVERED | adapter-level 429 + shared quota/timeout/all-unavailable cassettes |
 | D04 | MODELS_BILLING_LEDGER | PARTIAL | real classify_error/RouteChain exercised in test_p7_pipeline; adapter parity still missing |
 | D04 | VERIFICATION | PARTIAL | no verification in fallback scenarios |
 | D04 | PUBLICATION | N/A | no publication required |
-| D05 | EXECUTION | PARTIAL | P4 RouteChain/engine tests, not adapter differential |
+| D05 | EXECUTION | PARTIAL | adapter-level timeout->UNKNOWN/resume now covered; other PAYG variants missing |
 | D05 | MODELS_BILLING_LEDGER | PARTIAL | real ledger/UNKNOWN tested in test_p7_pipeline; no adapter ledger parity |
 | D05 | VERIFICATION | N/A | no verification involved |
 | D05 | PUBLICATION | N/A | no publication required |
@@ -124,6 +124,15 @@ Regras aplicadas pelo comparador: timestamps/UUIDs são normalizados (ALLOWED_VA
 | Fingerprint inclui contrato de geração | Verde | `RouteChainLedgerTests.test_replay_requires_same_generation_contract` |
 | Resposta estruturada não é replayable | Verde | `RouteChainLedgerTests.test_structured_response_is_not_replayable` |
 | History reconciliada sem duplicar evento | Verde | `EngineCallGateTests.test_history_reconciliation_dedups_critic_event` |
+
+## Adapter-level full pipeline (WorkflowEngine + both adapters)
+
+These run both `FactoryAdapter` and `NativeAdapter` through `WorkflowEngine`, the real Router/RouteChain and the real CallLedger, with only the provider transport scripted.
+
+| Caso | Estado | Teste |
+|---|---|---|
+| Adapteres: 429 -> fallback seguro (Router/RouteChain reais) | Verde | `AdapterPipelineTests.test_d04_429_fallback_matches_across_adapters` |
+| Adapteres: PAYG timeout -> UNKNOWN, resume bloqueia sem retry | Verde | `AdapterPipelineTests.test_d05_payg_timeout_unknown_and_resume_blocks` |
 
 ## Full pipeline (real Router + RouteChain + CallLedger, fake transport)
 

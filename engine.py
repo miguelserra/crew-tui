@@ -599,6 +599,9 @@ class FactoryAdapter:
         if self.isolated:
             self.factory.final_root = Path(project.project_root)
         self.factory.state = self._to_factory_state(project)
+        self.factory.run_id = project.run_id or ""
+        if self.factory.run_id:
+            self.factory.state.run_id = self.factory.run_id
         self.pool.attempt_sink = self._on_attempt_from_pool
 
     # -- conversion --------------------------------------------------------- #

@@ -64,6 +64,13 @@ PENDING = [
      "retenção) e o envio condicionado a essa declaração."),
 ]
 
+ADAPTER_PIPELINE = [
+    ("Adapteres: 429 -> fallback seguro (Router/RouteChain reais)",
+     "test_d04_429_fallback_matches_across_adapters"),
+    ("Adapteres: PAYG timeout -> UNKNOWN, resume bloqueia sem retry",
+     "test_d05_payg_timeout_unknown_and_resume_blocks"),
+]
+
 PIPELINE = [
     ("Real Router+RouteChain 429 -> fallback seguro",
      "test_d04_429_falls_back_to_next_candidate"),
@@ -122,13 +129,13 @@ MATRIX = [
         "PUBLICATION": ("N/A", "no publication required"),
     }),
     ("D04", "Technical fallback", {
-        "EXECUTION": ("COVERED", "quota/timeout/all-unavailable differential cassettes"),
+        "EXECUTION": ("COVERED", "adapter-level 429 + shared quota/timeout/all-unavailable cassettes"),
         "MODELS_BILLING_LEDGER": ("PARTIAL", "real classify_error/RouteChain exercised in test_p7_pipeline; adapter parity still missing"),
         "VERIFICATION": ("PARTIAL", "no verification in fallback scenarios"),
         "PUBLICATION": ("N/A", "no publication required"),
     }),
     ("D05", "PAYG safety and UNKNOWN", {
-        "EXECUTION": ("PARTIAL", "P4 RouteChain/engine tests, not adapter differential"),
+        "EXECUTION": ("PARTIAL", "adapter-level timeout->UNKNOWN/resume now covered; other PAYG variants missing"),
         "MODELS_BILLING_LEDGER": ("PARTIAL", "real ledger/UNKNOWN tested in test_p7_pipeline; no adapter ledger parity"),
         "VERIFICATION": ("N/A", "no verification involved"),
         "PUBLICATION": ("N/A", "no publication required"),
@@ -255,6 +262,15 @@ def run_safety() -> list[tuple[str, str, str, str]]:
     return rows
 
 
+def run_adapter_pipeline() -> list[tuple[str, str, str, str]]:
+    rows = []
+    for label, method in ADAPTER_PIPELINE:
+        status = _run_one("tests.test_p7_pipeline_adapters",
+                          "AdapterPipelineTests", method)
+        rows.append((label, f"AdapterPipelineTests.{method}", "", status))
+    return rows
+
+
 def run_pipeline() -> list[tuple[str, str, str, str]]:
     rows = []
     for label, method in PIPELINE:
@@ -279,7 +295,7 @@ def matrix_counts():
     return counts
 
 
-def render(rows, safety, publisher, pipeline) -> str:
+def render(rows, safety, publisher, pipeline, adapter_pipeline) -> str:
     lines = [
         "# P7 differential equivalence report (P7.1d)",
         "",
@@ -366,6 +382,19 @@ def render(rows, safety, publisher, pipeline) -> str:
         lines.append(f"| {label} | {status} | `{name}` |")
     lines += [
         "",
+        "## Adapter-level full pipeline (WorkflowEngine + both adapters)",
+        "",
+        "These run both `FactoryAdapter` and `NativeAdapter` through "
+        "`WorkflowEngine`, the real Router/RouteChain and the real CallLedger, "
+        "with only the provider transport scripted.",
+        "",
+        "| Caso | Estado | Teste |",
+        "|---|---|---|",
+    ]
+    for label, name, _dims, status in adapter_pipeline:
+        lines.append(f"| {label} | {status} | `{name}` |")
+    lines += [
+        "",
         "## Full pipeline (real Router + RouteChain + CallLedger, fake transport)",
         "",
         "These exercise the real routing/classification/ledger components with "
@@ -432,11 +461,15 @@ def main() -> int:
     safety = run_safety()
     publisher = run_publisher()
     pipeline = run_pipeline()
+    adapter_pipeline = run_adapter_pipeline()
     out = ROOT / "docs" / "p7-differential-report.md"
-    out.write_text(render(rows, safety, publisher, pipeline), encoding="utf-8")
-    failed = [r for r in rows + safety + publisher + pipeline if r[3] == "Falha"]
+    out.write_text(render(rows, safety, publisher, pipeline, adapter_pipeline),
+                   encoding="utf-8")
+    failed = [r for r in rows + safety + publisher + pipeline + adapter_pipeline
+              if r[3] == "Falha"]
     print(f"wrote {out}")
-    for label, _name, _dims, status in rows + safety + publisher + pipeline:
+    for label, _name, _dims, status in (rows + safety + publisher + pipeline
+                                        + adapter_pipeline):
         print(f"  {status:10} {label}")
     return 1 if failed else 0
 
