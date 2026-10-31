@@ -186,6 +186,7 @@ class Factory:
         self.emit = emit
         self.telemetry = telemetry
         self.root = Path(project_root).expanduser().resolve()
+        self.final_root: Optional[Path] = None
         self.root.mkdir(parents=True, exist_ok=True)
         self.dir = self.root / ".factory"
         self.dir.mkdir(exist_ok=True)
@@ -1074,7 +1075,7 @@ Write the handover memory for the next engineer. STRICT JSON:
         except Exception as e:
             memory = {"note": f"sign-off gerado sem modelo: {e}"}
         payload = {
-            "project": str(self.root),
+            "project": str(getattr(self, "final_root", None) or self.root),
             "goal": self.state.goal,
             "generated_at": _now(),
             "requirements": self.state.requirements,

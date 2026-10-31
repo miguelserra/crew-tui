@@ -186,6 +186,7 @@ class Settings:
     allow_paid: bool = False
     allow_unknown: bool = False  # authorize models whose billing cannot be proved
     allow_unverified: bool = False  # explicit delivery exception for UNVERIFIED
+    workflow_profile: str = "auto"  # auto|web|library|script|review
     payg_models: str = ""      # extra comma-separated ids that bill per token
     # Cost policy: during a peak UTC window, skip pay-as-you-go DeepSeek and
     # fall back to the already-paid Gemini Plus subscription.
@@ -293,6 +294,7 @@ class Settings:
             allow_paid=_env_bool(env, "ALLOW_PAID", False),
             allow_unknown=_env_bool(env, "ALLOW_UNKNOWN", False),
             allow_unverified=_env_bool(env, "ALLOW_UNVERIFIED", False),
+            workflow_profile=env.get("WORKFLOW_PROFILE", "auto"),
             payg_models=env.get("PAYG_MODELS", ""),
             peak_policy=_env_bool(env, "PEAK_POLICY", True),
             peak_windows=env.get("PEAK_WINDOWS_UTC", "01:00-04:00,06:00-10:00"),
@@ -4005,11 +4007,13 @@ class CrewTUIApp(App):
                                      engine_version="legacy", phase="SPEC")
             else:
                 state = new_unified_state(goal or "projeto", str(root),
-                                          engine_version=ENGINE_VERSION)
+                                          engine_version=ENGINE_VERSION,
+                                          profile=self.settings.workflow_profile)
         if not state.project_root:
             state.project_root = str(root)
         adapter = FactoryAdapter(self.settings, self.pool, self._factory_emit, state,
-                                 legacy_order=(kind == ENGINE_LEGACY))
+                                 legacy_order=(kind == ENGINE_LEGACY),
+                                 isolate_workspace=(kind == ENGINE_UNIFIED))
         eng = WorkflowEngine(state, store, adapter, emit=self._factory_emit,
                              allow_unknown=self.settings.allow_unknown,
                              persistence=persistence)
@@ -4315,6 +4319,8 @@ def _legacy_factory_cli(args: Any, settings: Any = None, store: Any = None) -> i
         settings.allow_unknown = True
     if getattr(args, "allow_unverified", False):
         settings.allow_unverified = True
+    if getattr(args, "profile", None):
+        settings.workflow_profile = str(args.profile)
     if settings.unattended:
         settings.sleep_if_active = True
     telemetry = Telemetry(settings)
@@ -4384,7 +4390,9 @@ def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
         if not args.factory:
             print("uso: crew-tui --factory \"objetivo\" [--project DIR]", flush=True)
             return 2
-        state = new_unified_state(args.factory, str(root), engine_version=ENGINE_VERSION)
+        state = new_unified_state(args.factory, str(root),
+                                  engine_version=ENGINE_VERSION,
+                                  profile=settings.workflow_profile)
         state.engine_kind = kind
         if kind == ENGINE_LEGACY:
             state.engine_version = "legacy"
@@ -4399,7 +4407,8 @@ def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
               f"o estado usa engine_kind={kind}", flush=True)
 
     adapter = FactoryAdapter(settings, pool, emit, state,
-                             legacy_order=(kind == ENGINE_LEGACY))
+                             legacy_order=(kind == ENGINE_LEGACY),
+                             isolate_workspace=(kind == ENGINE_UNIFIED))
     eng = WorkflowEngine(state, store, adapter, emit=emit,
                          allow_unknown=bool(getattr(args, "allow_unknown", False)
                                             or settings.allow_unknown),
@@ -4468,6 +4477,8 @@ def _factory_cli(args: Any) -> int:
         settings.allow_unknown = True
     if getattr(args, "allow_unverified", False):
         settings.allow_unverified = True
+    if getattr(args, "profile", None):
+        settings.workflow_profile = str(args.profile)
     if settings.unattended:
         settings.sleep_if_active = True
     store = StateManager(settings.workspace_dir, settings.log_dir)
@@ -4556,6 +4567,8 @@ def main() -> None:
                         help="autoriza billing desconhecido (nunca por omissão)")
     parser.add_argument("--allow-unverified", action="store_true",
                         help="entrega explicitamente artefacts UNVERIFIED")
+    parser.add_argument("--profile", metavar="PROFILE",
+                        help="workflow: auto|web|library|script|review")
     parser.add_argument("--approve-architecture", action="store_true",
                         help="aprova a arquitetura (o --yes não a aprova)")
     parser.add_argument("--migrate-state", action="store_true",

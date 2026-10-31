@@ -688,10 +688,14 @@ class ProjectState:
              "task_ids": sorted(c.task_ids), "justification": c.justification}
             for c in self.requirements.acceptance
         ]
+        selection = self.extensions.get("profile_selection") or {}
         return sha256_json({
             "architecture": self.architecture.approval_payload(),
             "tasks": [t.plan_dict() for t in sorted(self.tasks, key=lambda t: t.id)],
             "traceability": criteria,
+            "profile": self.profile,
+            "profile_version": selection.get("profile_version", 1),
+            "profile_resolved": selection.get("resolved", self.profile),
         })
 
     def spec_approved(self) -> bool:

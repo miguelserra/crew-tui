@@ -245,6 +245,31 @@ Delivery requires independent evidence, not just a successful model call:
 `verify.py` owns the delivery policy; `main.Verifier` collects evidence and
 the Factory/Orchestrator call the same gate.
 
+## Workflow profiles and transactional delivery (P6)
+
+New unified runs separate **production** from **delivery**:
+
+- **Profile** (`auto|web|library|script|review`) determines the phases and
+  mandatory checks. `auto` is resolved from requirements/architecture/tasks
+  (UI/browser → web; library/API/test hints → library; otherwise script),
+  persisted as `profile_selection` with a reason/version, and never recomputed
+  silently on `--resume`. A profile change invalidates the architecture
+  approval because the profile is part of the approved plan hash.
+- **Scaffold is deterministic** from `ArchitectureContract`/task targets:
+  directories, empty files, preserve existing content, case-insensitive and
+  symlink validation, manifest, idempotent, zero LLM calls.
+- **Workspace isolation**: the user's `project_root` is only the destination.
+  BUILD, VERIFY, INTEGRATE, Playwright and VISUAL operate on an isolated
+  `workspace_root` seeded from the project. The project is not touched during
+  the run.
+- **Transactional publish** happens only after all gates and SIGN-OFF:
+  manifest with original/result hashes, human-change conflict detection,
+  backups, journal, per-file atomic replace, rollback/recovery after
+  interruption, and `DONE` only after confirmation. Conflicting human edits
+  are never overwritten silently.
+- P6 applies to the unified engine; the legacy Factory path remains for
+  compatibility until P7.
+
 ## Financial circuit breaker
 
 Pay-as-you-go models are **never** called implicitly:
@@ -568,6 +593,10 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `engine.py` | Engine selection, approvals, dispatch guard, workflow adapters |
 | `router.py` | Route contracts, error classification, circuit breaker, PAYG grants |
 | `verify.py` | Critic validity, UNVERIFIED semantics and delivery gate |
+| `profiles.py` | Workflow profiles, auto resolution and phase sets |
+| `scaffold.py` | Deterministic scaffold from the approved architecture |
+| `workspace.py` | Workspace seeding and publish planning |
+| `publish.py` | Journaled, recoverable transactional publish |
 | `peak.py` | Pure peak/off-peak window helpers (shared, no I/O) |
 | `power.py` | Platform dispatcher (Linux vs Windows) |
 | `power_linux.py` | `systemd-inhibit` keep-awake + RTC alarm/suspend gate |
@@ -575,7 +604,7 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `scripts/crew-sleep` | Root helper that arms the RTC alarm / suspends (Linux) |
 | `scripts/install-crew-sleep.sh` | One-time root install + sudoers rule |
 | `setup.ps1`, `run.ps1` | Windows bootstrap and launcher |
-| `tests/` | Power, budget, P0/P1 foundation, P2 contracts, P3 registry, P4 router and P5 verification tests |
+| `tests/` | Power, budget, P0/P1 foundation, P2 contracts, P3 registry, P4 router, P5 verification and P6 workspace/publish tests |
 
 ## Tests & CI
 
@@ -585,6 +614,7 @@ python -m unittest discover -s tests -p "test_p02_*.py"   # core, no deps
 python -m unittest discover -s tests -p "test_p03_*.py"   # registry, no deps
 python -m unittest discover -s tests -p "test_p04_*.py"   # router, no deps
 python -m unittest discover -s tests -p "test_p05_*.py"   # verification, no deps
+python -m unittest discover -s tests -p "test_p06_*.py"   # profiles/scaffold/workspace, no deps
 .venv/bin/python -m unittest discover -s tests -p "test_p0*_integration.py"
 python tests/test_power.py
 python tests/test_budget.py

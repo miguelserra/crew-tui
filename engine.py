@@ -39,6 +39,10 @@ from state import (
     utc_now,
 )
 from store import ResumeTarget, StateManager, atomic_write_json
+from profiles import resolve_profile, phases_for
+from publish import PublishError, PublishManager
+from workspace import default_workspace, prepare_workspace
+from scaffold import scaffold
 
 ENGINE_VERSION = "1.0"
 
@@ -190,6 +194,29 @@ class WorkflowEngine:
         else:
             self.store.save_staging(self.state)
 
+    def next_phase(self, phase: str) -> str:
+        if self.state.engine_kind != ENGINE_UNIFIED:
+            return self.adapter.next_phase(phase)
+        order = phases_for(self.state.profile)
+        if phase not in order:
+            return "DONE"
+        idx = order.index(phase)
+        return order[idx + 1] if idx + 1 < len(order) else "DONE"
+
+    def resolve_profile(self) -> None:
+        selection = dict(self.state.extensions.get("profile_selection") or {})
+        if selection.get("resolved"):
+            self.state.profile = str(selection["resolved"])
+            return
+        requested = str(selection.get("requested") or self.state.profile or "auto")
+        selected = resolve_profile(
+            requested, goal=self.state.goal,
+            requirements=self.state.requirements,
+            architecture=self.state.architecture, tasks=self.state.tasks)
+        self.state.extensions["profile_selection"] = selected.to_dict()
+        self.state.profile = selected.resolved
+        self.save()
+
     # -- approvals ---------------------------------------------------------- #
 
     def _has_approval(self, kind: str) -> bool:
@@ -204,14 +231,14 @@ class WorkflowEngine:
         if self.state.pause.reason in ("spec_questions", "spec_approval"):
             self.state.pause = PauseState()
         if self.state.phase == "SPEC" and self.adapter is not None:
-            self.state.phase = self.adapter.next_phase("SPEC")
+            self.state.phase = self.next_phase("SPEC")
         self.save()
 
     def approve_architecture(self, actor: str = "human") -> None:
         self.state.approve_architecture(actor=actor)
         self.state.pause = PauseState()
         if self.state.phase == "ARCHITECTURE":
-            self.state.phase = self.adapter.next_phase("ARCHITECTURE")
+            self.state.phase = self.next_phase("ARCHITECTURE")
         self.save()
 
     def approve_unknown_billing(self, ref: ModelRef, actor: str = "human") -> None:
@@ -231,12 +258,14 @@ class WorkflowEngine:
         if self.state.pause.reason in ("spec_questions", "spec_approval"):
             if self._has_approval("spec"):
                 self.state.pause = PauseState()
-                self.state.phase = self.adapter.next_phase("SPEC")
+                self.state.phase = self.next_phase("SPEC")
         elif self.state.pause.reason == "architecture_approval":
             if self.state.architecture_approved():
                 self.state.pause = PauseState()
                 if self.state.phase == "ARCHITECTURE":
-                    self.state.phase = self.adapter.next_phase("ARCHITECTURE")
+                    self.state.phase = self.next_phase("ARCHITECTURE")
+        elif self.state.pause.reason == "publish_conflict":
+            self.state.pause = PauseState()
         elif self.state.pause.reason.endswith("_failed"):
             self.state.pause = PauseState()
         self.save()
@@ -252,7 +281,7 @@ class WorkflowEngine:
         elif not self._has_approval("spec"):
             self._pause("spec_approval", "contrato de requisitos pronto")
         else:
-            self.state.phase = self.adapter.next_phase("SPEC")
+            self.state.phase = self.next_phase("SPEC")
             self.save()
         return req
 
@@ -268,12 +297,13 @@ class WorkflowEngine:
             return "paused"
         if (phase == "SPEC" and self.state.requirements.objective
                 and self._has_approval("spec")):
-            self.state.phase = self.adapter.next_phase("SPEC")
+            self.state.phase = self.next_phase("SPEC")
             self.save()
             return "ok"
         if (phase == "ARCHITECTURE" and _has_architecture(self.state)
                 and self.state.architecture_approved()):
-            self.state.phase = self.adapter.next_phase("ARCHITECTURE")
+            self.resolve_profile()
+            self.state.phase = self.next_phase("ARCHITECTURE")
             self.save()
             return "ok"
         if phase == "SPEC":
@@ -286,16 +316,21 @@ class WorkflowEngine:
             if not ok or not _has_architecture(self.state):
                 self._pause("architecture_failed")
                 return "failed"
+            self.resolve_profile()
             if not self.state.architecture_approved():
                 self._pause("architecture_approval", self.state.architecture_hash())
                 return "paused"
-            self.state.phase = self.adapter.next_phase("ARCHITECTURE")
+            self.state.phase = self.next_phase("ARCHITECTURE")
             self.save()
             return "ok"
 
         if phase == "VERIFY":
-            # P1: build/integrate still run the existing verification battery.
-            self.state.phase = self.adapter.next_phase("VERIFY")
+            ok = self.adapter.step("VERIFY")
+            self.adapter.sync_to_project()
+            if not ok:
+                self._pause("verify_failed")
+                return "failed"
+            self.state.phase = self.next_phase("VERIFY")
             self.save()
             return "ok"
 
@@ -310,7 +345,15 @@ class WorkflowEngine:
         if not ok:
             self._pause(f"{phase.lower()}_failed")
             return "failed"
-        self.state.phase = self.adapter.next_phase(phase)
+        if phase == "SIGNOFF" and hasattr(self.adapter, "publish"):
+            try:
+                published = self.adapter.publish()
+            except PublishError as exc:
+                self._pause("publish_conflict", str(exc))
+                return "failed"
+            if published:
+                self.state.extensions["publish"] = published
+        self.state.phase = self.next_phase(phase)
         self.save()
         return "ok"
 
@@ -430,6 +473,8 @@ class WorkflowAdapter(Protocol):
     def step(self, phase: str) -> bool: ...
     def sync_to_project(self) -> None: ...
     def next_phase(self, phase: str) -> str: ...
+    def _verify_checkpoint(self) -> bool: ...
+    def publish(self) -> Optional[dict[str, Any]]: ...
     def on_last_ok(self, task_id: str, ref: ModelRef) -> None: ...
 
 
@@ -443,13 +488,31 @@ class FactoryAdapter:
     """Adapts the existing Factory steps to a ProjectState."""
 
     def __init__(self, settings: Any, pool: Any, emit: Any, project: ProjectState,
-                 *, legacy_order: bool = False):
+                 *, legacy_order: bool = False, isolate_workspace: bool = False):
         self.settings = settings
         self.pool = pool
         self.emit = emit
         self.project = project
         self.order = PHASE_ORDER_LEGACY if legacy_order else PHASE_ORDER_UNIFIED
+        self.isolated = bool(isolate_workspace)
         self._last_ok: dict[str, ModelRef] = {}
+        if self.isolated and project.project_root:
+            ws = str(project.extensions.get("workspace_root") or
+                     default_workspace(settings, project.run_id))
+            project.extensions["workspace_root"] = ws
+            origin = project.extensions.get("workspace_origin")
+            if not origin:
+                origin = prepare_workspace(project.project_root, ws)
+                project.extensions["workspace_origin"] = origin
+            self.workspace_root = ws
+            try:
+                PublishManager(project.project_root, ws,
+                               Path(project.project_root) / ".crew",
+                               origin).recover()
+            except Exception:
+                pass
+        else:
+            self.workspace_root = project.project_root
 
         from factory import Factory, FactoryState, TaskState  # lazy: heavy deps
 
@@ -464,8 +527,10 @@ class FactoryAdapter:
 
         self._FactoryState = FactoryState
         self._TaskState = TaskState
-        self.factory = EphemeralFactory(settings, pool, emit, project.project_root,
+        self.factory = EphemeralFactory(settings, pool, emit, self.workspace_root,
                                         telemetry=getattr(pool, "telemetry", None))
+        if self.isolated:
+            self.factory.final_root = Path(project.project_root)
         self.factory.state = self._to_factory_state(project)
         self.pool.attempt_sink = self._on_attempt_from_pool
 
@@ -487,7 +552,7 @@ class FactoryAdapter:
                               if t.id in project.verifications else None),
             ))
         return self._FactoryState(
-            project=str(project.project_root), goal=project.goal,
+            project=str(self.workspace_root), goal=project.goal,
             step=project.phase, run_id=project.run_id,
             requirements=project.requirements.to_legacy_dict(),
             answers=list(project.requirements.answers),
@@ -580,11 +645,19 @@ class FactoryAdapter:
             if phase == "ARCHITECTURE":
                 ok = bool(self.factory.step_architect())
             elif phase == "SCAFFOLD":
-                ok = bool(self.factory.step_scaffold())
+                if self.isolated:
+                    manifest = scaffold(self.workspace_root, self.project.architecture,
+                                        self.project.tasks,
+                                        approved=self.project.architecture_approved())
+                    self.project.scaffold = manifest.to_dict()
+                    self.factory.state.scaffold = manifest.to_dict()
+                    ok = True
+                else:
+                    ok = bool(self.factory.step_scaffold())
             elif phase == "BUILD":
                 ok = bool(self.factory.step_build())
             elif phase == "VERIFY":
-                ok = True
+                ok = self._verify_checkpoint() if self.isolated else True
             elif phase == "INTEGRATE":
                 ok = bool(self.factory.step_integrate())
             elif phase == "VISUAL":
@@ -597,6 +670,33 @@ class FactoryAdapter:
             self.factory.power.stop()
         self.sync_to_project()
         return ok
+
+    def _verify_checkpoint(self) -> bool:
+        if self.project.profile == "review":
+            return True
+        build_tasks = [t for t in self.project.tasks if t.kind == "build"]
+        missing = [t.id for t in build_tasks if t.id not in self.project.verifications]
+        bad = [t.id for t in build_tasks
+               if self.project.verifications.get(t.id)
+               and self.project.verifications[t.id].verdict == "FAIL"]
+        unverified = [t.id for t in build_tasks
+                      if self.project.verifications.get(t.id)
+                      and self.project.verifications[t.id].verdict == "UNVERIFIED"]
+        if missing or bad or (unverified and not self.settings.allow_unverified):
+            detail = f"missing={missing} fail={bad} unverified={unverified}"
+            self.emit("VERIFY", f"checkpoint bloqueado: {detail}")
+            return False
+        self.emit("VERIFY", f"checkpoint OK ({len(build_tasks)} tarefas)")
+        return True
+
+    def publish(self) -> Optional[dict[str, Any]]:
+        if not self.isolated or self.project.profile == "review":
+            return None
+        origin = dict(self.project.extensions.get("workspace_origin") or {})
+        mgr = PublishManager(self.project.project_root, self.workspace_root,
+                             Path(self.project.project_root) / ".crew", origin)
+        mgr.recover()
+        return mgr.publish()
 
     def on_last_ok(self, task_id: str, ref: ModelRef) -> None:
         self._last_ok[task_id] = ref
@@ -619,15 +719,25 @@ class FactoryAdapter:
 
 
 def new_unified_state(goal: str, project_root: str, run_id: Optional[str] = None,
-                      engine_version: str = ENGINE_VERSION) -> ProjectState:
-    return ProjectState(
+                      engine_version: str = ENGINE_VERSION,
+                      profile: str = "auto") -> ProjectState:
+    requested = (profile or "auto").strip().lower()
+    resolved = "" if requested == "auto" else requested
+    state = ProjectState(
         run_id=run_id or new_id("run_"),
         project_root=project_root,
         goal=goal,
+        profile=resolved or "auto",
         engine_kind=ENGINE_UNIFIED,
         engine_version=engine_version,
         phase="SPEC",
     )
+    state.extensions["profile_selection"] = {
+        "requested": requested, "resolved": resolved,
+        "reason": "" if requested != "auto" else "pendente de arquitectura",
+        "profile_version": 1,
+    }
+    return state
 
 
 def open_execution(store: StateManager, project_root: Optional[str] = None) -> Optional[ExecDecision]:
