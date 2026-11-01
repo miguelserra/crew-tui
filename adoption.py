@@ -68,7 +68,7 @@ def inspect_repository(root: str | Path,
             truncated = True
             break
         name = path.name
-        rel_s = str(rel)
+        rel_s = rel.as_posix()
         files.append(rel_s)
         if name in CONFIG_NAMES:
             configs.append(rel_s)
