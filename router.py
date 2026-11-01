@@ -10,6 +10,7 @@ decision after verification failure and always uses a stronger chain.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -176,6 +177,8 @@ class CircuitBreaker:
         self.clock = clock
         self._lock = threading.Lock()
         self._entries: dict[str, BreakerEntry] = {}
+        self.persistence_degraded = False
+        self.last_persistence_error = ""
         self._load()
 
     # -- persistence -------------------------------------------------------- #
@@ -194,13 +197,25 @@ class CircuitBreaker:
     def _save_locked(self) -> None:
         if self.path is None:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        payload = {"version": 1,
-                   "breakers": {k: v.to_dict() for k, v in self._entries.items()}}
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        os.replace(tmp, self.path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"version": 1,
+                       "breakers": {k: v.to_dict()
+                                    for k, v in self._entries.items()}}
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            os.replace(tmp, self.path)
+            self.persistence_degraded = False
+        except OSError as exc:
+            self.persistence_degraded = True
+            self.last_persistence_error = str(exc)[:300]
+            logging.getLogger("crew_tui.router").warning(
+                "circuit breaker persistence failed: %s", exc)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     # -- API ---------------------------------------------------------------- #
 
@@ -296,13 +311,30 @@ class CircuitBreaker:
 # --------------------------------------------------------------------------- #
 
 
+# Reservation lifecycle. A reservation starts ACTIVE (budget withheld, not yet
+# submitted or in flight). Once submitted with an ambiguous outcome it becomes
+# HELD: the exposure is *uncertain* and must never be silently released. A
+# confirmed result COMMITS it; a confirmed technical failure RELEASES it.
+RESERVATION_ACTIVE = "active"
+RESERVATION_HELD = "held"
+RESERVATION_COMMITTED = "committed"
+RESERVATION_RELEASED = "released"
+
+
+class GrantAccountingError(Exception):
+    """An invalid reservation state transition was attempted."""
+
+
 @dataclass
 class PaidGrant:
     scope: str                 # "task" | "run"
     scope_id: str
     keys: frozenset[str]       # identity_key values; {"*"} for any
     max_cost: Optional[Decimal] = None
-    spent: Decimal = Decimal("0")
+    spent: Decimal = Decimal("0")       # confirmed spend (actual cost)
+    reserved: Decimal = Decimal("0")    # reserved exposure (active reservations)
+    uncertain: Decimal = Decimal("0")   # uncertain exposure (held reservations)
+    overrun: Decimal = Decimal("0")     # confirmed spend beyond reserved estimate
     created: float = 0.0
 
 
@@ -312,11 +344,49 @@ def request_scope_id(request: "RouteRequest") -> str:
     return f"role:{request.role}:{request.run_id or '-'}"
 
 
+class GrantReservation:
+    def __init__(self, grant: Optional[PaidGrant], amount: Decimal,
+                 billable: bool):
+        self.grant = grant
+        self.amount = amount
+        self.billable = billable
+        self.state = RESERVATION_ACTIVE
+
+    @property
+    def active(self) -> bool:
+        """Still withholding budget (ACTIVE or HELD)."""
+        return self.state in (RESERVATION_ACTIVE, RESERVATION_HELD)
+
+
 class GrantStore:
-    """In-memory, explicit-scope PAYG approvals (never a global allow flag)."""
+    """Process-local, explicit-scope PAYG approvals.
+
+    Accounting model (kept distinct on purpose):
+
+    * ``estimated_cost``  — the predicted cost before execution (see
+      ``Router._reservation_amount``).
+    * ``reserved``        — reserved exposure: budget withheld for an ACTIVE
+      reservation (not yet submitted, or submitted and not yet settled).
+    * ``uncertain``       — uncertain exposure: budget held because the request
+      was submitted and its outcome is ambiguous (timeout/connection/...).
+    * ``spent``           — confirmed spend: the actual cost recorded on commit.
+    * ``overrun``         — cumulative confirmed spend beyond the reserved
+      estimate (actual cost is never truncated).
+
+    The authorization invariant is ``spent + reserved + uncertain <= max_cost``;
+    when a confirmed charge exceeds its reservation the overrun is recorded and
+    further authorization is blocked because ``spent`` now consumes the ceiling.
+
+    The store is intentionally process-local and in-memory: it is not a
+    multi-process budget authority and reservations are not durable. A crash
+    between reserve and commit loses the in-flight reservation; the
+    ``CallLedger`` SUBMITTED/UNKNOWN records are the durable evidence of a
+    submitted request.
+    """
 
     def __init__(self, allow_paid: bool = False):
         self._grants: list[PaidGrant] = []
+        self._lock = threading.RLock()
         if allow_paid:
             self.add("run", "*", {"*"})
 
@@ -325,45 +395,154 @@ class GrantStore:
         grant = PaidGrant(scope=scope, scope_id=scope_id,
                           keys=frozenset(keys or {"*"}),
                           max_cost=max_cost, created=time.time())
-        self._grants.append(grant)
+        with self._lock:
+            self._grants.append(grant)
         return grant
 
     def approve_task(self, request: "RouteRequest", keys: Iterable[str],
                      max_cost: Optional[Decimal] = None) -> PaidGrant:
         return self.add("task", request_scope_id(request), keys, max_cost)
 
+    def _matches(self, grant: PaidGrant, request: "RouteRequest",
+                 identity: ModelIdentity) -> bool:
+        if grant.scope == "run":
+            if grant.scope_id not in ("*", request.run_id or ""):
+                return False
+        elif grant.scope == "task":
+            if grant.scope_id != request_scope_id(request):
+                return False
+        else:
+            return False
+        return "*" in grant.keys or identity_key(identity) in grant.keys
+
     def allows(self, request: "RouteRequest", identity: ModelIdentity) -> bool:
         if identity.billing != BILLING_PAYG:
             return True
-        for grant in self._grants:
-            if grant.max_cost is not None and grant.spent >= grant.max_cost:
-                continue
-            if grant.scope == "run":
-                if grant.scope_id not in ("*", request.run_id or ""):
+        with self._lock:
+            for grant in self._grants:
+                if not self._matches(grant, request, identity):
                     continue
-            elif grant.scope == "task":
-                if grant.scope_id != request_scope_id(request):
+                if (grant.max_cost is not None
+                        and (grant.spent + grant.reserved + grant.uncertain
+                             >= grant.max_cost)):
                     continue
-            else:
-                continue
-            if "*" in grant.keys or identity_key(identity) in grant.keys:
                 return True
         return False
+
+    def reserve(self, request: "RouteRequest", identity: ModelIdentity,
+                amount: Optional[Decimal] = None) -> Optional[GrantReservation]:
+        if identity.billing != BILLING_PAYG:
+            return GrantReservation(None, Decimal("0"), False)
+        with self._lock:
+            for grant in self._grants:
+                if not self._matches(grant, request, identity):
+                    continue
+                if grant.max_cost is None:
+                    return GrantReservation(grant, Decimal("0"), True)
+                available = (grant.max_cost - grant.spent - grant.reserved
+                             - grant.uncertain)
+                if available <= 0:
+                    continue
+                if amount is None:
+                    take = available
+                elif amount > available:
+                    continue
+                else:
+                    take = amount
+                if take <= 0:
+                    continue
+                grant.reserved += take
+                return GrantReservation(grant, take, True)
+        return None
+
+    def hold(self, reservation: Optional[GrantReservation]) -> None:
+        """Mark a submitted reservation whose outcome is ambiguous.
+
+        The reserved amount moves into uncertain exposure. It must never be
+        released silently: only an explicit ``commit`` (confirmed) or
+        ``release`` (manual reconciliation) settles it.
+        """
+        if reservation is None:
+            return
+        with self._lock:
+            if reservation.state != RESERVATION_ACTIVE:
+                return
+            reservation.state = RESERVATION_HELD
+            if reservation.grant is not None:
+                reservation.grant.reserved = max(
+                    Decimal("0"), reservation.grant.reserved - reservation.amount)
+                reservation.grant.uncertain += reservation.amount
+
+    def commit(self, reservation: Optional[GrantReservation],
+               cost: CostEstimate) -> None:
+        if reservation is None:
+            return
+        with self._lock:
+            if reservation.state == RESERVATION_COMMITTED:
+                return  # idempotent: already settled
+            if reservation.state == RESERVATION_RELEASED:
+                raise GrantAccountingError("commit após release")
+            if reservation.state == RESERVATION_ACTIVE:
+                if reservation.grant is not None:
+                    reservation.grant.reserved = max(
+                        Decimal("0"),
+                        reservation.grant.reserved - reservation.amount)
+            elif reservation.state == RESERVATION_HELD:
+                if reservation.grant is not None:
+                    reservation.grant.uncertain = max(
+                        Decimal("0"),
+                        reservation.grant.uncertain - reservation.amount)
+            reservation.state = RESERVATION_COMMITTED
+            if (reservation.billable and cost.billable
+                    and reservation.grant is not None):
+                actual = cost.total
+                reservation.grant.spent += actual
+                if actual > reservation.amount and reservation.amount > 0:
+                    reservation.grant.overrun += actual - reservation.amount
+
+    def release(self, reservation: Optional[GrantReservation]) -> None:
+        if reservation is None:
+            return
+        with self._lock:
+            if reservation.state in (RESERVATION_RELEASED, RESERVATION_COMMITTED):
+                return  # idempotent no-op
+            if reservation.state == RESERVATION_ACTIVE:
+                if reservation.grant is not None:
+                    reservation.grant.reserved = max(
+                        Decimal("0"),
+                        reservation.grant.reserved - reservation.amount)
+            elif reservation.state == RESERVATION_HELD:
+                if reservation.grant is not None:
+                    reservation.grant.uncertain = max(
+                        Decimal("0"),
+                        reservation.grant.uncertain - reservation.amount)
+            reservation.state = RESERVATION_RELEASED
+
+    def exposure(self, request: "RouteRequest",
+                 identity: ModelIdentity) -> dict[str, Any]:
+        """Confirmed spend, reserved and uncertain exposure for a matching grant."""
+        with self._lock:
+            for grant in self._grants:
+                if self._matches(grant, request, identity):
+                    return {
+                        "spent": grant.spent,
+                        "reserved": grant.reserved,
+                        "uncertain": grant.uncertain,
+                        "overrun": grant.overrun,
+                        "max_cost": grant.max_cost,
+                    }
+        return {"spent": Decimal("0"), "reserved": Decimal("0"),
+                "uncertain": Decimal("0"), "overrun": Decimal("0"),
+                "max_cost": None}
 
     def charge(self, request: "RouteRequest", identity: ModelIdentity,
                cost: CostEstimate) -> None:
         if identity.billing != BILLING_PAYG or not cost.billable:
             return
-        for grant in self._grants:
-            if grant.scope == "run":
-                if grant.scope_id not in ("*", request.run_id or ""):
+        with self._lock:
+            for grant in self._grants:
+                if not self._matches(grant, request, identity):
                     continue
-            elif grant.scope == "task":
-                if grant.scope_id != request_scope_id(request):
-                    continue
-            else:
-                continue
-            if "*" in grant.keys or identity_key(identity) in grant.keys:
                 grant.spent += cost.total
                 return
 
@@ -547,19 +726,33 @@ class Router:
 
     # -- grants ------------------------------------------------------------- #
 
-    def authorize(self, request: RouteRequest, candidate: RouteCandidate) -> bool:
+    def _reservation_amount(self, request: RouteRequest,
+                            identity: ModelIdentity) -> Optional[Decimal]:
+        price = identity.price
+        if price is None or not price.confirmed:
+            return None
+        out_tokens = max(1, int(request.max_tokens or 1))
+        in_tokens = max(0, int(request.estimated_context or 0))
+        estimate = self.registry.estimate(identity, in_tokens, out_tokens)
+        return estimate.total if estimate.total > 0 else None
+
+    def reserve(self, request: RouteRequest,
+                candidate: RouteCandidate) -> Optional[GrantReservation]:
         identity = candidate.identity
         if identity.billing == BILLING_UNKNOWN:
             raise UnknownModelError(
                 f"billing desconhecido para {identity.credential_profile}/"
                 f"{identity.model_id}")
-        if identity.billing != BILLING_PAYG:
-            return True
-        if self.grants.allows(request, identity):
-            return True
-        chosen = self.request_grant(request, candidate) if self.request_grant else None
+        reservation = self.grants.reserve(
+            request, identity,
+            amount=self._reservation_amount(request, identity))
+        if reservation is not None:
+            return reservation
+        if self.request_grant is None:
+            return None
+        chosen = self.request_grant(request, candidate)
         if not chosen:
-            return False
+            return None
         key = None
         if chosen == "*" or chosen == identity_key(identity):
             key = identity_key(identity)
@@ -571,17 +764,56 @@ class Router:
             if len(matches) == 1:
                 key = identity_key(matches[0])
         if key is None:
-            return False
+            return None
         self.grants.approve_task(request, {key})
-        return self.grants.allows(request, identity)
+        return self.grants.reserve(
+            request, identity,
+            amount=self._reservation_amount(request, identity))
+
+    def release(self, reservation: Optional[GrantReservation]) -> None:
+        self.grants.release(reservation)
+
+    def hold(self, reservation: Optional[GrantReservation]) -> None:
+        self.grants.hold(reservation)
+
+    def authorize(self, request: RouteRequest, candidate: RouteCandidate) -> bool:
+        """Compatibility authorization that also reserves the PAYG budget.
+
+        The execution path uses :meth:`reserve` directly; this method keeps the
+        historical boolean API while preventing a caller from authorizing one
+        request and later charging it after another request consumed the same
+        remaining budget. The reservation is attached to the candidate and is
+        consumed by :meth:`charge`, or can be released with :meth:`release`.
+        Repeated authorization of the same candidate is idempotent.
+        """
+        existing = getattr(candidate, "_reservation", None)
+        if existing is not None and existing.active:
+            return True
+        reservation = self.reserve(request, candidate)
+        if reservation is None:
+            return False
+        candidate._reservation = reservation
+        return True
 
     def charge(self, request: RouteRequest, candidate: RouteCandidate,
-               response: Any) -> CostEstimate:
+               response: Any,
+               reservation: Optional[GrantReservation] = None) -> CostEstimate:
+        if reservation is None:
+            reservation = getattr(candidate, "_reservation", None)
         usage = getattr(response, "usage_metadata", None) or {}
         in_t = int(usage.get("input_tokens") or usage.get("input_token_count") or 0)
         out_t = int(usage.get("output_tokens") or usage.get("output_token_count") or 0)
         cost = self.registry.estimate(candidate.identity, in_t, out_t)
-        self.grants.charge(request, candidate.identity, cost)
+        if reservation is not None:
+            # ``GrantStore.commit`` is idempotent: committing an already
+            # committed/released reservation is a safe no-op. The candidate
+            # keeps its reservation reference on purpose so a repeated charge
+            # (e.g. a second compatibility ``charge`` after ``authorize``)
+            # cannot fall through to the unreserved ``GrantStore.charge`` path
+            # and double-count the same authorization.
+            self.grants.commit(reservation, cost)
+        else:
+            self.grants.charge(request, candidate.identity, cost)
         return cost
 
 
@@ -651,13 +883,19 @@ class RouteChain:
                 continue
             if self.router is not None and not self.router.breaker.allow(identity):
                 continue
+            reservation = None
             try:
-                allowed = self.router.authorize(self.request, candidate)
+                if hasattr(self.router, "reserve"):
+                    reservation = self.router.reserve(self.request, candidate)
+                    if reservation is None:
+                        denied_paid = True
+                        continue
+                else:
+                    if not self.router.authorize(self.request, candidate):
+                        denied_paid = True
+                        continue
             except UnknownModelError:
                 raise
-            if not allowed:
-                denied_paid = True
-                continue
             for attempt in range(2):
                 record = None
                 if (ledger is not None and identity.billing == BILLING_PAYG
@@ -679,6 +917,24 @@ class RouteChain:
                 except Exception as exc:
                     info = classify_error(exc)
                     ambiguous = info.kind in self.AMBIGUOUS_KINDS
+                    retrying = (info.kind in ("timeout", "empty")
+                                and attempt == 0)
+                    if reservation is not None:
+                        if ambiguous and hasattr(self.router, "hold"):
+                            # Submitted with an unknown outcome: keep the
+                            # exposure as uncertain; never release silently.
+                            self.router.hold(reservation)
+                        elif (not retrying
+                              and getattr(reservation, "state",
+                                          RESERVATION_ACTIVE)
+                                  == RESERVATION_ACTIVE
+                              and hasattr(self.router, "release")):
+                            # Only an ACTIVE (never-submitted / settled-free)
+                            # reservation may be released by a later definitive
+                            # failure. A HELD reservation means an earlier
+                            # ambiguous submission may already have cost money
+                            # and must stay as uncertain exposure.
+                            self.router.release(reservation)
                     if record is not None:
                         ledger.fail(record.call_id, str(exc), info.kind,
                                     ambiguous=ambiguous)
@@ -704,7 +960,11 @@ class RouteChain:
                     set_call_context(record.call_id, candidate.ref)
                     ledger.confirm(record.call_id, served=candidate.ref,
                                    text=content, replayable=replayable)
-                self.router.charge(self.request, candidate, response)
+                if reservation is not None:
+                    self.router.charge(self.request, candidate, response,
+                                       reservation=reservation)
+                else:
+                    self.router.charge(self.request, candidate, response)
                 return response
         if denied_paid:
             raise BudgetSuspended(

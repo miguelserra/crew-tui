@@ -10,6 +10,7 @@ D06: CONFIRMED result replay after crash boundaries, fingerprint changes,
 missing/non-replayable artifacts, and history deduplication.
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -1988,7 +1989,9 @@ class D10ResumePipelineTests(unittest.TestCase):
                 st = eng["state"]
                 hashes = st.visual.get("artifact_hashes") or {}
                 self.assertEqual(hashes.get("index.html"),
-                                 s.artifact_hash("<html>ok</html>\n"), kind)
+                                 {"v": 2, "sha": hashlib.sha256(
+                                     b"<html>ok</html>\n").hexdigest()},
+                                 kind)
                 (run["ws"] / "index.html").write_text("<html>changed</html>\n",
                                                       encoding="utf-8")
                 self.assertTrue(any("visual desatualizado" in b
@@ -3025,7 +3028,9 @@ class D08VisualBrowserTests(unittest.TestCase):
         self.assertIn("vision", eng["pool"].registry.identity_for(
             "gemini-plus", calls[0]["model"]).capabilities)
         self.assertEqual(st.visual.get("artifact_hashes", {}).get("index.html"),
-                         s.artifact_hash(self.HTML), kind)
+                         {"v": 2, "sha": hashlib.sha256(
+                             self.HTML.encode("utf-8")).hexdigest()},
+                         kind)
         return run, eng, calls
 
     def _approve_visual(self, run, eng):
@@ -3191,8 +3196,9 @@ class D08VisualBrowserTests(unittest.TestCase):
                              "PASS", kind)
             self.assertEqual(len(calls), 2, kind)
             self.assertEqual(visual.get("artifact_hashes", {}).get("index.html"),
-                             s.artifact_hash((run["ws"] / "index.html").read_text(
-                                 encoding="utf-8")), kind)
+                             {"v": 2, "sha": hashlib.sha256(
+                                 (run["ws"] / "index.html").read_bytes()
+                             ).hexdigest()}, kind)
 
     def test_d08_10_stale_visual_evidence_blocks_signoff(self):
         for kind in ("factory", "native"):

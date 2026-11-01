@@ -41,7 +41,8 @@ from main import (LANG_SUFFIX, LLMPool, Settings, Verifier,
 import verify as verify_policy
 from registry import ModelRef, unknown_ref
 from state import (StateCorruptError, artifact_hash, validate_dependencies,
-                   TaskAttempt, VerificationRecord, new_id)
+                   TaskAttempt, VerificationRecord, new_id,
+                   visual_artifact_hash)
 from power import make_power
 
 ROLES = ("ANALYST", "SCAFFOLD", "ARCHITECT", "DEV", "TEST", "INTEG", "VISUAL", "SIGN")
@@ -1086,8 +1087,7 @@ Output each corrected file with `### FILE: <relative path>` then a fenced block.
                 continue
             path = self._safe(task.target_file)
             if path is not None and path.is_file():
-                report["artifact_hashes"][task.target_file] = artifact_hash(
-                    path.read_text(encoding="utf-8"))
+                report["artifact_hashes"][task.target_file] = visual_artifact_hash(path)
         self.state.visual = report
         self.log("visual", json.dumps(report, ensure_ascii=False)[:8000])
         self.save()

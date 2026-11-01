@@ -51,6 +51,10 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p72b_*.py"
       - name: P7.2c discovery/understanding tests
         run: python -m unittest discover -s tests -p "test_p72c_*.py"
+      - name: P7.2b.2 reliability hardening tests
+        run: python -m unittest discover -s tests -p "test_p72b2_*.py"
+      - name: P7.2b.3 budget integrity / visual migration tests
+        run: python -m unittest discover -s tests -p "test_p72b3_*.py"
 
   integration:
     name: Integration (py3.13)
@@ -86,6 +90,10 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p72b_*.py"
       - name: P7.2c discovery/understanding tests
         run: python -m unittest discover -s tests -p "test_p72c_*.py"
+      - name: P7.2b.2 reliability hardening tests
+        run: python -m unittest discover -s tests -p "test_p72b2_*.py"
+      - name: P7.2b.3 budget integrity / visual migration tests
+        run: python -m unittest discover -s tests -p "test_p72b3_*.py"
 
   windows:
     name: Windows (py3.13)
@@ -125,3 +133,7 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p72b_*.py"
       - name: P7.2c discovery/understanding tests
         run: python -m unittest discover -s tests -p "test_p72c_*.py"
+      - name: P7.2b.2 reliability hardening tests
+        run: python -m unittest discover -s tests -p "test_p72b2_*.py"
+      - name: P7.2b.3 budget integrity / visual migration tests
+        run: python -m unittest discover -s tests -p "test_p72b3_*.py"

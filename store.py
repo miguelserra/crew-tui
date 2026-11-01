@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -79,6 +80,27 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _replace_with_retry(tmp: Path, path: Path, *,
+                         platform: Optional[str] = None,
+                         sleep: Optional[Callable[[float], None]] = None,
+                         attempts: int = 4,
+                         initial_delay: float = 0.05) -> None:
+    """Replace atomically; retry bounded transient Windows PermissionError."""
+    platform = os.name if platform is None else platform
+    sleep = time.sleep if sleep is None else sleep
+    delay = initial_delay
+    tries = attempts if platform == "nt" else 1
+    for attempt in range(tries):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if platform != "nt" or attempt == tries - 1:
+                raise
+            sleep(delay)
+            delay = min(delay * 2, 0.25)
+
+
 def atomic_write_json(path: Path, data: Any,
                       validate: Optional[Callable[[Any], None]] = None) -> None:
     """Write JSON atomically in the destination filesystem."""
@@ -94,7 +116,7 @@ def atomic_write_json(path: Path, data: Any,
             os.fsync(fh.fileno())
         if validate is not None:
             validate(read_json(tmp))
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
         _fsync_dir(path.parent)
     except Exception:
         try:

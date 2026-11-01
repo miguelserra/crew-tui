@@ -10,7 +10,7 @@ from typing import Any
 import verify as verify_policy
 import native_util
 from router import RouteRequest
-from state import ProjectState, Task, artifact_hash
+from state import ProjectState, Task, visual_artifact_hash
 
 
 def playwright_audit(root: Path, logs_dir: Path, page: str = "index.html",
@@ -32,32 +32,56 @@ def playwright_audit(root: Path, logs_dir: Path, page: str = "index.html",
         report["verdict"] = "UNAVAILABLE"
         report["note"] = "não consegui subir servidor HTTP local"
         return report
+    browser = None
+    ctx = None
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context(viewport={"width": width, "height": height})
-            pg = ctx.new_page()
-            pg.on("console", lambda m: report["console_all"].append(
-                {"type": m.type, "text": m.text, "where": str(m.location)}))
-            pg.on("pageerror", lambda e: report["page_errors"].append(str(e)))
-            pg.on("requestfailed", lambda r: report["failed_requests"].append(
-                {"url": r.url, "failure": (r.failure or "")}))
-            pg.on("response", lambda r: report["http_errors"].append(
-                {"url": r.url, "status": r.status})
-                  if r.status >= 400 and "favicon" not in r.url else None)
-            pg.goto(f"http://127.0.0.1:{port}/{page}", wait_until="load", timeout=15000)
-            pg.wait_for_timeout(wait_ms)
-            logs_dir.mkdir(parents=True, exist_ok=True)
-            png = logs_dir / "ui_screenshot.png"
-            pg.screenshot(path=str(png), full_page=True)
-            report["screenshot"] = str(png)
-            ctx.close()
-            browser.close()
+            try:
+                ctx = browser.new_context(viewport={"width": width,
+                                                    "height": height})
+                try:
+                    pg = ctx.new_page()
+                    pg.on("console", lambda m: report["console_all"].append(
+                        {"type": m.type, "text": m.text,
+                         "where": str(m.location)}))
+                    pg.on("pageerror",
+                          lambda e: report["page_errors"].append(str(e)))
+                    pg.on("requestfailed",
+                          lambda r: report["failed_requests"].append(
+                              {"url": r.url, "failure": (r.failure or "")}))
+                    pg.on("response",
+                          lambda r: report["http_errors"].append(
+                              {"url": r.url, "status": r.status})
+                          if r.status >= 400 and "favicon" not in r.url else None)
+                    pg.goto(f"http://127.0.0.1:{port}/{page}",
+                            wait_until="load", timeout=15000)
+                    pg.wait_for_timeout(wait_ms)
+                    logs_dir.mkdir(parents=True, exist_ok=True)
+                    png = logs_dir / "ui_screenshot.png"
+                    pg.screenshot(path=str(png), full_page=True)
+                    report["screenshot"] = str(png)
+                finally:
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
     except Exception as exc:
         report["note"] = f"playwright falhou: {type(exc).__name__}: {exc}"
     finally:
-        server.shutdown()
-        server.server_close()
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+        try:
+            server.server_close()
+        except Exception:
+            pass
     report["console_errors"] = [c for c in report["console_all"]
                                 if c["type"] in ("error", "assert")]
     problems = (report["page_errors"] or report["console_errors"]
@@ -119,8 +143,8 @@ class VisualService:
 
 
     @staticmethod
-    def _artifact_hashes(project: ProjectState, root: Path) -> dict[str, str]:
-        hashes: dict[str, str] = {}
+    def _artifact_hashes(project: ProjectState, root: Path) -> dict[str, Any]:
+        hashes: dict[str, Any] = {}
         for task in project.tasks:
             rel = task.target_file
             if not rel.endswith((".html", ".htm", ".css", ".js", ".mjs")):
@@ -131,7 +155,7 @@ class VisualService:
             except ValueError:
                 continue
             if path.is_file():
-                hashes[rel] = artifact_hash(path.read_text(encoding="utf-8"))
+                hashes[rel] = visual_artifact_hash(path)
         return hashes
 
     def _review(self, project: ProjectState, png: Path) -> dict[str, Any]:

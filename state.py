@@ -94,6 +94,72 @@ def artifact_hash(text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+# Visual artifact hash versioning. P7.2b.2 switched visual artifact hashes to
+# raw-byte SHA-256; previously they were ``artifact_hash(read_text)``. Existing
+# projects may still hold legacy plain-string hashes, so each stored hash must
+# carry an unambiguous algorithm identifier (or, for legacy records, be
+# interpreted with the old semantics and never as raw bytes).
+VISUAL_HASH_LEGACY = 1   # normalized-text artifact_hash()
+VISUAL_HASH_BYTES = 2    # raw-byte SHA-256
+
+
+def visual_hash_bytes(path: Path) -> str:
+    """Raw-byte SHA-256 of a file (current visual artifact semantics)."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def visual_artifact_hash(path: Path) -> dict[str, Any]:
+    """Versioned visual artifact hash for the current byte semantics."""
+    return {"v": VISUAL_HASH_BYTES, "sha": visual_hash_bytes(path)}
+
+
+def _visual_hash_version(record: dict[str, Any]) -> Optional[int]:
+    """Parse a persisted visual hash version; ``None`` means malformed.
+
+    Missing version defaults to the legacy value. Booleans are rejected even
+    though ``bool`` is a subclass of ``int``; non-numeric strings and other
+    types are malformed. This keeps the caller fail-closed instead of leaking
+    ``ValueError``/``TypeError``.
+    """
+    raw = record.get("v")
+    if raw is None:
+        return VISUAL_HASH_LEGACY
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and raw.strip().isdigit():
+        return int(raw.strip())
+    return None
+
+
+def visual_artifact_matches(expected: Any, path: Path) -> bool:
+    """Interpret a persisted visual artifact hash by version and compare.
+
+    * ``{"v": 2, "sha": hex}`` → raw-byte SHA-256 (current);
+    * plain ``hex`` string      → legacy normalized-text ``artifact_hash``;
+    * anything else, or an unknown/malformed version, or an unreadable/binary
+      file for a legacy record → cannot verify (fail-closed).
+    """
+    if isinstance(expected, dict):
+        version = _visual_hash_version(expected)
+        if version is None or version != VISUAL_HASH_BYTES:
+            return False
+        sha = expected.get("sha")
+        if not isinstance(sha, str) or not sha:
+            return False
+        try:
+            return visual_hash_bytes(path) == sha
+        except OSError:
+            return False
+    if isinstance(expected, str):
+        try:
+            return artifact_hash(path.read_text(encoding="utf-8")) == expected
+        except (OSError, UnicodeDecodeError):
+            return False
+    return False
+
+
 # --------------------------------------------------------------------------- #
 #  Attempts
 # --------------------------------------------------------------------------- #
@@ -1023,10 +1089,25 @@ class ProjectState:
             blockers.append("visual não verificado")
         visual_hashes = (self.visual or {}).get("artifact_hashes") or {}
         if visual_verdict == "PASS" and visual_hashes:
-            artifacts = self._signoff_artifacts()
+            root_raw = self.extensions.get("workspace_root") or self.project_root
+            root = Path(root_raw).expanduser().resolve() if root_raw else None
             for task in build_tasks:
-                expected = visual_hashes.get(task.target_file)
-                if expected and artifacts.get(task.id) != expected:
+                if task.target_file not in visual_hashes:
+                    # Genuinely no persisted hash for this artifact.
+                    continue
+                expected = visual_hashes[task.target_file]
+                ok = False
+                if root is not None:
+                    path = (root / task.target_file).resolve()
+                    try:
+                        path.relative_to(root)
+                        ok = path.is_file() and visual_artifact_matches(
+                            expected, path)
+                    except (ValueError, OSError):
+                        ok = False
+                if not ok:
+                    # Includes explicitly present but empty/null/malformed
+                    # records: they must fail closed, never be skipped.
                     blockers.append(f"visual desatualizado: {task.id}")
         if not self.signoff:
             blockers.append("sign-off não gerado")

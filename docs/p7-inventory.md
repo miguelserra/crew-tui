@@ -67,3 +67,37 @@ Baseline: `p6.1-gate` (`86f2df1`).
   requirements and conflicts.
 - P7.1d remains OPEN/COMPLETE.
 - P7.2b and P7.2c have not started.
+
+
+## P7.2b.2 reliability hardening
+
+- V01 PAYG reservation/concurrency, V02 Playwright teardown, V04 breaker
+  persistence degradation, V05 Windows atomic retry and V06 byte-accurate visual
+  hashing implemented with 20 focused tests.
+- Rejected findings were not modified; P7.2c discovery was not changed; no
+  P7.2c/REA work was started in this milestone.
+
+## P7.2b.3 budget integrity / visual migration
+
+- V01 accounting model made explicit (estimated/reserved/uncertain/confirmed/
+  overrun), idempotent commit/release, commit-after-release rejected, actual
+  cost never truncated, ambiguous outcomes held as uncertain exposure.
+- V06 visual hashes versioned per record (`{"v": 2, "sha": ...}`) with legacy
+  normalized-text interpretation and fail-closed re-audit; no global schema
+  bump.
+- V05 native filesystem tests added to every CI job; native Windows CI still
+  NOT_VERIFIED (no push authorized).
+- See `docs/p7-2b3-design.md`. 28 new focused tests; full Linux suite 498 green.
+
+### P7.2b.3.1 Big Pickle remediation
+
+- F1: HELD (ambiguous) exposure is only released on an explicit resolution, not
+  by a later definitive failure.
+- F2: repeated compatibility `charge()` is idempotent and cannot double-count.
+- F4: malformed visual-hash version metadata fails closed (no leaked exceptions).
+- F7: a present-but-empty/null/malformed visual hash blocks sign-off.
+- F8: real Router + real CallLedger ambiguous-outcome integration test added.
+- Budget lifetime is explicitly classified PROCESS_SCOPED; `max_cost` is a
+  library-only ceiling (production passes `max_cost=None`) and is not
+  reconstructed across resume. See `docs/p7-2b3-design.md`.
+- Full Linux suite 517 green; native Windows CI still NOT_VERIFIED.
