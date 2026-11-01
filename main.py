@@ -4006,7 +4006,7 @@ class CrewTUIApp(App):
                 persistence = "factory"
         if state is not None:
             try:
-                identity, reason = engine_selection.resume_identity(
+                identity, reason = engine_selection.resolve_and_persist(
                     state, self._engine_identity)
             except engine_selection.EngineIdentityError as exc:
                 self._write(tagged("SYSTEM", f"engine: {exc}", bold=True))
@@ -4201,7 +4201,7 @@ class CrewTUIApp(App):
                                        self.settings.log_dir))
                 self._write(tagged("ADOPT", f"origem={result['origin']} · "
                                             f"motor={result['identity']} · "
-                                            f"ficheiros={result['baseline']['file_count']}"))
+                                            f"ficheiros={result['baseline'].get('files_total_regular', 0)}"))
                 self._start_factory(str(Path(path).expanduser().resolve()),
                                     resume=True)
             except Exception as exc:
@@ -4582,7 +4582,7 @@ def _adopt_cli(args: Any) -> int:
         "origin": result["origin"],
         "engine_identity": result["identity"],
         "project_root": baseline["root"],
-        "file_count": baseline["file_count"],
+        "file_count": baseline.get("files_total_regular", baseline.get("inventory_total", 0)),
         "languages": baseline["languages"],
         "configurations": baseline["configurations"],
         "tests": baseline["tests"],

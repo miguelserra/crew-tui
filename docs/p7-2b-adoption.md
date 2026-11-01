@@ -20,3 +20,14 @@ managed `.crew`/`.factory` state is rejected.
 CLI: `--adopt DIR`, then `--status --project DIR` or `--resume`.
 TUI: `/adopt DIR`; `/engine native|factory` sets explicit selection for a new
 project/resume.
+
+
+## Baseline scope and limits
+
+The hash baseline is bounded (default 2000 files, 64 MiB total, 8 MiB per file).
+Reports distinguish inventory totals, hashed count, coverage, skipped hashes,
+unreadable files, symlinks, special files and excluded roots. Incomplete
+coverage is never reported as full integrity. Symlinks are recorded without
+following external targets; LFS pointer files are identified; submodule paths
+are recorded from `.gitmodules`. Adoption re-inspects after state creation and
+fails on changed hashes, though it does not lock against concurrent writers.

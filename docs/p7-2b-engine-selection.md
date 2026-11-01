@@ -14,6 +14,9 @@ Unified states without identity are ambiguous and block resume unless the user
 resolves them explicitly with `--engine native|factory`. A conflicting override
 is rejected.
 
+Explicit resolution of an ambiguous identity is persisted by
+`resolve_and_persist()`, so it survives save/reload/repeated resume.
+
 New projects use NativeAdapter by default. FactoryAdapter remains available via
 explicit selection and for existing factory projects. No automatic migration or
 engine switch is performed.

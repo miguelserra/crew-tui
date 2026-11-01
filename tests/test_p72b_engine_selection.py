@@ -66,6 +66,14 @@ class SelectionTests(unittest.TestCase):
             st = s.ProjectState.from_dict(st.to_dict())
             self.assertEqual(sel.resume_identity(st)[0], "native")
 
+    def test_explicit_resolution_is_persisted(self):
+        st = self._state()
+        identity, _reason = sel.resolve_and_persist(st, "native")
+        self.assertEqual(identity, "native")
+        self.assertEqual(sel.identity_of(st), "native")
+        reloaded = s.ProjectState.from_dict(st.to_dict())
+        self.assertEqual(sel.resume_identity(reloaded)[0], "native")
+
     def test_status_describes_origin_identity_adapter(self):
         st = self._state(identity="factory")
         data = sel.describe(st)
@@ -212,6 +220,65 @@ class AdoptionTests(unittest.TestCase):
             (root2 / ".factory" / "state.json").write_text("{}", encoding="utf-8")
             with self.assertRaises(adoption.AdoptionError):
                 adoption.adopt_repository(root2, store)
+
+    def test_baseline_reports_coverage_and_limits(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "a.py").write_text("a" * 10, encoding="utf-8")
+            (root / "b.py").write_text("b" * 10, encoding="utf-8")
+            bounded = adoption.inspect_repository(root, max_files=1)
+            self.assertFalse(bounded["inventory_complete"])
+            self.assertEqual(bounded["files_total_regular"], 2)
+            self.assertEqual(bounded["hashed_count"], 1)
+            self.assertEqual(bounded["hash_coverage"], 0.5)
+            self.assertFalse(bounded["hash_complete"])
+            limited = adoption.inspect_repository(root, max_file_bytes=1)
+            self.assertTrue(limited["hash_skipped"])
+            self.assertFalse(limited["hash_complete"])
+
+    def test_adoption_incomplete_baseline_does_not_claim_full_integrity(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "repo"
+            root.mkdir()
+            (root / "a.py").write_text("content", encoding="utf-8")
+            store = StateManager(Path(td) / "ws", Path(td) / "logs")
+            result = adoption.adopt_repository(root, store, max_file_bytes=1)
+            st = result["state"]
+            self.assertFalse(st.extensions["adoption"]["verified_unchanged"])
+            integrity = st.extensions["adoption"]["integrity"]
+            self.assertFalse(integrity["baseline_hash_complete"])
+            self.assertGreater(integrity["hash_skipped_count"], 0)
+
+    def test_symlinks_and_lfs_metadata_are_recorded_without_following(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "repo"
+            outside = Path(td) / "outside.txt"
+            root.mkdir()
+            outside.write_text("outside\n", encoding="utf-8")
+            (root / "lfs.bin").write_text(
+                "version https://git-lfs.github.com/spec/v1\noid sha256:abc\n",
+                encoding="utf-8")
+            try:
+                (root / "link.txt").symlink_to(outside)
+            except OSError:
+                self.skipTest("symlink not permitted")
+            info = adoption.inspect_repository(root)
+            self.assertEqual(len(info["symlinks"]), 1)
+            self.assertFalse(info["symlinks"][0]["target_inside_root"])
+            self.assertNotIn("link.txt", info["file_sha256"])
+            self.assertNotIn("outside.txt", info["file_sha256"])
+            self.assertEqual(info["lfs_pointers"], ["lfs.bin"])
+
+    def test_baseline_inspection_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "a.py").write_text("a", encoding="utf-8")
+            (root / "b.txt").write_text("b", encoding="utf-8")
+            first = adoption.inspect_repository(root)
+            second = adoption.inspect_repository(root)
+            for key in ("files", "file_sha256", "languages", "inventory_total",
+                        "hashed_count", "hash_coverage", "hash_complete"):
+                self.assertEqual(first[key], second[key], key)
 
     def test_adoption_does_not_overwrite_configuration(self):
         with tempfile.TemporaryDirectory() as td:

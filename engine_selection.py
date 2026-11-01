@@ -83,6 +83,15 @@ def resume_identity(state: ProjectState,
         "project engine identity is ambiguous; pass --engine native|factory")
 
 
+def resolve_and_persist(state: ProjectState,
+                        explicit: Optional[str] = None) -> tuple[str, str]:
+    persisted = identity_of(state)
+    identity, reason = resume_identity(state, explicit)
+    if persisted is None:
+        set_identity(state, identity, origin=origin_of(state))
+    return identity, reason
+
+
 def describe(state: ProjectState, explicit: Optional[str] = None) -> dict[str, Any]:
     try:
         identity, reason = resume_identity(state, explicit)
