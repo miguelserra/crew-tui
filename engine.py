@@ -961,7 +961,8 @@ class FactoryAdapter:
 
 def new_unified_state(goal: str, project_root: str, run_id: Optional[str] = None,
                       engine_version: str = ENGINE_VERSION,
-                      profile: str = "auto") -> ProjectState:
+                      profile: str = "auto",
+                      engine_identity: str = "native") -> ProjectState:
     requested = (profile or "auto").strip().lower()
     resolved = "" if requested == "auto" else requested
     state = ProjectState(
@@ -978,6 +979,8 @@ def new_unified_state(goal: str, project_root: str, run_id: Optional[str] = None
         "reason": "" if requested != "auto" else "pendente de arquitectura",
         "profile_version": 1,
     }
+    state.extensions.setdefault("engine_identity", str(engine_identity))
+    state.extensions.setdefault("project_origin", "CREATED_BY_CREW")
     return state
 
 

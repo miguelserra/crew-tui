@@ -97,6 +97,8 @@ from state import (ProjectState, StateCorruptError, StateError, VerificationReco
                    from_legacy_factory, new_id)
 import verify as verify_policy
 import brief as brief_flow
+import engine_selection
+import adoption as adoption_mod
 from verify import UNVERIFIED, FAIL, NA, PASS as VERIFY_PASS
 from router import (
     CircuitBreaker, GrantStore, PaidGrant, RouteRequest, RouteResult, RouteChain,
@@ -3747,6 +3749,7 @@ class CrewTUIApp(App):
         self.engine: Optional[Any] = None
         self._factory_mode = False
         self._pending_brief: Optional[dict[str, Any]] = None
+        self._engine_identity: Optional[str] = None
 
     # -- lifecycle ---------------------------------------------------------- #
 
@@ -4001,31 +4004,38 @@ class CrewTUIApp(App):
                 state = from_legacy_factory(target.legacy_raw, engine_kind=ENGINE_LEGACY)
                 kind = ENGINE_LEGACY
                 persistence = "factory"
-        if kind is None and not resume:
+        if state is not None:
             try:
-                kind = resolve_engine()
-            except EngineError:
-                kind = ENGINE_LEGACY
-            persistence = "factory" if kind == ENGINE_LEGACY else "crew"
-            if kind == ENGINE_LEGACY and store.project_state_path(root).is_file():
-                self._write(tagged("SYSTEM", "existe .crew neste projeto; usa /resume "
-                                             "ou --migrate-engine antes de iniciar legacy.", bold=True))
+                identity, reason = engine_selection.resume_identity(
+                    state, self._engine_identity)
+            except engine_selection.EngineIdentityError as exc:
+                self._write(tagged("SYSTEM", f"engine: {exc}", bold=True))
                 return
-
-        if state is None:
-            if kind == ENGINE_LEGACY:
-                state = ProjectState(run_id=new_id("run_"), project_root=str(root),
-                                     goal=goal or "projeto", engine_kind=ENGINE_LEGACY,
-                                     engine_version="legacy", phase="SPEC")
-            else:
-                state = new_unified_state(goal or "projeto", str(root),
-                                          engine_version=ENGINE_VERSION,
-                                          profile=self.settings.workflow_profile)
+        else:
+            if not resume and store.project_state_path(root).is_file():
+                self._write(tagged("SYSTEM", "já existe .crew neste projeto; usa /resume.",
+                                   bold=True))
+                return
+            try:
+                identity, reason = engine_selection.new_identity(
+                    self._engine_identity)
+            except engine_selection.EngineIdentityError as exc:
+                self._write(tagged("SYSTEM", f"engine: {exc}", bold=True))
+                return
+            kind = ENGINE_UNIFIED
+            persistence = "crew"
+            state = new_unified_state(goal or "projeto", str(root),
+                                      engine_version=ENGINE_VERSION,
+                                      profile=self.settings.workflow_profile,
+                                      engine_identity=identity)
+            engine_selection.set_identity(
+                state, identity, origin=engine_selection.CREATED_BY_CREW)
         if not state.project_root:
             state.project_root = str(root)
-        adapter = FactoryAdapter(self.settings, self.pool, self._factory_emit, state,
-                                 legacy_order=(kind == ENGINE_LEGACY),
-                                 isolate_workspace=(kind == ENGINE_UNIFIED))
+        adapter = _build_workflow_adapter(
+            identity, self.settings, self.pool, self._factory_emit, state,
+            legacy_order=(kind == ENGINE_LEGACY),
+            isolate_workspace=(kind == ENGINE_UNIFIED))
         eng = WorkflowEngine(state, store, adapter, emit=self._factory_emit,
                              allow_unknown=self.settings.allow_unknown,
                              persistence=persistence)
@@ -4034,7 +4044,10 @@ class CrewTUIApp(App):
         self.engine = eng
         self.factory = EngineFacade(eng, store)
         self._factory_mode = True
-        self._write(tagged("CREW", f"projeto: {root} · motor: {kind} · estado: {persistence}",
+        self._write(tagged("CREW", f"projeto: {root} · engine_kind: {kind} · "
+                                     f"identity: {identity} · "
+                                     f"origin: {engine_selection.origin_of(state)} · "
+                                     f"reason: {reason} · estado: {persistence}",
                            bold=True))
         if self._pending_brief is not None:
             data = self._pending_brief
@@ -4172,6 +4185,28 @@ class CrewTUIApp(App):
             self._write(tagged("SYSTEM", "a run is already in progress …"))
             return
 
+        if text.startswith("/engine "):
+            value = text.split(" ", 1)[1].strip().lower()
+            if value not in ("native", "factory"):
+                self._write(tagged("SYSTEM", "uso: /engine native|factory"))
+                return
+            self._engine_identity = value
+            self._write(tagged("SYSTEM", f"motor explícito: {value}"))
+            return
+        if text.startswith("/adopt "):
+            path = text.split(" ", 1)[1].strip()
+            try:
+                result = adoption_mod.adopt_repository(
+                    path, StateManager(self.settings.workspace_dir,
+                                       self.settings.log_dir))
+                self._write(tagged("ADOPT", f"origem={result['origin']} · "
+                                            f"motor={result['identity']} · "
+                                            f"ficheiros={result['baseline']['file_count']}"))
+                self._start_factory(str(Path(path).expanduser().resolve()),
+                                    resume=True)
+            except Exception as exc:
+                self._write(tagged("ADOPT", f"falhou: {exc}"))
+            return
         if text.startswith("/brief") or text.startswith("/answer ")                 or text.startswith("/defer ") or text == "/approve-spec":
             self._brief_command(text)
             return
@@ -4494,6 +4529,70 @@ def _legacy_factory_cli(args: Any, settings: Any = None, store: Any = None) -> i
     return 0 if ok else 1
 
 
+def _build_workflow_adapter(identity: str, settings: Any, pool: Any, emit: Any,
+                            state: Any, *, legacy_order: bool,
+                            isolate_workspace: bool) -> Any:
+    if identity == engine_selection.FACTORY:
+        return FactoryAdapter(settings, pool, emit, state,
+                              legacy_order=legacy_order,
+                              isolate_workspace=isolate_workspace)
+    from native_adapter import NativeAdapter
+    verifier = Verifier(settings, pool, emit,
+                        getattr(pool, "telemetry", None))
+    return NativeAdapter(settings, pool, emit, state, verifier=verifier,
+                         isolate_workspace=isolate_workspace)
+
+
+def _status_cli(args: Any) -> int:
+    if not args.project:
+        print("--status exige --project DIR", flush=True)
+        return 2
+    settings = Settings.from_env()
+    store = StateManager(settings.workspace_dir, settings.log_dir)
+    root = Path(os.path.expanduser(args.project))
+    target = store.resolve_resume(root)
+    if target is None:
+        print("[STATE] nenhum projeto encontrado", flush=True)
+        return 6
+    if target.project_state is not None:
+        state = target.project_state
+    elif target.legacy_raw is not None:
+        state = from_legacy_factory(target.legacy_raw,
+                                    engine_kind=ENGINE_LEGACY)
+    else:
+        print("[STATE] estado sem formato canónico", flush=True)
+        return 6
+    print(json.dumps(engine_selection.describe(state,
+                                               getattr(args, "engine", None)),
+                     ensure_ascii=False, indent=2), flush=True)
+    return 0
+
+
+def _adopt_cli(args: Any) -> int:
+    settings = Settings.from_env()
+    store = StateManager(settings.workspace_dir, settings.log_dir)
+    goal = args.factory or args.goal
+    try:
+        result = adoption_mod.adopt_repository(args.adopt, store, goal=goal)
+    except adoption_mod.AdoptionError as exc:
+        print(f"[ADOPT] {exc}", flush=True)
+        return 4
+    baseline = result["baseline"]
+    print(json.dumps({
+        "origin": result["origin"],
+        "engine_identity": result["identity"],
+        "project_root": baseline["root"],
+        "file_count": baseline["file_count"],
+        "languages": baseline["languages"],
+        "configurations": baseline["configurations"],
+        "tests": baseline["tests"],
+        "git_dirty": baseline["git_dirty"],
+        "git_head": baseline["git_head"],
+        "status": "ADOPTED",
+    }, ensure_ascii=False, indent=2), flush=True)
+    return 0
+
+
 def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
                     state: Any = None, persistence: str = "crew") -> int:
     """Run the unified/legacy engine with canonical .crew persistence."""
@@ -4525,6 +4624,10 @@ def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
         slug = re.sub(r"[^a-z0-9]+", "_", goal.lower()).strip("_")[:40] or "projeto"
         root = Path(os.path.expanduser(settings.project_dir)) / slug
     root.mkdir(parents=True, exist_ok=True)
+    if state is None and store.project_state_path(root).is_file():
+        print(f"[STATE] já existe {store.project_state_path(root)}; usa --resume",
+              flush=True)
+        return 2
 
     if state is None:
         if not args.factory:
@@ -4535,9 +4638,18 @@ def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
             if not args.factory:
                 print("uso: crew-tui --factory \"objetivo\" [--project DIR]", flush=True)
                 return 2
+        try:
+            identity, reason = engine_selection.new_identity(
+                getattr(args, "engine", None))
+        except engine_selection.EngineIdentityError as exc:
+            print(f"[ENGINE] {exc}", flush=True)
+            return 2
         state = new_unified_state(args.factory, str(root),
                                   engine_version=ENGINE_VERSION,
-                                  profile=settings.workflow_profile)
+                                  profile=settings.workflow_profile,
+                                  engine_identity=identity)
+        engine_selection.set_identity(
+            state, identity, origin=engine_selection.CREATED_BY_CREW)
         state.engine_kind = kind
         if kind == ENGINE_LEGACY:
             state.engine_version = "legacy"
@@ -4545,15 +4657,20 @@ def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
         kind = state.engine_kind
         if not state.project_root:
             state.project_root = str(root)
+        try:
+            identity, reason = engine_selection.resume_identity(
+                state, getattr(args, "engine", None))
+        except engine_selection.EngineIdentityError as exc:
+            print(f"[ENGINE] {exc}", flush=True)
+            return 4
 
-    env_kind = resolve_engine()
-    if args.resume and env_kind != kind:
-        print(f"aviso: CREW_ENGINE={env_kind} ignorado no resume; "
-              f"o estado usa engine_kind={kind}", flush=True)
+    print(f"[ENGINE] identity={identity} · origin={engine_selection.origin_of(state)} "
+          f"· reason={reason}", flush=True)
 
-    adapter = FactoryAdapter(settings, pool, emit, state,
-                             legacy_order=(kind == ENGINE_LEGACY),
-                             isolate_workspace=(kind == ENGINE_UNIFIED))
+    adapter = _build_workflow_adapter(
+        identity, settings, pool, emit, state,
+        legacy_order=(kind == ENGINE_LEGACY),
+        isolate_workspace=(kind == ENGINE_UNIFIED))
     eng = WorkflowEngine(state, store, adapter, emit=emit,
                          allow_unknown=bool(getattr(args, "allow_unknown", False)
                                             or settings.allow_unknown),
@@ -4721,19 +4838,8 @@ def _factory_cli(args: Any) -> int:
             return 6
         return _legacy_factory_cli(args, settings, store)
 
-    try:
-        kind = resolve_engine()
-    except EngineError as exc:
-        print(f"[ENGINE] {exc}", flush=True)
-        return 2
-    if kind == ENGINE_UNIFIED:
-        return _engine_cli_run(args, kind, settings, store, None, persistence="crew")
-    root = Path(os.path.expanduser(args.project)) if args.project else None
-    if root is not None and store.project_state_path(root).is_file():
-        print("[STATE] existe .crew neste projeto; usa --resume ou remove/migra "
-              "antes de iniciar um run legacy", flush=True)
-        return 2
-    return _engine_cli_run(args, kind, settings, store, None, persistence="factory")
+    return _engine_cli_run(args, ENGINE_UNIFIED, settings, store, None,
+                           persistence="crew")
 
 
 def _resolve_call_cli(args: Any) -> int:
@@ -4841,6 +4947,12 @@ def main() -> None:
                         help="entrega explicitamente artefacts UNVERIFIED")
     parser.add_argument("--profile", metavar="PROFILE",
                         help="workflow: auto|web|library|script|review")
+    parser.add_argument("--engine", choices=["native", "factory"],
+                        help="adapter identity for a new project or explicit resolution")
+    parser.add_argument("--adopt", metavar="DIR",
+                        help="adopt an existing external repository non-destructively")
+    parser.add_argument("--status", action="store_true",
+                        help="show project origin, persisted identity and effective adapter")
     parser.add_argument("--brief", metavar="FILE",
                         help="Project Brief JSON for the structured requirements flow")
     parser.add_argument("--answer", action="append", metavar="ID=VALUE",
@@ -4884,6 +4996,10 @@ def main() -> None:
         raise SystemExit(_resolve_publish_cli(args))
     if args.resolve_call:
         raise SystemExit(_resolve_call_cli(args))
+    if args.status:
+        raise SystemExit(_status_cli(args))
+    if args.adopt:
+        raise SystemExit(_adopt_cli(args))
     if args.goal and args.factory:
         parser.error("dá o objetivo como posicional OU --factory (deprecated), não ambos")
     if args.factory:
