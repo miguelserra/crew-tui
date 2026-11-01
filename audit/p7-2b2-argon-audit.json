@@ -1,0 +1,214 @@
+{
+  "audit_id": "P7.2b.2-ARGON-REVIEW",
+  "title": "Independent Reliability Hardening and Regression Audit",
+  "repository": "/home/miguel/ai-stack/crew-tui",
+  "auditor": "Gemini Argon",
+  "date": "2026-11-01",
+  "baseline_head": "9b05b372ed855cdc8c10461d4a80bb72bde11844",
+  "branch": "main",
+  "mode": "READ_ONLY_INDEPENDENT_AUDIT",
+  "decision": "CONDITIONAL_PASS",
+  "findings": [
+    {
+      "id": "V01-1",
+      "title": "GrantStore is process-local only; no multi-process budget authority",
+      "severity": "HIGH",
+      "status": "UNRESOLVED",
+      "evidence_label": "INSPECTED",
+      "source_locations": [
+        "router.py:341-347",
+        "router.py:393-416"
+      ],
+      "failure_mechanism": "GrantStore uses threading.RLock for intra-process synchronization only. Multiple worker processes sharing the same logical budget will each maintain independent in-memory GrantStore instances, allowing combined spend to exceed max_cost.",
+      "reproduction": "Run two separate crew-tui processes with the same max_cost grant; both can reserve and commit the full budget independently.",
+      "impact": "Financial invariant (spent <= max_cost) only holds within a single process. Not suitable for distributed or multi-worker deployments without external coordination.",
+      "recommendation": "Document as explicit limitation. For multi-process safety, implement external budget service or persistent shared grant store."
+    },
+    {
+      "id": "V01-2",
+      "title": "Reservation estimate may underestimate actual provider token usage",
+      "severity": "HIGH",
+      "status": "UNRESOLVED",
+      "evidence_label": "INSPECTED",
+      "source_locations": [
+        "router.py:633-641"
+      ],
+      "failure_mechanism": "_reservation_amount() calculates estimate from request.estimated_context and request.max_tokens. Provider may consume more input tokens than estimated_context (e.g., large context injection, system prompts), causing actual cost > reservation.",
+      "reproduction": "Set estimated_context=1000, max_tokens=1000; provider receives 5000 input tokens due to system prompt + history; actual cost exceeds reservation.",
+      "impact": "Reservation is a conservative estimate, not a provider-enforced cap. Budget can be exceeded on a per-call basis. The invariant spent + reserved <= max_cost holds at reservation time but not necessarily at settlement.",
+      "recommendation": "Document that reservation is an estimate. Consider adding provider-side max_tokens enforcement where supported, or increase estimation safety margin."
+    },
+    {
+      "id": "V01-3",
+      "title": "Ambiguous provider outcomes leave reservations held indefinitely",
+      "severity": "MEDIUM",
+      "status": "UNRESOLVED",
+      "evidence_label": "INSPECTED",
+      "source_locations": [
+        "router.py:738",
+        "router.py:810-826"
+      ],
+      "failure_mechanism": "AMBIGUOUS_KINDS = {timeout, connection, server, empty, unknown} trigger CallOutcomeUnknown exception and do NOT release reservation. No automatic timeout or TTL on GrantReservation.active. Requires manual human resolution via CallLedger.resolve().",
+      "reproduction": "Provider times out; RouteChain raises CallOutcomeUnknown; reservation remains active; subsequent requests for same grant cannot reserve the held amount.",
+      "impact": "Budget effectively frozen for that grant until manual intervention. No automatic recovery path.",
+      "recommendation": "Add reservation TTL (e.g., 5-10 minutes) with automatic release, or implement a background reaper that releases stale reservations."
+    },
+    {
+      "id": "V01-4",
+      "title": "Crash between reserve() and commit() leaks reservation; no crash recovery",
+      "severity": "HIGH",
+      "status": "UNRESOLVED",
+      "evidence_label": "INSPECTED",
+      "source_locations": [
+        "router.py:393-430",
+        "router.py:777-846"
+      ],
+      "failure_mechanism": "GrantReservation is in-memory only. If process crashes after reserve() but before commit()/release(), the reserved amount remains in grant.reserved indefinitely. No persistence of reservations; no reconciliation on restart.",
+      "reproduction": "Kill process after RouteChain reserves budget but before charge() commits. On restart, grant.reserved still holds the amount, reducing available budget.",
+      "impact": "Budget hole on crash. Requires manual grant adjustment or new run with fresh grants.",
+      "recommendation": "Persist reservation state alongside CallLedger intent (SUBMITTED state) or implement reservation TTL. For now, document as known crash window."
+    },
+    {
+      "id": "V01-5",
+      "title": "Compatibility charge() path can double-spend if reservation also committed",
+      "severity": "MEDIUM",
+      "status": "UNRESOLVED",
+      "evidence_label": "INSPECTED",
+      "source_locations": [
+        "router.py:695-708"
+      ],
+      "failure_mechanism": "Router.charge() accepts optional reservation parameter. If caller passes reservation, grants.commit() is called. If caller omits reservation, grants.charge() is called directly. A code path that has a reservation but calls charge() without it will double-spend.",
+      "reproduction": "Call router.reserve() then router.charge(request, candidate, response) without passing the reservation. Both commit() and charge() add to grant.spent.",
+      "impact": "Double-counting of PAYG spend for that call. RouteChain.invoke() passes reservation correctly (router.py:842-846), but external callers using authorize()/charge() compatibility API may not.",
+      "recommendation": "Make charge() require reservation for PAYG calls, or detect and prevent double-spend by checking if a reservation exists for the (request, candidate) pair."
+    },
+    {
+      "id": "V01-6",
+      "title": "No reservation TTL or automatic expiry mechanism",
+      "severity": "MEDIUM",
+      "status": "UNRESOLVED",
+      "evidence_label": "INSPECTED",
+      "source_locations": [
+        "router.py:331-337"
+      ],
+      "failure_mechanism": "GrantReservation.active only becomes False via explicit commit() or release(). No background cleanup, no TTL field, no timestamp-based expiry.",
+      "reproduction": "Reserve budget; abandon request without calling commit/release. Reservation blocks that budget forever.",
+      "impact": "Stale reservations permanently reduce available budget for that grant.",
+      "recommendation": "Add created_at timestamp to GrantReservation; implement periodic cleanup or TTL check in reserve()/allows()."
+    },
+    {
+      "id": "V02-1",
+      "title": "Playwright resource lifecycle correctly handles all cleanup paths",
+      "severity": "HIGH",
+      "status": "RESOLVED",
+      "evidence_label": "TESTED",
+      "source_locations": [
+        "visual.py:36-95"
+      ],
+      "failure_mechanism": "N/A - implementation correct",
+      "reproduction": "N/A",
+      "impact": "N/A",
+      "recommendation": "No action required. All 7 test scenarios pass: success, navigation failure, screenshot failure, context failure, browser close failure, multiple cleanup failures, server shutdown failure."
+    },
+    {
+      "id": "V04-1",
+      "title": "CircuitBreaker degraded persistence correctly preserves in-memory state",
+      "severity": "MEDIUM",
+      "status": "RESOLVED",
+      "evidence_label": "TESTED",
+      "source_locations": [
+        "router.py:197-218"
+      ],
+      "failure_mechanism": "N/A - implementation correct",
+      "reproduction": "N/A",
+      "impact": "N/A",
+      "recommendation": "No action required. OSError caught, persistence_degraded flag set, warning logged, temp file cleaned. Subsequent successful save restores full state."
+    },
+    {
+      "id": "V05-1",
+      "title": "Windows atomic_write_json retry only verified via simulation (platform='nt')",
+      "severity": "MEDIUM",
+      "status": "NOT_VERIFIED",
+      "evidence_label": "TESTED",
+      "source_locations": [
+        "store.py:83-102",
+        "store.py:119"
+      ],
+      "failure_mechanism": "_replace_with_retry() retries PermissionError up to 4 times with exponential backoff on Windows only. All tests mock os.name='nt'. No native Windows CI evidence.",
+      "reproduction": "Run on actual Windows with antivirus/file locking causing transient PermissionError on os.replace.",
+      "impact": "Behavior on native Windows unverified. Simulated tests may not capture Windows-specific filesystem semantics (e.g., mandatory locking, AV interactions).",
+      "recommendation": "Enable Windows CI job to run test_p72b2_reliability.py natively. Mark as NOT_VERIFIED until native evidence exists."
+    },
+    {
+      "id": "V06-1",
+      "title": "Byte-hash change breaks backward compatibility with existing visual evidence",
+      "severity": "HIGH",
+      "status": "UNRESOLVED",
+      "evidence_label": "INSPECTED",
+      "source_locations": [
+        "visual.py:147-160",
+        "factory.py:1084-1091",
+        "state.py:1024-1042"
+      ],
+      "failure_mechanism": "Previous visual hashing used artifact_hash(text) which normalizes CRLF→LF and ensures trailing newline. New hashing uses hashlib.sha256(path.read_bytes()).hexdigest() (raw bytes). Existing persisted state.visual.artifact_hashes computed with old semantics will mismatch new raw-byte hashes on resume, causing false 'visual desatualizado' blockers.",
+      "reproduction": "Project with pre-P7.2b.2 state.visual.artifact_hashes for index.html (CRLF line endings). Resume with new code; signoff_blockers() computes raw-byte hash ≠ stored normalized hash; blocks sign-off.",
+      "impact": "All existing projects with visual evidence will fail sign-off freshness check until visual re-audit regenerates hashes. Silent breaking change with no migration path.",
+      "recommendation": "Add 'artifact_hash_version': 2 to state.visual. On signoff_blockers(), detect version 1 (or missing) and re-hash with old semantics for comparison, or auto-migrate on first resume. Document as breaking change requiring visual re-audit."
+    }
+  ],
+  "regression_areas": {
+    "PAYG_CallLedger": "VERIFIED",
+    "Routing_Adapters": "VERIFIED",
+    "Publication_Recovery": "VERIFIED",
+    "Visual_Verification": "VERIFIED",
+    "P7_2c_Discovery_Preservation": "VERIFIED"
+  },
+  "test_execution": {
+    "focused_p72b2_tests": {
+      "command": ".venv/bin/python -m unittest discover -s tests -p \"test_p72b2_*.py\" -v",
+      "exit_code": 0,
+      "test_count": 20,
+      "result": "PASS"
+    },
+    "full_p7_suite": {
+      "command": ".venv/bin/python -m unittest discover -s tests -p \"test_p7*_*.py\"",
+      "exit_code": 0,
+      "test_count": 227,
+      "result": "PASS"
+    },
+    "router_tests": {
+      "command": ".venv/bin/python -m unittest tests.test_p04_router -v",
+      "exit_code": 0,
+      "test_count": 23,
+      "result": "PASS"
+    },
+    "calls_tests": {
+      "command": ".venv/bin/python -m unittest tests.test_p04_calls -v",
+      "exit_code": 0,
+      "test_count": 17,
+      "result": "PASS"
+    },
+    "integration_tests": {
+      "command": ".venv/bin/python -m unittest tests.test_p7_services tests.test_p061_publish tests.test_p061_recovery -v",
+      "exit_code": 0,
+      "test_count": 43,
+      "result": "PASS"
+    }
+  },
+  "mandatory_caveats": [
+    "Do not equate local test success with CI verification",
+    "Do not equate simulated Windows tests with native Windows verification",
+    "Do not claim multi-process financial integrity unless implemented and tested",
+    "Do not approve V01 solely because a lock exists",
+    "Do not approve V06 without examining compatibility with persisted evidence",
+    "Do not recommend broad refactoring without a concrete defect and evidence"
+  ],
+  "readiness_for_p72c": true,
+  "readiness_conditions": [
+    "V06 backward compatibility must be addressed (version marker + migration) before production deployment affecting existing projects",
+    "V01 limitations (process-local, estimate-dependent, no crash recovery) must be documented in architecture decision record",
+    "V05 native Windows verification should be obtained via CI before Windows release"
+  ],
+  "repository_state_preserved": true,
+  "working_tree_unchanged": true
+}
