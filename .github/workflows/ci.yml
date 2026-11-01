@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Byte-compile
-        run: python -m py_compile main.py calls.py budget.py factory.py power.py power_linux.py power_win.py peak.py registry.py state.py store.py attempts.py engine.py router.py brief.py engine_selection.py adoption.py verify.py profiles.py scaffold.py workspace.py publish.py requirements.py architecture.py executor.py context_reader.py integration.py visual.py signoff.py native_util.py native_adapter.py
+        run: python -m py_compile main.py calls.py budget.py factory.py power.py power_linux.py power_win.py peak.py registry.py state.py store.py attempts.py engine.py router.py brief.py engine_selection.py adoption.py discovery.py verify.py profiles.py scaffold.py workspace.py publish.py requirements.py architecture.py executor.py context_reader.py integration.py visual.py signoff.py native_util.py native_adapter.py
       - name: Test module discovery
         run: python tools/check_test_imports.py
       - name: Power policy tests
@@ -49,6 +49,8 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p72a_*.py"
       - name: P7.2b engine selection/adoption tests
         run: python -m unittest discover -s tests -p "test_p72b_*.py"
+      - name: P7.2c discovery/understanding tests
+        run: python -m unittest discover -s tests -p "test_p72c_*.py"
 
   integration:
     name: Integration (py3.13)
@@ -82,6 +84,8 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p72a_*.py"
       - name: P7.2b engine selection/adoption tests
         run: python -m unittest discover -s tests -p "test_p72b_*.py"
+      - name: P7.2c discovery/understanding tests
+        run: python -m unittest discover -s tests -p "test_p72c_*.py"
 
   windows:
     name: Windows (py3.13)
@@ -92,7 +96,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Byte-compile
-        run: python -m py_compile main.py calls.py budget.py factory.py power.py power_linux.py power_win.py peak.py registry.py state.py store.py attempts.py engine.py router.py brief.py engine_selection.py adoption.py verify.py profiles.py scaffold.py workspace.py publish.py requirements.py architecture.py executor.py context_reader.py integration.py visual.py signoff.py native_util.py native_adapter.py
+        run: python -m py_compile main.py calls.py budget.py factory.py power.py power_linux.py power_win.py peak.py registry.py state.py store.py attempts.py engine.py router.py brief.py engine_selection.py adoption.py discovery.py verify.py profiles.py scaffold.py workspace.py publish.py requirements.py architecture.py executor.py context_reader.py integration.py visual.py signoff.py native_util.py native_adapter.py
       - name: Test module discovery
         run: python tools/check_test_imports.py
       - name: Windows backend tests
@@ -119,3 +123,5 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p72a_*.py"
       - name: P7.2b engine selection/adoption tests
         run: python -m unittest discover -s tests -p "test_p72b_*.py"
+      - name: P7.2c discovery/understanding tests
+        run: python -m unittest discover -s tests -p "test_p72c_*.py"

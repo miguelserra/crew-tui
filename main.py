@@ -99,6 +99,7 @@ import verify as verify_policy
 import brief as brief_flow
 import engine_selection
 import adoption as adoption_mod
+import discovery
 from verify import UNVERIFIED, FAIL, NA, PASS as VERIFY_PASS
 from router import (
     CircuitBreaker, GrantStore, PaidGrant, RouteRequest, RouteResult, RouteChain,
@@ -4185,6 +4186,9 @@ class CrewTUIApp(App):
             self._write(tagged("SYSTEM", "a run is already in progress …"))
             return
 
+        if text == "/discover" or text.startswith("/understanding"):
+            self._discovery_command(text)
+            return
         if text.startswith("/engine "):
             value = text.split(" ", 1)[1].strip().lower()
             if value not in ("native", "factory"):
@@ -4279,6 +4283,31 @@ class CrewTUIApp(App):
         r"^\s*(o que|que (fizeste|faz|está|houve|se passou)|porque|por que|onde|quando|"
         r"como (ficou|está|funciona)|quem|qual|quais|explica|mostra|diz-me|what|why|where|how)", re.I)
     NEW_PROJECT_RE = re.compile(r"\b(novo projeto|outro projeto|de raiz|from scratch|começa do zero)\b", re.I)
+
+    def _discovery_command(self, text: str) -> None:
+        if self.engine is None or not self._factory_mode:
+            self._write(tagged("SYSTEM", "inicia ou retoma um projeto antes de usar /discover."))
+            return
+        try:
+            word, _, rest = text.partition(" ")
+            if word == "/discover":
+                result = self.engine.discover_project(refresh=True)
+                self._write(tagged("DISCOVER", json.dumps(
+                    result["summary"], ensure_ascii=False, indent=2)[:8000]))
+                self._write(tagged("DISCOVER", f"dossier: "
+                                               f"{result['metadata'].get('dossier_path')}"))
+                return
+            if rest:
+                value = self.engine.understanding_section(rest)
+                self._write(tagged("UNDERSTANDING", json.dumps(
+                    value, ensure_ascii=False, indent=2)[:8000]))
+                return
+            fresh = self.engine.understanding_freshness()
+            self._write(tagged("UNDERSTANDING", self.engine.understanding_summary()))
+            self._write(tagged("DISCOVER", f"freshness: {fresh.get('status')} "
+                                            f"({fresh.get('reason')})"))
+        except Exception as exc:
+            self._write(tagged("DISCOVER", f"falhou: {exc}"))
 
     def _brief_command(self, text: str) -> None:
         word, _, rest = text.partition(" ")
@@ -4541,6 +4570,69 @@ def _build_workflow_adapter(identity: str, settings: Any, pool: Any, emit: Any,
                         getattr(pool, "telemetry", None))
     return NativeAdapter(settings, pool, emit, state, verifier=verifier,
                          isolate_workspace=isolate_workspace)
+
+
+def _load_cli_state(args: Any) -> tuple[Any, Any, Any]:
+    settings = Settings.from_env()
+    store = StateManager(settings.workspace_dir, settings.log_dir)
+    if not args.project:
+        return None, store, None
+    root = Path(os.path.expanduser(args.project))
+    target = store.resolve_resume(root)
+    if target is None:
+        return None, store, None
+    if target.project_state is not None:
+        return target.project_state, store, root
+    if target.legacy_raw is not None:
+        return from_legacy_factory(target.legacy_raw,
+                                   engine_kind=ENGINE_LEGACY), store, root
+    return None, store, root
+
+
+def _discover_cli(args: Any) -> int:
+    if not args.project:
+        print("--discover exige --project DIR", flush=True)
+        return 2
+    state, store, _root = _load_cli_state(args)
+    if state is None:
+        print("[DISCOVER] projeto gerido não encontrado; usa --adopt ou --resume",
+              flush=True)
+        return 6
+    try:
+        result = discovery.discover_project(state, store, refresh=True)
+    except Exception as exc:
+        print(f"[DISCOVER] {exc}", flush=True)
+        return 4
+    print(json.dumps({
+        "status": "COMPLETE",
+        "summary": result["summary"],
+        "metadata": {
+            "generated_at": result["metadata"].get("generated_at"),
+            "head": result["metadata"].get("head"),
+            "dossier_path": result["metadata"].get("dossier_path"),
+            "markdown_path": result["metadata"].get("markdown_path"),
+        },
+    }, ensure_ascii=False, indent=2), flush=True)
+    return 0
+
+
+def _understanding_cli(args: Any) -> int:
+    state, store, _root = _load_cli_state(args)
+    if state is None:
+        print("[UNDERSTANDING] projeto gerido não encontrado", flush=True)
+        return 6
+    if getattr(args, "understanding_section", None):
+        value = discovery.section(state, args.understanding_section)
+        print(json.dumps(value, ensure_ascii=False, indent=2), flush=True)
+        return 0 if value is not None else 4
+    freshness = discovery.freshness(state)
+    store.save_project(state)
+    print(json.dumps({
+        "summary": discovery.summary_for_agent(state),
+        "freshness": freshness,
+        "metadata": state.extensions.get("understanding") or {},
+    }, ensure_ascii=False, indent=2), flush=True)
+    return 0
 
 
 def _status_cli(args: Any) -> int:
@@ -4953,6 +5045,12 @@ def main() -> None:
                         help="adopt an existing external repository non-destructively")
     parser.add_argument("--status", action="store_true",
                         help="show project origin, persisted identity and effective adapter")
+    parser.add_argument("--discover", action="store_true",
+                        help="statically analyse an existing project into a dossier")
+    parser.add_argument("--understanding", action="store_true",
+                        help="show the persisted project understanding summary")
+    parser.add_argument("--understanding-section", metavar="NAME",
+                        help="print one dossier section")
     parser.add_argument("--brief", metavar="FILE",
                         help="Project Brief JSON for the structured requirements flow")
     parser.add_argument("--answer", action="append", metavar="ID=VALUE",
@@ -4998,6 +5096,10 @@ def main() -> None:
         raise SystemExit(_resolve_call_cli(args))
     if args.status:
         raise SystemExit(_status_cli(args))
+    if args.discover:
+        raise SystemExit(_discover_cli(args))
+    if args.understanding or args.understanding_section:
+        raise SystemExit(_understanding_cli(args))
     if args.adopt:
         raise SystemExit(_adopt_cli(args))
     if args.goal and args.factory:

@@ -317,6 +317,25 @@ class WorkflowEngine:
     def brief_summary(self) -> dict[str, Any]:
         return brief_flow.summary(self.state)
 
+    def discover_project(self, refresh: bool = True) -> dict[str, Any]:
+        import discovery
+        return discovery.discover_project(self.state, self.store,
+                                          refresh=refresh)
+
+    def understanding_summary(self) -> str:
+        import discovery
+        return discovery.summary_for_agent(self.state)
+
+    def understanding_freshness(self) -> dict[str, Any]:
+        import discovery
+        result = discovery.freshness(self.state)
+        self.save()
+        return result
+
+    def understanding_section(self, name: str) -> Any:
+        import discovery
+        return discovery.section(self.state, name)
+
     def brief_blockers(self) -> list[str]:
         return brief_flow.blockers(self.state)
 
