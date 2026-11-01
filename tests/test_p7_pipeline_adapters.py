@@ -1990,7 +1990,8 @@ class D10ResumePipelineTests(unittest.TestCase):
                 hashes = st.visual.get("artifact_hashes") or {}
                 self.assertEqual(hashes.get("index.html"),
                                  {"v": 2, "sha": hashlib.sha256(
-                                     b"<html>ok</html>\n").hexdigest()},
+                                     (run["ws"] / "index.html").read_bytes()
+                                 ).hexdigest()},
                                  kind)
                 (run["ws"] / "index.html").write_text("<html>changed</html>\n",
                                                       encoding="utf-8")
@@ -3029,7 +3030,8 @@ class D08VisualBrowserTests(unittest.TestCase):
             "gemini-plus", calls[0]["model"]).capabilities)
         self.assertEqual(st.visual.get("artifact_hashes", {}).get("index.html"),
                          {"v": 2, "sha": hashlib.sha256(
-                             self.HTML.encode("utf-8")).hexdigest()},
+                             (run["ws"] / "index.html").read_bytes()
+                         ).hexdigest()},
                          kind)
         return run, eng, calls
 

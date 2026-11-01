@@ -173,10 +173,13 @@ class VisualMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "index.html").write_text("<html>a</html>\n", encoding="utf-8")
-            (root / "style.css").write_text("body{}\n", encoding="utf-8")
+            css = root / "style.css"
+            # Write exact bytes so the v2 expectation is independent of the
+            # host's text-mode newline translation (Windows writes CRLF).
+            css.write_bytes(b"body{}\n")
             legacy = s.artifact_hash("<html>a</html>\n")
             current = {"v": 2, "sha": hashlib.sha256(
-                b"body{}\n").hexdigest()}
+                css.read_bytes()).hexdigest()}
             st = s.ProjectState(run_id="r", goal="g",
                                 engine_kind=s.ENGINE_UNIFIED,
                                 project_root=str(root))
