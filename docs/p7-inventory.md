@@ -66,7 +66,7 @@ Baseline: `p6.1-gate` (`86f2df1`).
   approval, resume, legacy compatibility, CLI flags/flow, no fabricated
   requirements and conflicts.
 - P7.1d remains OPEN/COMPLETE.
-- P7.2b and P7.2c have not started.
+- P7.2b and P7.2c were implemented in later milestones (see the sections below).
 
 
 ## P7.2b.2 reliability hardening
@@ -101,3 +101,23 @@ Baseline: `p6.1-gate` (`86f2df1`).
   library-only ceiling (production passes `max_cost=None`) and is not
   reconstructed across resume. See `docs/p7-2b3-design.md`.
 - Full Linux suite 517 green; native Windows CI still NOT_VERIFIED.
+
+## P7.2c.1 Discovery Core completion
+
+- `discovery.py` already provided a full static P7.2c implementation; the core
+  was audited and the P7.2c.1 gaps were filled additively without removing the
+  pre-existing dossier/freshness/CLI/TUI/engine integration.
+- Added structured `project` (name provenance + description), enriched
+  `repository` (git_available/dirty/dirty_paths), `structure`
+  (modules/classes/functions/interfaces, plus `unsupported_source_suffixes` for
+  inventory-recognised source languages without a structural extractor), `tests`,
+  dependency `manifests/declared_dependencies/unresolved_formats`, and `evidence`
+  (coverage + item index).
+- Fixed TOML/requirements manifest parsing and framework evidence (no empty or
+  substring-based evidence).
+- Discovery remains static/bounded and reuses `adoption.inspect_repository`;
+  no execution, installation, network or cloud calls.
+- See `docs/p7-2c1-core-audit.md`. `tests/test_p72c_discovery.py` now has 27
+  tests (7 pre-existing + 13 P7.2c.1 core + 7 P7.2c.1.1 F-1 classification).
+- P7.2c.2+ (dossier/agent integration refinements) remain future work unless
+  already present; no new milestone started here.
