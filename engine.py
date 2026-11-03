@@ -336,6 +336,34 @@ class WorkflowEngine:
         import discovery
         return discovery.section(self.state, name)
 
+    def retrieve_context(self, query: str, **kwargs: Any) -> dict[str, Any]:
+        """Bounded, deterministic retrieval over the persisted dossier.
+
+        Delegates to :func:`discovery.retrieve_context`. This performs no model
+        call, no repository rescan and no dossier refresh.
+        """
+        import discovery
+        return discovery.retrieve_context(self.state, query, **kwargs)
+
+    def project_summary(self, **kwargs: Any) -> str:
+        """Compact project summary for agent initialisation (no model call)."""
+        import discovery
+        return discovery.summary_for_agent(self.state, **kwargs)
+
+    def project_summary_structured(self, **kwargs: Any) -> dict[str, Any]:
+        """Structured project summary; see ``discovery.get_project_summary``."""
+        import discovery
+        return discovery.get_project_summary(self.state, **kwargs)
+
+    def component_context(self, component: str, max_chars: int = 4000
+                          ) -> dict[str, Any]:
+        import discovery
+        return discovery.get_component_context(self.state, component, max_chars)
+
+    def evidence(self, evidence_ids: list[str]) -> list[dict[str, Any]]:
+        import discovery
+        return discovery.get_evidence(self.state, evidence_ids)
+
     def brief_blockers(self) -> list[str]:
         return brief_flow.blockers(self.state)
 

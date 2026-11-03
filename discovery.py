@@ -1123,7 +1123,20 @@ def discover_project(state: ProjectState, store: Any, *,
         "summary": compact,
         "scope": dossier["analysis_scope"],
         "tool": dossier["provenance"],
-        "freshness": "FRESH",
+    }
+    # A dossier is produced from a bounded inventory/hash pass over the current
+    # tree. If that pass was complete the initial recorded assessment is FRESH;
+    # otherwise it is UNKNOWN (never a false FRESH under partial coverage).
+    complete = bool(dossier["analysis_scope"].get("hash_complete", False))
+    initial_status = "FRESH" if complete else "UNKNOWN"
+    meta["freshness"] = initial_status
+    meta["last_freshness"] = {
+        "status": initial_status,
+        "reason": ("generated from current bounded inventory" if complete
+                   else "generated with incomplete hash coverage"),
+        "checked_at": dossier["generated_at"],
+        "source": "generation",
+        "live": True,
     }
     state.extensions["understanding"] = meta
     store.save_project(state)
@@ -1144,9 +1157,15 @@ def load_dossier(state: ProjectState) -> Optional[dict[str, Any]]:
 def freshness(state: ProjectState, root: Optional[str | Path] = None) -> dict[str, Any]:
     dossier = load_dossier(state)
     meta = state.extensions.get("understanding") or {}
+    checked_at = utc_now()
     if dossier is None:
-        return {"status": "UNKNOWN", "reason": "no dossier",
-                "changed": [], "new": [], "removed": [], "head_changed": False}
+        result = {"status": "UNKNOWN", "reason": "no dossier",
+                  "changed": [], "new": [], "removed": [], "head_changed": False,
+                  "checked_at": checked_at, "source": "live_assessment",
+                  "live": True}
+        meta["last_freshness"] = result
+        state.extensions["understanding"] = meta
+        return dict(result)
     base_root = Path(root or state.project_root).expanduser().resolve()
     limits = dossier.get("analysis_scope", {}).get("limits", {})
     current = adoption.inspect_repository(
@@ -1176,35 +1195,667 @@ def freshness(state: ProjectState, root: Optional[str | Path] = None) -> dict[st
     result = {"status": status, "reason": reason,
               "changed": changed[:100], "new": new_files[:100],
               "removed": removed[:100], "head_changed": head_changed,
-              "current_head": current.get("git_head", "")}
+              "current_head": current.get("git_head", ""),
+              "checked_at": checked_at, "source": "live_assessment",
+              "live": True}
     meta["last_freshness"] = result
+    meta.setdefault("generated_at", dossier.get("generated_at", ""))
     state.extensions["understanding"] = meta
-    return result
+    return dict(result)
+
+
+def _lookup_path(dossier: dict[str, Any], path: str) -> Any:
+    """Resolve a dotted section path (e.g. ``structure.classes``).
+
+    Numeric segments index into lists. Returns ``None`` when a segment is
+    missing or the path is malformed.
+    """
+    current: Any = dossier
+    for part in path.split("."):
+        if isinstance(current, dict):
+            current = current.get(part)
+        elif isinstance(current, list) and part.isdigit():
+            idx = int(part)
+            current = current[idx] if 0 <= idx < len(current) else None
+        else:
+            return None
+        if current is None:
+            return None
+    return current
 
 
 def section(state: ProjectState, name: str) -> Any:
+    """Return a dossier section by name (dotted paths supported).
+
+    Backward compatible with the original top-level lookup; ``name`` may now be
+    a dotted path such as ``structure.classes`` or ``dependencies.manifests``.
+    Missing sections (and unknown nested paths) return ``None``.
+    """
     dossier = load_dossier(state)
     if dossier is None:
         return None
+    if "." in name:
+        return _lookup_path(dossier, name)
     return dossier.get(name)
 
 
-def summary_for_agent(state: ProjectState, max_chars: int = 4000) -> str:
-    dossier = load_dossier(state)
+_UNSET = object()
+_VALID_FRESHNESS = {"FRESH", "STALE", "UNKNOWN", "CONFLICTING"}
+
+
+def _limit(name: str, value: Any, default: int, low: int, high: int) -> int:
+    """Validate a bounded integer limit.
+
+    Omitted (sentinel) values use ``default``. Non-integer values (including
+    ``bool``, ``float``, strings and explicit ``None``) raise ``TypeError``.
+    In-range integers are preserved; out-of-range integers are clamped to the
+    documented range (the established pre-P7.2c.2.1 behaviour).
+    """
+    if value is _UNSET:
+        value = default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer, not {type(value).__name__}")
+    return max(low, min(value, high))
+
+
+def _dump(obj: Any) -> str:
+    """Canonical serialisation used for every character-budget measurement."""
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def _freshness_unknown(reason: str, generated_at: Optional[str] = None
+                       ) -> dict[str, Any]:
+    return {"status": "UNKNOWN", "stale": False, "source": "last_recorded",
+            "live": False, "generated_at": generated_at,
+            "checked_at": None, "assessment_source": None, "reason": reason}
+
+
+def _known_freshness(state: ProjectState,
+                     dossier_missing: bool = False) -> dict[str, Any]:
+    """Return the last *recorded* freshness (never a live filesystem claim).
+
+    Retrieval must not walk the repository on every request, so this reads only
+    the persisted metadata written by ``discover_project`` / ``freshness``.
+    Malformed metadata — or a missing dossier — is reported as ``UNKNOWN`` and
+    can never be surfaced as ``FRESH``.
+
+    ``source``/``live`` describe the *retrieval operation* (always
+    ``last_recorded`` / ``false``). ``assessment_source`` preserves how the
+    underlying assessment was originally produced (``generation`` or
+    ``live_assessment``) without implying a live check happened now.
+    """
     meta = state.extensions.get("understanding") or {}
+    generated_at = meta.get("generated_at")
+    if not isinstance(generated_at, str) or not generated_at:
+        generated_at = None
+    if dossier_missing:
+        return _freshness_unknown("no dossier", generated_at)
+    last = meta.get("last_freshness")
+    if last is None:
+        return _freshness_unknown("no recorded freshness assessment", generated_at)
+    if not isinstance(last, dict):
+        return _freshness_unknown("malformed freshness metadata", generated_at)
+    status = last.get("status")
+    if status not in _VALID_FRESHNESS:
+        return _freshness_unknown("malformed freshness status", generated_at)
+    checked = last.get("checked_at")
+    checked_ok = isinstance(checked, str) and bool(checked)
+    reason = last.get("reason") if isinstance(last.get("reason"), str) else ""
+    if status == "FRESH" and not checked_ok:
+        # A FRESH claim without a recorded assessment timestamp is not honest.
+        return _freshness_unknown(
+            "freshness assessment timestamp unavailable", generated_at)
+    assessment_source = last.get("source")
+    if not isinstance(assessment_source, str) or not assessment_source:
+        assessment_source = None
+    return {"status": status, "stale": status == "STALE",
+            "source": "last_recorded", "live": False,
+            "generated_at": generated_at,
+            "checked_at": checked if checked_ok else None,
+            "assessment_source": assessment_source,
+            "reason": reason}
+
+
+def _fit_dict(obj: dict[str, Any], max_chars: int,
+              large_keys: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Return a JSON object whose serialised form is <= ``max_chars``.
+
+    Large optional lists are dropped first, then the object is replaced by a
+    bounded ``preview`` with an explicit truncation marker. A minimal error
+    object is used if even the preview envelope cannot fit.
+    """
+    if len(_dump(obj)) <= max_chars:
+        return obj
+    if large_keys:
+        slim = dict(obj)
+        for key in large_keys:
+            if key in slim:
+                slim[key] = []
+        if len(_dump(slim)) <= max_chars:
+            slim["truncated"] = True
+            return slim
+    text = _dump(obj)
+    marker = "... [truncated]"
+    base = {k: obj.get(k) for k in ("component", "found") if k in obj}
+    lo, hi, best = 0, len(text), None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        cand = dict(base)
+        cand["preview"] = text[:mid] + marker
+        cand["truncated"] = True
+        if len(_dump(cand)) <= max_chars:
+            best = cand
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best is not None:
+        return best
+    fallback = {"error": "budget_too_small", "truncated": True}
+    return fallback if len(_dump(fallback)) <= max_chars else {"error": "budget"}
+
+
+def _fit_summary(summary: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    """Bound a structured summary response by its complete serialised size.
+
+    If the full freshness object does not leave room for any summary text, a
+    compact freshness view is used so the response stays useful while remaining
+    within budget. Truncated responses never claim more precision than they
+    carry.
+    """
+    if len(_dump(summary)) <= max_chars:
+        return summary
+    text = _dump(summary)
+    marker = "... [truncated]"
+    fresh = summary.get("freshness")
+    variants: list[Any] = []
+    if isinstance(fresh, dict):
+        variants.append(fresh)
+        variants.append({k: fresh.get(k) for k in
+                         ("status", "source", "live", "checked_at",
+                          "generated_at", "assessment_source")})
+        variants.append({k: fresh.get(k) for k in
+                         ("status", "source", "live")})
+    else:
+        variants.append(None)
+    for variant in variants:
+        lo, hi, best = 0, len(text), None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            cand = {"summary": text[:mid] + marker, "truncated": True}
+            if variant is not None:
+                cand["freshness"] = variant
+            if len(_dump(cand)) <= max_chars:
+                best = cand
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best is not None:
+            return best
+    fallback = {"error": "budget_too_small", "truncated": True}
+    return fallback if len(_dump(fallback)) <= max_chars else {"error": "budget"}
+
+
+def summary_for_agent(state: ProjectState, max_chars: int = 4000,
+                      include_git: bool = True,
+                      include_tech_stack: bool = True,
+                      include_architecture: bool = True,
+                      include_risks: bool = True) -> str:
+    """Return a compact, evidence-aware project summary for agent context.
+
+    ``include_risks`` defaults to ``True`` to preserve the historical output of
+    callers that never passed the newer flags. The freshness line is always
+    first (and is last-recorded, not a live verification) so it survives
+    ``max_chars`` truncation.
+    """
+    dossier = load_dossier(state)
     if not dossier:
         return "No project understanding dossier is available."
-    s = dossier["overview"]
-    tech = dossier["technology_stack"]
-    risks = [r["text"] for r in dossier["risks"]]
-    unresolved = dossier["unresolved_questions"]
-    text = (
-        f"Project: {s.get('project_name')} | languages={tech.get('languages')} | "
-        f"frameworks={[f['name'] for f in tech.get('frameworks', [])]}\n"
-        f"Entry points: {[e['file'] for e in dossier['entry_points']]}\n"
-        f"Components: {[c['name'] for c in dossier['components']]}\n"
-        f"Risks: {risks[:6]}\nUnresolved: {unresolved[:6]}\n"
-        f"Freshness: {meta.get('freshness', 'UNKNOWN')} | "
-        f"analyzed={dossier['analysis_scope']['files_analyzed']}/"
-        f"{dossier['analysis_scope']['files_total']}")
-    return text[:max_chars]
+    overview = dossier.get("overview", {})
+    tech = dossier.get("technology_stack", {})
+    scope = dossier.get("analysis_scope", {})
+    fresh = _known_freshness(state)
+    languages = tech.get("languages", {})
+    frameworks = [f.get("name") for f in tech.get("frameworks", []) if f.get("name")]
+
+    lines = [f"Freshness: {fresh['status']} (last recorded) | analyzed="
+             f"{scope.get('files_analyzed', 0)}/{scope.get('files_total', 0)}"]
+    lines.append(f"Project: {overview.get('project_name')} | languages={languages} | "
+                 f"frameworks={frameworks}")
+    if include_git:
+        repo = dossier.get("repository", {})
+        if repo.get("head") or repo.get("branch"):
+            lines.append(f"Git: head={str(repo.get('head', ''))[:8]} "
+                         f"branch={repo.get('branch', '')} dirty={repo.get('dirty')}")
+    if include_tech_stack:
+        lines.append(f"Package managers: {tech.get('package_managers', [])} | "
+                     f"build: {tech.get('build_systems', [])}")
+    if include_architecture:
+        comps = dossier.get("components", [])
+        names = ", ".join(str(c.get("name")) for c in comps[:8])
+        lines.append(f"Components: {names or 'none'}")
+    entry = [e.get("file") for e in dossier.get("entry_points", [])]
+    lines.append(f"Entry points: {entry}")
+    if include_risks:
+        risks = [r.get("text") for r in dossier.get("risks", []) if r.get("text")]
+        if risks:
+            lines.append("Risks: " + "; ".join(risks[:3]))
+    unresolved = dossier.get("unresolved_questions", [])
+    if unresolved:
+        lines.append("Unresolved: " + "; ".join(str(u) for u in unresolved[:3]))
+    return "\n".join(lines)[:max_chars]
+
+
+def get_project_summary(state: ProjectState,
+                        max_chars: int = _UNSET,
+                        include_git: bool = True,
+                        include_tech_stack: bool = True,
+                        include_architecture: bool = True,
+                        include_risks: bool = False) -> dict[str, Any]:
+    """Return a structured, bounded project summary (JSON-serialisable).
+
+    The complete serialised response (including any truncation marker) is
+    guaranteed to be <= ``max_chars``.
+    """
+    max_chars = _limit("max_chars", max_chars, 4000, 200, _MAX_CHARS_CAP)
+    dossier = load_dossier(state)
+    if not dossier:
+        return {"error": "no project understanding dossier", "results": []}
+    overview = dossier.get("overview", {})
+    tech = dossier.get("technology_stack", {})
+    summary: dict[str, Any] = {
+        "project_name": overview.get("project_name"),
+        "goal": overview.get("goal", ""),
+        "entry_points": dossier.get("entry_points", []),
+        "components": [{"name": c.get("name"), "file_count": c.get("file_count", 0)}
+                       for c in dossier.get("components", [])],
+        "freshness": _known_freshness(state),
+    }
+    if include_git:
+        repo = dossier.get("repository", {})
+        summary["git"] = {"head": str(repo.get("head", ""))[:8],
+                          "branch": repo.get("branch", ""),
+                          "dirty": repo.get("dirty"),
+                          "dirty_paths": repo.get("dirty_paths", [])}
+    if include_tech_stack:
+        summary["technology_stack"] = {
+            "languages": tech.get("languages", {}),
+            "frameworks": [f.get("name") for f in tech.get("frameworks", [])],
+            "package_managers": tech.get("package_managers", []),
+            "build_systems": tech.get("build_systems", []),
+            "test_frameworks": tech.get("test_frameworks", []),
+        }
+    if include_architecture:
+        summary["architecture"] = {
+            "components": [{"name": c.get("name"), "file_count": c.get("file_count", 0)}
+                           for c in dossier.get("components", [])],
+            "entry_points": dossier.get("entry_points", []),
+        }
+    if include_risks:
+        summary["risks"] = [{"text": r.get("text"), "status": r.get("status")}
+                            for r in dossier.get("risks", [])]
+    return _fit_summary(summary, max_chars)
+
+
+def get_evidence(state: ProjectState, evidence_ids: list[str]) -> list[dict[str, Any]]:
+    """Retrieve exact evidence records by stable ID (missing IDs are omitted)."""
+    dossier = load_dossier(state)
+    if not dossier:
+        return []
+    items = (dossier.get("evidence") or {}).get("items", [])
+    by_id = {item.get("id"): item for item in items if item.get("id")}
+    return [by_id[eid] for eid in evidence_ids if eid in by_id]
+
+
+def _evidence_index(dossier: dict[str, Any]) -> dict[str, list[str]]:
+    """Map source path -> evidence IDs (derived from the canonical index)."""
+    index: dict[str, list[str]] = {}
+    for item in (dossier.get("evidence") or {}).get("items", []):
+        path = item.get("source_path")
+        if item.get("id") and path:
+            index.setdefault(path, []).append(str(item["id"]))
+    return index
+
+
+def get_file_context(state: ProjectState, file_path: str) -> Optional[dict[str, Any]]:
+    """Return dossier context for a specific file, or ``None`` if unknown."""
+    dossier = load_dossier(state)
+    if not dossier:
+        return None
+    ev_index = _evidence_index(dossier)
+    structure = dossier.get("structure") or {}
+    modules = [m for m in structure.get("modules", []) if m.get("path") == file_path]
+    symbols = [s for key in ("classes", "functions", "interfaces")
+               for s in structure.get(key, []) if s.get("file") == file_path]
+    edges = [e for e in (dossier.get("dependencies") or {}).get("internal", [])
+             if e.get("from") == file_path or e.get("to") == file_path]
+    if not modules and not symbols and not edges and file_path not in ev_index:
+        return None
+    return {"path": file_path, "modules": modules, "symbols": symbols,
+            "internal_edges": edges,
+            "evidence_ids": list(ev_index.get(file_path, []))}
+
+
+def get_symbol_context(state: ProjectState, symbol_name: str,
+                       file_path: Optional[str] = None) -> list[dict[str, Any]]:
+    """Find observed classes/functions/interfaces by name (optionally by file)."""
+    dossier = load_dossier(state)
+    if not dossier:
+        return []
+    structure = dossier.get("structure") or {}
+    out = []
+    for key in ("classes", "functions", "interfaces"):
+        for sym in structure.get(key, []):
+            if sym.get("name") != symbol_name:
+                continue
+            if file_path is not None and sym.get("file") != file_path:
+                continue
+            rec = dict(sym)
+            rec.setdefault("section", f"structure.{key}")
+            out.append(rec)
+    out.sort(key=lambda s: (s.get("file", ""), s.get("line", 0), s.get("name", "")))
+    return out
+
+
+def get_component_context(state: ProjectState, component: str,
+                          max_chars: int = _UNSET) -> dict[str, Any]:
+    """Return the component entry, its files' symbols and its internal edges.
+
+    The complete serialised response is guaranteed to be <= ``max_chars``.
+    """
+    max_chars = _limit("max_chars", max_chars, 4000, 200, _MAX_CHARS_CAP)
+    dossier = load_dossier(state)
+    if not dossier:
+        return {"component": component, "found": False}
+    comp = next((c for c in dossier.get("components", [])
+                 if c.get("name") == component), None)
+    if comp is None:
+        return _fit_dict({"component": component, "found": False}, max_chars)
+    paths = set(comp.get("paths", []))
+    structure = dossier.get("structure") or {}
+    symbols = [s for key in ("classes", "functions", "interfaces")
+               for s in structure.get(key, []) if s.get("file") in paths]
+    edges = [e for e in (dossier.get("dependencies") or {}).get("internal", [])
+             if e.get("from") in paths or e.get("to") in paths]
+    result = {"component": component, "found": True, "content": comp,
+              "symbols": symbols[:200], "internal_edges": edges[:200]}
+    return _fit_dict(result, max_chars, large_keys=("symbols", "internal_edges"))
+
+
+def _iter_searchable(dossier: dict[str, Any], ev_index: dict[str, list[str]]
+                     ) -> list[dict[str, Any]]:
+    """Flatten the dossier into deterministic, searchable items (bounded)."""
+    items: list[dict[str, Any]] = []
+
+    def add(section_name: str, path: str, content: Any, status: str,
+            name: str = "", file: str = "") -> None:
+        ev = list(ev_index.get(file or path, []))
+        text = " ".join(str(x) for x in (name, path, file, section_name,
+                                         json.dumps(content, ensure_ascii=False)))
+        items.append({"section": section_name, "path": path, "content": content,
+                      "status": status, "name": name, "file": file,
+                      "evidence_ids": ev, "text": text})
+
+    structure = dossier.get("structure") or {}
+    for mod in structure.get("modules", []):
+        add("structure.modules", str(mod.get("path", "")), mod,
+            "OBSERVED", file=str(mod.get("path", "")))
+    for key in ("classes", "functions"):
+        for sym in structure.get(key, []):
+            path = f"{sym.get('file', '')}:{sym.get('line', 0)}"
+            add(f"structure.{key}", path, sym, "OBSERVED",
+                name=str(sym.get("name", "")), file=str(sym.get("file", "")))
+    for sym in structure.get("interfaces", []):
+        path = f"{sym.get('file', '')}:{sym.get('line', 0)}"
+        add("structure.interfaces", path, sym, "INFERRED",
+            name=str(sym.get("name", "")), file=str(sym.get("file", "")))
+
+    for comp in dossier.get("components", []):
+        add("components", str(comp.get("name", "")), comp, "INFERRED",
+            name=str(comp.get("name", "")))
+
+    deps = dossier.get("dependencies") or {}
+    for dep in deps.get("declared_dependencies", []):
+        add("dependencies.declared_dependencies",
+            str(dep.get("name", "")), dep, "OBSERVED",
+            name=str(dep.get("name", "")))
+    for edge in deps.get("internal", []):
+        add("dependencies.internal",
+            f"{edge.get('from', '')}->{edge.get('to', '')}", edge,
+            "OBSERVED", file=str(edge.get("from", "")))
+    for edge in deps.get("external_imports", []):
+        add("dependencies.external_imports",
+            str(edge.get("module", "")), edge, "OBSERVED",
+            name=str(edge.get("module", "")), file=str(edge.get("file", "")))
+
+    for ep in dossier.get("entry_points", []):
+        add("entry_points", str(ep.get("file", "")), ep, "OBSERVED",
+            file=str(ep.get("file", "")))
+    for ext in dossier.get("external_interfaces", []):
+        add("external_interfaces", str(ext.get("text", ""))[:60], ext,
+            str(ext.get("status", "UNKNOWN")))
+    for pers in dossier.get("persistence", []):
+        add("persistence", str(pers.get("text", ""))[:60], pers,
+            str(pers.get("status", "UNKNOWN")))
+    for risk in dossier.get("risks", []):
+        add("risks", str(risk.get("text", ""))[:60], risk,
+            str(risk.get("status", "UNKNOWN")))
+    for ev in (dossier.get("evidence") or {}).get("items", []):
+        add("evidence", str(ev.get("id", "")), ev,
+            str(ev.get("classification", "UNKNOWN")),
+            file=str(ev.get("source_path", "")))
+    return items
+
+
+def _score_item(item: dict[str, Any], query: str,
+                tokens: set[str]) -> tuple[float, str]:
+    """Deterministic lexical relevance score and human-readable reason."""
+    q = (query or "").strip().lower()
+    score = 0.0
+    reasons: list[str] = []
+    if not q:
+        return 0.0, "empty_query"
+    name = str(item.get("name", "")).lower()
+    path = str(item.get("path", "")).lower()
+    section_name = str(item.get("section", "")).lower()
+    if name and q == name:
+        score = max(score, 1.0)
+        reasons.append(f"exact_symbol:{query}")
+    elif name and q in name:
+        score = max(score, 0.85)
+        reasons.append(f"symbol_contains:{query}")
+    if path and q == path:
+        score = max(score, 1.0)
+        reasons.append(f"exact_path:{query}")
+    elif path and q in path:
+        score = max(score, 0.8)
+        reasons.append(f"path_contains:{query}")
+    if q in section_name:
+        score = max(score, 0.6)
+        reasons.append(f"section_contains:{query}")
+    overlap = len(tokens & set(item.get("text", "").lower().split()))
+    if overlap:
+        score = max(score, min(0.4 + 0.1 * overlap, 0.9))
+        reasons.append(f"token_overlap:{overlap}")
+    return round(score, 4), ";".join(reasons)
+
+
+_MAX_RESULTS_CAP = 50
+_MAX_CHARS_CAP = 50000
+_MAX_RESULT_CHARS_CAP = 8000
+
+
+def _build_result_entry(item: dict[str, Any], score: float, reason: str,
+                        limit: int) -> Optional[dict[str, Any]]:
+    """Build one result whose complete serialised form is <= ``limit``.
+
+    Mandatory provenance fields are always present. Oversized content becomes a
+    JSON-string preview including the marker; if the mandatory metadata alone
+    cannot fit, the entry is omitted (``None``).
+    """
+    def make(content: Any, truncated: bool) -> dict[str, Any]:
+        return {"section": item["section"], "path": item["path"],
+                "content": content, "evidence_ids": list(item["evidence_ids"]),
+                "epistemic_status": item["status"], "match_reason": reason,
+                "relevance_score": score, "truncated": truncated}
+
+    entry = make(item["content"], False)
+    if len(_dump(entry)) <= limit:
+        return entry
+    rendered = _dump(item["content"])
+    marker = " ... [truncated]"
+    lo, hi, best = 0, len(rendered), None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        cand = make(rendered[:mid] + marker, True)
+        if len(_dump(cand)) <= limit:
+            best = cand
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def _shrink_envelope(base: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    """Shrink response metadata so the empty-result envelope fits ``max_chars``."""
+    if len(_dump(base)) <= max_chars:
+        return base
+    for key in ("task_context", "query"):
+        s = base.get(key)
+        if isinstance(s, str) and s:
+            over = len(_dump(base)) - max_chars
+            base[key] = s[:max(0, len(s) - over - 16)]
+    for key in ("task_context", "sections_searched"):
+        if len(_dump(base)) <= max_chars:
+            return base
+        base.pop(key, None)
+    if len(_dump(base)) <= max_chars:
+        return base
+    base.pop("query", None)
+    if len(_dump(base)) <= max_chars:
+        return base
+    fallback = {"error": "budget_too_small", "truncated": True, "results": [],
+                "max_results": base.get("max_results"),
+                "max_chars": base.get("max_chars"),
+                "max_chars_per_result": base.get("max_chars_per_result"),
+                "retrieval": "lexical", "model": None}
+    if len(_dump(fallback)) <= max_chars:
+        return fallback
+    return {"error": "budget_too_small", "truncated": True, "results": []}
+
+
+def retrieve_context(state: ProjectState,
+                     query: str,
+                     task_context: str = "",
+                     sections: Optional[list[str]] = None,
+                     file_paths: Optional[list[str]] = None,
+                     symbols: Optional[list[str]] = None,
+                     evidence_ids: Optional[list[str]] = None,
+                     max_results: int = _UNSET,
+                     max_chars: int = _UNSET,
+                     max_chars_per_result: int = _UNSET,
+                     epistemic_filter: Optional[list[str]] = None) -> dict[str, Any]:
+    """Retrieve bounded, ranked, evidence-linked dossier context.
+
+    Deterministic lexical retrieval (exact/prefix/overlap) — no embeddings, no
+    model, no network. The dossier is read from disk; the repository is **not**
+    re-scanned, and freshness is reported as last-recorded (never live).
+
+    ``max_chars`` bounds the **complete** ``json.dumps(response, ensure_ascii=
+    False)`` string; ``max_chars_per_result`` bounds each complete result entry.
+    """
+    max_results = _limit("max_results", max_results, 10, 1, _MAX_RESULTS_CAP)
+    max_chars = _limit("max_chars", max_chars, 8000, 200, _MAX_CHARS_CAP)
+    max_chars_per_result = _limit("max_chars_per_result", max_chars_per_result,
+                                  2000, 100, _MAX_RESULT_CHARS_CAP)
+    query = str(query or "")
+    tokens = {t for t in query.lower().split() if t}
+
+    dossier = load_dossier(state)
+    fresh = _known_freshness(state, dossier_missing=dossier is None)
+    base: dict[str, Any] = {
+        "results": [], "total_count": 0, "truncated": False,
+        "evidence_ids": [], "query": query,
+        "task_context": str(task_context or ""),
+        "sections_searched": [], "freshness": fresh,
+        "max_results": max_results, "max_chars": max_chars,
+        "max_chars_per_result": max_chars_per_result,
+        "retrieval": "lexical", "model": None,
+    }
+    if dossier is None:
+        base["error"] = "no project understanding dossier"
+        return _shrink_envelope(base, max_chars)
+
+    items = _iter_searchable(dossier, _evidence_index(dossier))
+    if sections:
+        items = [i for i in items
+                 if any(i["section"] == s or i["section"].startswith(s + ".")
+                        or i["section"].startswith(s) for s in sections)]
+    if file_paths:
+        prefixes = tuple(file_paths)
+        items = [i for i in items
+                 if i.get("file", "").startswith(prefixes)
+                 or i.get("path", "").startswith(prefixes)]
+    if symbols:
+        wanted = {s.lower() for s in symbols}
+        items = [i for i in items if i.get("name", "").lower() in wanted]
+    if evidence_ids:
+        wanted_ids = set(evidence_ids)
+        items = [i for i in items if wanted_ids & set(i.get("evidence_ids", []))]
+
+    scored: list[tuple[float, dict[str, Any], str]] = []
+    for item in items:
+        if epistemic_filter is not None and item["status"] not in epistemic_filter:
+            continue
+        score, reason = _score_item(item, query, tokens)
+        if score <= 0:
+            continue
+        scored.append((score, item, reason))
+
+    scored.sort(key=lambda row: (-row[0], row[1]["section"], row[1]["path"]))
+    total_count = len(scored)
+
+    base["total_count"] = total_count
+    base["sections_searched"] = sorted({i["section"] for _, i, _ in scored})[:50]
+    base = _shrink_envelope(base, max_chars)
+    if base.get("error") == "budget_too_small":
+        return base
+
+    def _union_ids(entries: list[dict[str, Any]]) -> list[str]:
+        union: list[str] = []
+        for entry in entries:
+            for eid in entry["evidence_ids"]:
+                if eid not in union:
+                    union.append(eid)
+        return union
+
+    results: list[dict[str, Any]] = []
+    truncated = False
+    for score, item, reason in scored:
+        if len(results) >= max_results:
+            truncated = True
+            break
+        entry = _build_result_entry(item, score, reason, max_chars_per_result)
+        if entry is None:
+            truncated = True
+            continue
+        prospective = results + [entry]
+        trial = dict(base)
+        trial["results"] = prospective
+        trial["truncated"] = truncated
+        trial["evidence_ids"] = _union_ids(prospective)
+        if len(_dump(trial)) > max_chars:
+            truncated = True
+            break
+        results.append(entry)
+
+    base["results"] = results
+    base["truncated"] = truncated
+    base["evidence_ids"] = _union_ids(results)
+    # Final strict guarantee: drop trailing results until the whole response fits.
+    while base["results"] and len(_dump(base)) > max_chars:
+        base["results"].pop()
+        base["truncated"] = True
+        base["evidence_ids"] = _union_ids(base["results"])
+    if len(_dump(base)) > max_chars:  # pragma: no cover - envelope guard
+        base = _shrink_envelope(base, max_chars)
+    return base

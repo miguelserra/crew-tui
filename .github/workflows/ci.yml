@@ -51,6 +51,8 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p72b_*.py"
       - name: P7.2c discovery/understanding tests
         run: python -m unittest discover -s tests -p "test_p72c_*.py"
+      - name: P7.2c.2 retrieval tests
+        run: python -m unittest discover -s tests -p "test_p72c2_*.py"
       - name: P7.2b.2 reliability hardening tests
         run: python -m unittest discover -s tests -p "test_p72b2_*.py"
       - name: P7.2b.3 budget integrity / visual migration tests
@@ -90,6 +92,8 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p72b_*.py"
       - name: P7.2c discovery/understanding tests
         run: python -m unittest discover -s tests -p "test_p72c_*.py"
+      - name: P7.2c.2 retrieval tests
+        run: python -m unittest discover -s tests -p "test_p72c2_*.py"
       - name: P7.2b.2 reliability hardening tests
         run: python -m unittest discover -s tests -p "test_p72b2_*.py"
       - name: P7.2b.3 budget integrity / visual migration tests
@@ -133,6 +137,8 @@ jobs:
         run: python -m unittest discover -s tests -p "test_p72b_*.py"
       - name: P7.2c discovery/understanding tests
         run: python -m unittest discover -s tests -p "test_p72c_*.py"
+      - name: P7.2c.2 retrieval tests
+        run: python -m unittest discover -s tests -p "test_p72c2_*.py"
       - name: P7.2b.2 reliability hardening tests
         run: python -m unittest discover -s tests -p "test_p72b2_*.py"
       - name: P7.2b.3 budget integrity / visual migration tests

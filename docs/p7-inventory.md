@@ -121,3 +121,31 @@ Baseline: `p6.1-gate` (`86f2df1`).
   tests (7 pre-existing + 13 P7.2c.1 core + 7 P7.2c.1.1 F-1 classification).
 - P7.2c.2+ (dossier/agent integration refinements) remain future work unless
   already present; no new milestone started here.
+
+## P7.2c.2 agent understanding / context retrieval
+
+- Added a bounded, deterministic, **lexical** retrieval layer over the existing
+  `p7-2c/2` dossier (no embeddings, no vector store, no model, no network):
+  `retrieve_context`, `get_project_summary`, `get_evidence`, `get_file_context`,
+  `get_symbol_context`, `get_component_context`, plus dotted-path `section()`
+  and an extended (backward-compatible) `summary_for_agent()`.
+- Results preserve evidence IDs and epistemic classification
+  (OBSERVED/INFERRED/UNKNOWN/CONFLICTING); `epistemic_filter` is supported.
+- Bounds are **strict** (P7.2c.2.1): `max_chars` bounds the complete
+  `json.dumps(response, ensure_ascii=False)` including metadata/escaping/markers;
+  `max_chars_per_result` bounds each result entry; a minimum-envelope overflow
+  returns a documented `budget_too_small` error within budget. Limit types are
+  validated (`TypeError` for non-int/bool/None), out-of-range ints clamp.
+- Freshness is **last-recorded provenance** (P7.2c.2.1): retrieval returns
+  `source="last_recorded"`, `live=false`, `generated_at`, `checked_at`; it never
+  re-scans the repository and never refreshes the dossier. Missing/invalid
+  dossier or missing/malformed metadata yields `UNKNOWN`, never `FRESH`; `STALE`
+  is preserved. Generation records an initial assessment honouring hash coverage.
+- `summary_for_agent()` restores the legacy risks-by-default behaviour
+  (`include_risks=False` opts out).
+- `WorkflowEngine` gained additive delegation methods; routing, RouteChain,
+  CallLedger, PAYG billing and adapter selection are unchanged.
+- Deferred: agent tool/function-calling for mid-generation retrieval (no such
+  interface exists); semantic search; per-section live freshness; P7.2c.3+.
+- See `docs/p7-2c2-design.md` and `docs/p7-2c2-audit.md` (the latter is a
+  historical Phase-0 snapshot). `tests/test_p72c2_retrieval.py` adds 51 tests.
