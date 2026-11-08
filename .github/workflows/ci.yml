@@ -54,7 +54,7 @@ jobs:
       - name: P7.2c.2 retrieval tests
         run: python -m unittest discover -s tests -p "test_p72c2_*.py"
       - name: P7.2c.3 critical core tests
-        run: python -m unittest discover -s tests -p "test_p72c3_*.py"
+        run: python -m unittest discover -s tests -p "test_p72c3_core.py"
       - name: P7.2b.2 reliability hardening tests
         run: python -m unittest discover -s tests -p "test_p72b2_*.py"
       - name: P7.2b.3 budget integrity / visual migration tests
@@ -144,7 +144,7 @@ jobs:
       - name: P7.2c.2 retrieval tests
         run: python -m unittest discover -s tests -p "test_p72c2_*.py"
       - name: P7.2c.3 critical core tests
-        run: python -m unittest discover -s tests -p "test_p72c3_*.py"
+        run: python -m unittest discover -s tests -p "test_p72c3_core.py"
       - name: P7.2b.2 reliability hardening tests
         run: python -m unittest discover -s tests -p "test_p72b2_*.py"
       - name: P7.2b.3 budget integrity / visual migration tests
