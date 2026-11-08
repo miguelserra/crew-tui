@@ -39,7 +39,7 @@ Baseline: `p6.1-gate` (`86f2df1`).
 | `integration.py` | runtime/integration | P7.1c extraction |
 | `visual.py` | multimodal | P7.1c extraction |
 | `signoff.py` | final sign-off | P7.1c extraction |
-| `native_adapter.py` | native composition | P7.1d extraction; not default |
+| `native_adapter.py` | native composition | P7.1d extraction; default for new projects |
 | differential cassette | normal, FAIL→FIX, UNVERIFIED, visual retry, fallback, Playwright, resume, publish parity/conflict, D09 integration/sign-off | D09 success/failure, fixer revalidation, approval/rejection and gate bypass green; PAYG ledger/recovery and publisher crash-recovery covered; idempotency header pending |
 | differential report | generated matrix + uncovered items | `docs/p7-differential-report.md` |
 | publisher recovery | fault injection at each journal/apply/rollback boundary + real os._exit subprocess | rollback-only; COMMITTED/ROLLED_BACK/RECOVERY_REQUIRED; never false COMMITTED; orphans detected/cleaned explicitly |
@@ -146,6 +146,50 @@ Baseline: `p6.1-gate` (`86f2df1`).
 - `WorkflowEngine` gained additive delegation methods; routing, RouteChain,
   CallLedger, PAYG billing and adapter selection are unchanged.
 - Deferred: agent tool/function-calling for mid-generation retrieval (no such
-  interface exists); semantic search; per-section live freshness; P7.2c.3+.
+  interface exists); semantic search; per-section live freshness. Retrieval
+  contract: empty query returns no matches even with `symbols`; nonempty
+  `symbols` is an exact case-insensitive name filter, while `task_context` is
+  echoed but does not affect ranking. See `docs/p7-2c2-design.md`.
 - See `docs/p7-2c2-design.md` and `docs/p7-2c2-audit.md` (the latter is a
-  historical Phase-0 snapshot). `tests/test_p72c2_retrieval.py` adds 51 tests.
+  historical Phase-0 snapshot). `tests/test_p72c2_retrieval.py` has 55 tests,
+  including process-reload persistence coverage for freshness provenance.
+
+
+## P7.2c.3 deterministic workflow context (Stage B)
+
+- Opt-in `workflow_context` core from Stage A is now wired into generation:
+  native `ArchitectureService.design` / `ExecutorService._build_task` and Factory
+  `step_architect` / `_build_one`, through `WorkflowEngine.apply_pool` attachment.
+- Explicit human consent is persisted with `ContextActivation`; CLI
+  `--context-consent` (model id or full identity key) plus `--context-phases`
+  (default ARCHITECTURE,BUILD). `--yes`, `--allow-paid` and existing approvals
+  never imply disclosure consent. Activation is disabled by default.
+- Disclosure is limited to provider identities in the allowlist for the whole
+  candidate chain; otherwise the exact unchanged base prompt is used and the
+  omission (`disclosure_denied`) is recorded in the snapshot.
+- Enabled prompt blocks are bounded, structured, evidence-linked and labelled as
+  historical untrusted data. Existing direct workspace reads remain authoritative.
+- BUILD installs generated text idempotently and refuses to overwrite
+  human/other-writer edits (`workspace.apply_generated_text`). Application and
+  the `APPLIED` marker are persisted before the managed call is consumed.
+- Managed BUILD with a definitive verification failure now runs the existing
+  automatic FIX + re-verification (NEW-01). The confirmed BUILD result is
+  recovered locally and never re-submitted to a provider; only the accepted
+  final artifact is applied/consumed. Exhausted FIX, ambiguous provider
+  outcomes, filesystem conflicts and other transactional uncertainty remain
+  fail-closed/recoverable. Disabled mode keeps the legacy flow unchanged.
+- Tests: `tests/test_p72c3_core.py` (35), `tests/test_p72c3_integration.py` (20),
+  plus `tests/context_crash_worker.py` real-process boundaries. CI runs
+  `test_p72c3_*.py` on Linux, Integration Linux/Windows and Windows.
+- Limitations: lexical retrieval, conservative byte-based context budget (not a
+  tokenizer), last-recorded freshness, no dynamic tool calling, and no generic
+  atomic transaction across multiple workspace files plus ProjectState.
+- Release hardening: NEW-02 documents the intentionally different tiny-budget
+  payload priorities of component and project-summary APIs; NEW-03 documents
+  symbol-filter semantics; NEW-04 verifies freshness status/provenance across a
+  fresh Python process; NEW-05 verifies `task_context` is metadata only, not a
+  ranking input.
+- Latest release-hardening Linux regression: 647 tests, 0 failures/errors,
+  12 skipped (the Windows-only `test_power_win.py` module remains excluded).
+  Hosted CI for these uncommitted changes is NOT_VERIFIED until an authorized
+  push.

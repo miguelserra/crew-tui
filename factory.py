@@ -44,6 +44,9 @@ from state import (StateCorruptError, artifact_hash, validate_dependencies,
                    TaskAttempt, VerificationRecord, new_id,
                    visual_artifact_hash)
 from power import make_power
+from calls import CallOutcomeUnknown
+from workspace import apply_generated_text
+from workflow_context import ContextRecoveryRequired
 
 ROLES = ("ANALYST", "SCAFFOLD", "ARCHITECT", "DEV", "TEST", "INTEG", "VISUAL", "SIGN")
 
@@ -206,6 +209,9 @@ class Factory:
         self.power = make_power(settings, pool, emit,
                                 on_pause=self._pause_marker,
                                 on_resume=self._power_resume)
+        self.context_engine = None
+        self.managed_apply_arch = None
+        self.managed_apply_build = None
 
     # -- persistence -------------------------------------------------------- #
 
@@ -477,6 +483,69 @@ STRICT JSON:
         self.emit("SCAFFOLD", f"{len(created)} ficheiro(s) de base criados")
         return True
 
+    # -- managed context generation ----------------------------------------- #
+
+    def _context_core(self):
+        engine = getattr(self, "context_engine", None)
+        state = getattr(engine, "state", None)
+        if engine is None or state is None or not getattr(state, "project_root", ""):
+            return None
+        return engine.context_core()
+
+    @staticmethod
+    def _arch_query(state: "FactoryState") -> str:
+        req = state.requirements or {}
+        parts = [req.get("objective") or ""]
+        for key in ("scope_in", "constraints", "non_negotiables", "acceptance"):
+            value = req.get(key) or []
+            if isinstance(value, list):
+                parts.extend(str(v.get("text") if isinstance(v, dict) else v)
+                             for v in value)
+        return " ".join(p.strip() for p in parts if p and p.strip()) or state.goal or "architecture"
+
+    @staticmethod
+    def _build_query(state: "FactoryState", task: "TaskState") -> str:
+        arch = state.architecture or {}
+        parts = [task.title, task.description, task.target_file, *task.acceptance]
+        parts += [str(i.get("name") or "") for i in arch.get("interfaces", [])
+                  if i.get("file") == task.target_file]
+        return " ".join(str(p).strip() for p in parts if p and str(p).strip()) or task.target_file
+
+    def _generate(self, role: str, system: str, user: str, tag: str, phase: str,
+                  query: str, sections: tuple[str, ...], *, task_id: str = "",
+                  complexity: str = "auto", target_file: str = ""):
+        core = self._context_core()
+        if core is None:
+            return self._ask(role, system, user, tag, task_id, complexity), None
+        self.power.before_step(tag)
+        self.pool.refresh_peak()
+        llm, _tag = self._llm(role, task_id=task_id, complexity=complexity)
+        if llm is None:
+            raise RuntimeError(f"sem modelo para o papel '{role}'")
+        messages = [SystemMessage(system), HumanMessage(user)]
+        route = getattr(llm, "result", None)
+        if core is not None and route is not None:
+            run = self.run_id or getattr(self.state, "run_id", "") or "run"
+            logical_id = (f"{phase.lower()}-{run}" +
+                          (f"-{task_id}" if task_id else ""))
+            snapshot = core.prepare(logical_id, phase, route, messages,
+                                    target_file=target_file, query=query,
+                                    sections=sections)
+            if snapshot is not None:
+                def factory(role_name: str, content: str):
+                    return SystemMessage(content) if role_name == "system" else HumanMessage(content)
+                restored = snapshot.render_messages(factory)
+                try:
+                    result = core.invoke(self.pool, route, logical_id, restored)
+                except CallOutcomeUnknown as exc:
+                    setattr(exc, "managed_context", True)
+                    raise
+                return result.text, (core, logical_id)
+        meta = {"run": self.run_id or None, "tag": tag}
+        if task_id:
+            meta["task"] = task_id
+        return self.pool.complete(llm, messages, meta=meta), None
+
     # -- step 3: architect -------------------------------------------------- #
 
     def step_architect(self) -> bool:
@@ -510,8 +579,20 @@ Rules:
 - Every task must list requirement_ids referencing the acceptance_criteria ids
   above; do not leave a criterion unmapped."""
         try:
-            raw = self._ask("chief", ARCHITECT_SYSTEM, prompt, "ARCHITECT")
+            raw, handle = self._generate(
+                "chief", ARCHITECT_SYSTEM, prompt, "ARCHITECT", "ARCHITECTURE",
+                self._arch_query(self.state),
+                ("structure", "dependencies", "components", "entry_points",
+                 "persistence", "external_interfaces"))
             data = _json_or_raise(raw, "architecture")
+        except ContextRecoveryRequired:
+            raise
+        except CallOutcomeUnknown as exc:
+            if getattr(exc, "managed_context", False):
+                raise
+            self.log("architect", f"ERRO: {exc}")
+            self.emit("SYSTEM", f"architect falhou: {exc}")
+            return False
         except Exception as e:
             self.log("architect", f"ERRO: {e}")
             self.emit("SYSTEM", f"architect falhou: {e}")
@@ -540,8 +621,15 @@ Rules:
             self.emit("SYSTEM", "architect não devolveu tarefas válidas")
             self.log("architect", json.dumps(data, ensure_ascii=False))
             return False
-        self.state.architecture = data
-        self.state.tasks = tasks
+        if handle is not None:
+            if self.managed_apply_arch is None:
+                raise ContextRecoveryRequired("FactoryAdapter did not provide managed apply")
+            core, logical_id = handle
+            core.commit(logical_id, lambda state, result:
+                        self.managed_apply_arch(state, data, tasks))
+        else:
+            self.state.architecture = data
+            self.state.tasks = tasks
         self.log("architect", json.dumps(data, ensure_ascii=False, indent=2))
         self.emit("ARCHITECT", f"{len(tasks)} tarefa(s): "
                                + ", ".join(f"{t.id}:{Path(t.target_file).name}/{t.role}" for t in tasks))
@@ -614,14 +702,28 @@ Output the COMPLETE file content in ONE fenced block tagged ```{fence or 'text'}
 No prose, no placeholders, no elided sections.
 {f"CURRENT CONTENT (keep everything that works, fix what the task asks):{chr(10)}```{fence}{chr(10)}{existing[:12000]}{chr(10)}```" if existing else ""}"""
         try:
-            raw = self._ask(task.role, DEV_SYSTEM if task.role == "senior" else JUNIOR_SYSTEM,
-                            prompt, "DEV", task.id, task.complexity)
+            raw, handle = self._generate(
+                task.role, DEV_SYSTEM if task.role == "senior" else JUNIOR_SYSTEM,
+                prompt, "DEV", "BUILD", self._build_query(self.state, task),
+                ("structure", "dependencies", "components"), task_id=task.id,
+                complexity=task.complexity, target_file=task.target_file)
+        except ContextRecoveryRequired:
+            raise
+        except CallOutcomeUnknown as exc:
+            if getattr(exc, "managed_context", False):
+                raise
+            task.errors.append(f"gerar: {exc}")
+            self.log("build", f"{task.id} ERRO ao gerar: {exc}")
+            return False
         except Exception as e:
             task.errors.append(f"gerar: {e}")
             self.log("build", f"{task.id} ERRO ao gerar: {e}")
             return False
         code = _one_block(raw, fence)
         if not code.strip():
+            if handle is not None:
+                raise ContextRecoveryRequired(
+                    f"{task.id}: managed BUILD output has no code block; retained")
             task.errors.append("resposta sem bloco de código")
             return False
         cand = self.dir / "candidates" / f"{task.id}_{Path(task.target_file).name}"
@@ -684,7 +786,20 @@ No prose, no placeholders, no elided sections.
             task.verification = record.to_dict()
             self.save()
             if decision.deliver:
-                self._install(task, cand, code)
+                if handle is not None:
+                    if self.managed_apply_build is None:
+                        raise ContextRecoveryRequired(
+                            "FactoryAdapter did not provide managed BUILD apply")
+                    core, logical_id = handle
+                    producer = self.pool.last_attempt_model.get(task.id)
+                    served = (producer.to_dict() if producer is not None
+                              else result.served)
+                    core.commit(logical_id, lambda state, result:
+                                self.managed_apply_build(
+                                    state, task.id, task.target_file, code, record,
+                                    served))
+                else:
+                    self._install(task, cand, code)
                 self.log("build", f"{task.id} entregue em {task.target_file} "
                                   f"(verdict {decision.verdict})")
                 if decision.verdict == verify_policy.UNVERIFIED:
@@ -736,6 +851,8 @@ ERROR OUTPUT (attempt {n}/{attempts}):
 Output the COMPLETE corrected file in ONE fenced block."""
             try:
                 raw = self._ask(role, system, prompt, "DEV", task.id, task.complexity)
+            except CallOutcomeUnknown:
+                raise
             except Exception as e:
                 self.log("fix", f"{task.id} tentativa {n}: modelo falhou: {e}")
                 continue

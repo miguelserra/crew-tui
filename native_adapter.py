@@ -81,6 +81,11 @@ class NativeAdapter:
                                     artifact_dir=self.artifact_dir)
         self.signoff = SignoffService(settings, pool, emit, project.run_id or "")
 
+    def attach_context(self, engine: Any) -> None:
+        """Provide the engine-owned context core to generation services only."""
+        self.architecture.context_engine = engine
+        self.executor.context_engine = engine
+
     def prepare(self, goal: str, feedback: str = "") -> dict[str, Any]:
         return self.requirements.prepare(self.project, feedback)
 

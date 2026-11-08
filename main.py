@@ -4685,6 +4685,39 @@ def _adopt_cli(args: Any) -> int:
     return 0
 
 
+def _activate_context_from_args(args: Any, engine: Any, pool: Any,
+                                state: ProjectState) -> None:
+    """Explicit, persisted disclosure consent. Never implied by other flags."""
+    raw = getattr(args, "context_consent", None) or []
+    tokens = [t.strip() for item in raw for t in str(item).split(",") if t.strip()]
+    if not tokens:
+        return
+    from workflow_context import ContextActivation
+    phases = tuple(p.strip().upper() for p in
+                   str(getattr(args, "context_phases", "") or "").split(",") if p.strip())
+    if not phases or not set(phases) <= {"ARCHITECTURE", "BUILD"}:
+        raise EngineError("--context-phases inválido (ARCHITECTURE,BUILD)")
+    identities = list(pool.registry.models.values())
+    providers: list[str] = []
+    for token in tokens:
+        if "|" in token:
+            providers.append(token)
+            continue
+        matches = [i for i in identities if i.model_id == token]
+        if len(matches) != 1:
+            raise EngineError(
+                f"--context-consent: {token!r} é ambíguo/desconhecido; "
+                "usa provider|endpoint|credential_profile|model_id")
+        providers.append(identity_key(matches[0]))
+    activation = ContextActivation(
+        run_id=state.run_id, phases=phases, providers=tuple(dict.fromkeys(providers)),
+        actor="human:cli", phase_tokens={"ARCHITECTURE": 4096, "BUILD": 2048},
+        max_chars=16000, safety_ratio=0.15)
+    engine.context_core().activate(activation)
+    print(f"[CONTEXT] disclosure consent recorded: phases={list(phases)} "
+          f"providers={len(activation.providers)}; full prompts stored under "
+          f".crew/runs/{state.run_id}/context_snapshots", flush=True)
+
 def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
                     state: Any = None, persistence: str = "crew") -> int:
     """Run the unified/legacy engine with canonical .crew persistence."""
@@ -4768,6 +4801,7 @@ def _engine_cli_run(args: Any, kind: str, settings: Any, store: StateManager,
                                             or settings.allow_unknown),
                          persistence=persistence)
     eng.apply_pool(pool)
+    _activate_context_from_args(args, eng, pool, state)
     eng.save()
     if brief_data is not None and not brief_flow.has_brief(state):
         eng.start_brief(brief_data)
@@ -5037,6 +5071,12 @@ def main() -> None:
                         help="autoriza billing desconhecido (nunca por omissão)")
     parser.add_argument("--allow-unverified", action="store_true",
                         help="entrega explicitamente artefacts UNVERIFIED")
+    parser.add_argument("--context-consent", metavar="MODEL_OR_IDENTITY", action="append",
+                        help="explicit human consent to disclose bounded structured dossier "
+                             "context to the named model identities (comma-separated; "
+                             "not implied by --yes/--allow-paid)")
+    parser.add_argument("--context-phases", default="ARCHITECTURE,BUILD",
+                        help="phases authorised for dossier context (default: ARCHITECTURE,BUILD)")
     parser.add_argument("--profile", metavar="PROFILE",
                         help="workflow: auto|web|library|script|review")
     parser.add_argument("--engine", choices=["native", "factory"],

@@ -128,6 +128,7 @@ class CallRecord:
     credential_profile: str = ""
     idempotency_key: str = ""
     request_sha256: str = ""
+    context_snapshot_id: str = ""
     created: str = ""
     updated: str = ""
     served: dict[str, Any] = field(default_factory=dict)
@@ -160,6 +161,7 @@ class CallRecord:
             credential_profile=str(data.get("credential_profile") or ""),
             idempotency_key=str(data.get("idempotency_key") or ""),
             request_sha256=str(data.get("request_sha256") or ""),
+            context_snapshot_id=str(data.get("context_snapshot_id") or ""),
             created=str(data.get("created") or ""),
             updated=str(data.get("updated") or ""),
             served=dict(data.get("served") or {}),
@@ -257,7 +259,7 @@ class CallLedger:
 
     def intent(self, *, run_id: str, role: str, ref: Any,
                task: str = "", tag: str = "",
-               request_sha256: str = "") -> CallRecord:
+               request_sha256: str = "", context_snapshot_id: str = "") -> CallRecord:
         with self._lock:
             now = utc_now()
             rec = CallRecord(
@@ -275,6 +277,7 @@ class CallLedger:
                 credential_profile=str(getattr(ref, "credential_profile", "") or ""),
                 idempotency_key="crew-" + uuid.uuid4().hex,
                 request_sha256=str(request_sha256 or ""),
+                context_snapshot_id=context_snapshot_id,
                 created=now,
                 updated=now,
             )
@@ -392,13 +395,14 @@ class CallLedger:
     # -- queries ------------------------------------------------------------ #
 
     def find_replay(self, run_id: str, task: str, tag: str,
-                    request_sha256: str) -> Optional[CallRecord]:
+                    request_sha256: str, context_snapshot_id: str = "") -> Optional[CallRecord]:
         with self._lock:
             for rec in self._records.values():
                 if (rec.state == CONFIRMED and not rec.consumed
                         and rec.run_id == str(run_id or "")
                         and rec.task == str(task or "")
                         and rec.tag == str(tag or "")
+                        and rec.context_snapshot_id == context_snapshot_id
                         and rec.request_sha256 == str(request_sha256 or "")):
                     if self.result_text(rec.call_id) is not None:
                         return rec

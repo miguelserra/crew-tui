@@ -44,8 +44,8 @@ from state import (
 from store import ResumeTarget, StateManager, atomic_write_json
 from profiles import resolve_profile, phases_for
 from publish import PublishConflict, PublishError, PublishManager
-from workspace import (IgnoreRules, default_workspace, prepare_workspace,
-                       validate_workspace_integrity)
+from workspace import (IgnoreRules, apply_generated_text, default_workspace,
+                       prepare_workspace, validate_workspace_integrity)
 from scaffold import scaffold
 
 ENGINE_VERSION = "1.0"
@@ -153,6 +153,9 @@ class WorkflowEngine:
             self._seen_call_ids.update(self._call_ids_from_state())
             if getattr(pool, "router", None) is not None:
                 pool.router.call_ledger = self.call_ledger
+            attach = getattr(self.adapter, "attach_context", None)
+            if attach is not None:
+                attach(self)
         except CallLedgerError as exc:
             raise EngineError(f"ledger de chamadas inválido: {exc}") from exc
 
@@ -182,9 +185,24 @@ class WorkflowEngine:
     def _already_persisted(self, attempt: TaskAttempt) -> bool:
         if attempt.call_id and attempt.call_id in self._seen_call_ids:
             if self.call_ledger is not None:
-                self.call_ledger.mark_consumed(attempt.call_id)
+                self._consume_legacy_call(attempt.call_id)
             return True
         return False
+
+    def _consume_legacy_call(self, call_id: str) -> None:
+        """Managed calls stay replayable until their application is committed."""
+        if self.call_ledger is not None:
+            record = self.call_ledger.get(call_id)
+            if record is not None and record.context_snapshot_id:
+                return
+            self.call_ledger.mark_consumed(call_id)
+
+    def context_core(self):
+        """Lazy critical core; callers explicitly prepare/invoke/commit requests."""
+        from workflow_context import WorkflowContext
+        if not hasattr(self, "_context_core"):
+            self._context_core = WorkflowContext(self)
+        return self._context_core
 
     def on_attempt(self, event: AttemptEvent) -> None:
         attempt: TaskAttempt = event.attempt
@@ -196,7 +214,7 @@ class WorkflowEngine:
                 self._seen_call_ids.add(attempt.call_id)
             self.save()
             if attempt.call_id and self.call_ledger is not None:
-                self.call_ledger.mark_consumed(attempt.call_id)
+                self._consume_legacy_call(attempt.call_id)
             return
         task = next((t for t in self.state.tasks if t.id == event.task), None)
         if task is None:
@@ -211,7 +229,7 @@ class WorkflowEngine:
             self._seen_call_ids.add(attempt.call_id)
         self.save()
         if attempt.call_id and self.call_ledger is not None:
-            self.call_ledger.mark_consumed(attempt.call_id)
+            self._consume_legacy_call(attempt.call_id)
 
     def mark_delivered(self, task_id: str) -> None:
         task = next((t for t in self.state.tasks if t.id == task_id), None)
@@ -228,6 +246,7 @@ class WorkflowEngine:
         self.state.updated = utc_now()
         if self.persistence == "factory" and self.state.project_root:
             self.store.save_factory_from_project(self.state.project_root, self.state)
+            self._context_state_saved()
             return
         if self.state.project_root:
             final = self.store.project_state_path(self.state.project_root)
@@ -238,6 +257,12 @@ class WorkflowEngine:
                 self.store.save_project(self.state)
         else:
             self.store.save_staging(self.state)
+        self._context_state_saved()
+
+    def _context_state_saved(self) -> None:
+        core = getattr(self, "_context_core", None)
+        if core is not None:
+            core._revision = core._disk_revision()
 
     def next_phase(self, phase: str) -> str:
         if self.state.engine_kind != ENGINE_UNIFIED:
@@ -782,6 +807,36 @@ class FactoryAdapter:
         if self.factory.run_id:
             self.factory.state.run_id = self.factory.run_id
         self.pool.attempt_sink = self._on_attempt_from_pool
+
+    # -- managed context application ---------------------------------------- #
+
+    def attach_context(self, engine: "WorkflowEngine") -> None:
+        """Let the Factory use the engine core while keeping both state views."""
+        self.factory.context_engine = engine
+        self.factory.managed_apply_arch = self._managed_apply_arch
+        self.factory.managed_apply_build = self._managed_apply_build
+
+    def _managed_apply_arch(self, state: ProjectState, data: dict[str, Any],
+                            tasks: list[Any]) -> None:
+        self.factory.state.architecture = data
+        self.factory.state.tasks = tasks
+        self.sync_to_project()
+
+    def _managed_apply_build(self, state: ProjectState, task_id: str,
+                             target_file: str, code: str, record: Any,
+                             served: dict[str, Any]) -> None:
+        try:
+            apply_generated_text(self.workspace_root, target_file, code,
+                                 state.extensions.get("workspace_origin") or {})
+        except ValueError as exc:
+            from workflow_context import ContextRecoveryRequired
+            raise ContextRecoveryRequired(str(exc)) from exc
+        task = next((ts for ts in self.factory.state.tasks if ts.id == task_id), None)
+        if task is not None:
+            task.status = "done"
+            task.verification = record.to_dict()
+            task.delivered_by = ModelRef.from_dict(served).to_dict()
+        self.sync_to_project()
 
     # -- conversion --------------------------------------------------------- #
 

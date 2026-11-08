@@ -10,6 +10,9 @@ import verify as verify_policy
 from state import ProjectState, Task, VerificationRecord, artifact_hash
 from state import normalize_target_file, validate_dependencies
 from registry import ModelRef
+from calls import CallOutcomeUnknown
+from workspace import apply_generated_text
+from workflow_context import ContextRecoveryRequired
 
 DEV_SYSTEM = (
     "You are a senior software engineer. You write production-quality code for exactly one "
@@ -63,6 +66,7 @@ class ExecutorService:
         self.verifier = verifier
         self.emit = emit
         self.run_id = run_id
+        self.context_engine = None
 
     def build(self, project: ProjectState, workspace_root: str | Path) -> bool:
         validate_dependencies(project.tasks)
@@ -96,6 +100,20 @@ class ExecutorService:
         return all(t.status in ("done", "verified")
                    for t in project.tasks if t.kind == "build")
 
+    def _core(self):
+        engine = getattr(self, "context_engine", None)
+        state = getattr(engine, "state", None)
+        if engine is None or state is None or not getattr(state, "project_root", ""):
+            return None
+        return engine.context_core()
+
+    @staticmethod
+    def _build_query(project: ProjectState, task: Task) -> str:
+        parts = [task.title, task.description, task.target_file, *task.acceptance]
+        parts += [str(i.get("name") or "") for i in project.architecture.interfaces
+                  if i.get("file") == task.target_file]
+        return " ".join(p.strip() for p in parts if p and p.strip()) or task.target_file
+
     def _build_task(self, project: ProjectState, root: Path, task: Task) -> bool:
         target = _safe(root, task.target_file)
         lang = self._lang(target)
@@ -124,37 +142,97 @@ Deliverable file: {task.target_file}
 Output the COMPLETE file content in ONE fenced block tagged ```{fence or 'text'}.
 No prose, no placeholders, no elided sections.
 {f"CURRENT CONTENT (keep what works):{chr(10)}```{fence}{chr(10)}{existing[:12000]}{chr(10)}```" if existing else ""}"""
+        messages = [
+            self._message("SystemMessage",
+                          JUNIOR_SYSTEM if task.role == "junior" else DEV_SYSTEM),
+            self._message("HumanMessage", prompt),
+        ]
+        handle = None
         try:
             llm, tag = self.pool.team_llm(task, run_id=self.run_id or "")
             if llm is None:
                 task.errors.append("sem modelo")
                 return False
-            raw = self.pool.complete(llm, [
-                self._message("SystemMessage", JUNIOR_SYSTEM if task.role == "junior" else DEV_SYSTEM),
-                self._message("HumanMessage", prompt),
-            ], meta={"run": self.run_id or None, "tag": tag, "task": task.id})
+            route = getattr(llm, "result", None)
+            core = self._core()
+            if core is not None and route is not None:
+                logical_id = f"build-{self.run_id or project.run_id}-{task.id}"
+                snapshot = core.prepare(
+                    logical_id, "BUILD", route, messages,
+                    target_file=task.target_file,
+                    query=self._build_query(project, task),
+                    sections=("structure", "dependencies", "components"))
+                if snapshot is not None:
+                    messages = snapshot.render_messages(self._render_message)
+                    try:
+                        result = core.invoke(self.pool, route, logical_id, messages)
+                    except CallOutcomeUnknown as exc:
+                        setattr(exc, "managed_context", True)
+                        raise
+                    raw = result.text
+                    handle = (core, logical_id, result)
+                else:
+                    raw = self.pool.complete(llm, messages, meta={
+                        "run": self.run_id or None, "tag": tag, "task": task.id})
+            else:
+                raw = self.pool.complete(llm, messages, meta={
+                    "run": self.run_id or None, "tag": tag, "task": task.id})
+        except ContextRecoveryRequired:
+            raise
+        except CallOutcomeUnknown as exc:
+            if getattr(exc, "managed_context", False):
+                raise
+            task.errors.append(str(exc)[:300])
+            return False
         except Exception as exc:
             task.errors.append(str(exc)[:300])
             return False
         code = _one_block(raw, fence)
         if not code.strip():
+            if handle is not None:
+                raise ContextRecoveryRequired(
+                    f"{task.id}: managed BUILD output has no code block; result retained")
             task.errors.append("resposta sem bloco de código")
             return False
-        ok, _feedback, record = self._verify(project, task, code, root, target, lang)
-        if ok:
+        ok, feedback, record = self._verify(project, task, code, root, target, lang)
+
+        def managed_apply(final_code: str, final_record: VerificationRecord):
+            producer = self.pool.last_attempt_model.get(task.id)
+
+            def apply(state: ProjectState, managed) -> None:
+                try:
+                    apply_generated_text(root, task.target_file, final_code,
+                                         state.extensions.get("workspace_origin") or {})
+                except ValueError as exc:
+                    raise ContextRecoveryRequired(str(exc)) from exc
+                state.verifications[task.id] = final_record
+                task.verification = final_record.to_dict()
+                task.status = "done"
+                task.delivered_by = producer or ModelRef.from_dict(managed.served)
+            return apply
+
+        if handle is not None and ok:
+            core, logical_id, _result = handle
+            core.commit(logical_id, managed_apply(code, record))
+            self.emit("DEV", f"{task.id} entregue em {task.target_file}")
+            return True
+        if handle is None and ok:
             self._install(task, target, code)
             project.verifications[task.id] = record
             task.verification = record.to_dict()
             task.status = "done"
             self.emit("DEV", f"{task.id} entregue em {task.target_file}")
             return True
+
+        # Definitive verification failure (managed or legacy): record evidence and
+        # run the existing automatic FIX. A CONFIRMED managed BUILD result is
+        # recovered locally on resume; it is never re-submitted to a provider.
         project.verifications[task.id] = record
         task.verification = record.to_dict()
         if record.verdict == verify_policy.UNVERIFIED:
             task.status = "failed"
             self.emit("SYSTEM", f"{task.id}: UNVERIFIED — não entregue")
             return False
-        # Quality FAIL: one native fix attempt, then re-verify.
         oracle_failed = not record.oracle.get("passed", True)
         if oracle_failed:
             error = record.reason or "oracle falhou"
@@ -170,6 +248,8 @@ No prose, no placeholders, no elided sections.
             task.errors.append(f"critic FAIL: {detail or error}")
         try:
             fixed = self._fix(project, task, code, error, root)
+        except CallOutcomeUnknown:
+            raise
         except Exception as exc:
             task.errors.append(str(exc)[:300])
             return False
@@ -177,7 +257,11 @@ No prose, no placeholders, no elided sections.
             task.status = "failed"
             return False
         new_code, record = fixed
-        self._install(task, target, new_code)
+        if handle is not None:
+            core, logical_id, _result = handle
+            core.commit(logical_id, managed_apply(new_code, record))
+        else:
+            self._install(task, target, new_code)
         project.verifications[task.id] = record
         task.verification = record.to_dict()
         task.status = "done"
@@ -212,6 +296,8 @@ Output the COMPLETE corrected file in ONE fenced block."""
                 self._message("SystemMessage", DEV_SYSTEM),
                 self._message("HumanMessage", prompt),
             ], meta={"run": self.run_id or None, "tag": "DEV", "task": task.id})
+        except CallOutcomeUnknown:
+            raise
         except Exception:
             return None
         new_code = _one_block(raw, fence)
@@ -267,6 +353,11 @@ Output the COMPLETE corrected file in ONE fenced block."""
     def _message(kind: str, text: str) -> Any:
         from langchain_core.messages import HumanMessage, SystemMessage
         return SystemMessage(text) if kind == "SystemMessage" else HumanMessage(text)
+
+    @staticmethod
+    def _render_message(role: str, text: str) -> Any:
+        from langchain_core.messages import HumanMessage, SystemMessage
+        return SystemMessage(text) if role == "system" else HumanMessage(text)
 
     @staticmethod
     def _lang(path: Path) -> str:

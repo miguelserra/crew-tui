@@ -91,9 +91,12 @@ result metadata, `evidence_ids`, truncation markers and JSON escaping included.
 - **Minimum clamp is explicit:** a request below the minimum (e.g.
   `max_chars=50`) is clamped to **200**, so the effective budget is 200. APIs do
   not echo the invalid requested value and never exceed the effective budget.
-  `get_component_context()` returns a bounded preview object while
-  `get_project_summary()` returns a bounded preview/error object; the differing
-  sizes reflect their different response formats, not different limits.
+  `get_component_context()` prioritizes component identity (`component` and
+  `found`) and then returns a bounded `preview`; `get_project_summary()`
+  prioritizes compact `freshness` and a bounded `summary` preview (or the common
+  `budget_too_small` envelope if even that cannot fit). Their tiny-budget shapes
+  intentionally differ; the shared contract is the complete serialized-size
+  bound, not identical truncation fields or payload priority.
 
 ## Query semantics
 
@@ -101,6 +104,10 @@ result metadata, `evidence_ids`, truncation markers and JSON escaping included.
   (or whitespace-only) query yields **no matches** (`total_count=0`); it is not
   a "list everything" request. The `symbols`/`file_paths`/`evidence_ids`/
   `sections` parameters *filter a non-empty query*, they do not replace it.
+- `symbols` is applied only when a nonempty list is supplied, and matches exact
+  symbol names case-insensitively. An empty list is equivalent to no symbol
+  filter. Ranking still comes exclusively from `query`; `task_context` is echoed
+  in the response but does not contribute to lexical scores.
 - For exact, query-free symbol lookup use `get_symbol_context(name, file=None)`
   (and `get_file_context()` for a file). These are the documented APIs for
   direct lookup, not `retrieve_context("")`.

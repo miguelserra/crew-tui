@@ -3,6 +3,7 @@
 validation, compatibility and regressions."""
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -204,12 +205,49 @@ class RetrievalBoundsTests(_Base):
         comp2 = discovery.get_component_context(self.state, "pkg", max_chars=200)
         self.assertLessEqual(len(_DUMP(comp2)), 200)
 
+    def test_tiny_budget_preserves_each_api_minimum_contract(self):
+        comp = discovery.get_component_context(self.state, "pkg", max_chars=200)
+        summary = discovery.get_project_summary(self.state, max_chars=200)
+        self.assertLessEqual(len(_DUMP(comp)), 200)
+        self.assertLessEqual(len(_DUMP(summary)), 200)
+        # Component lookup prioritizes its identity and a preview; project
+        # summary prioritizes a compact freshness assessment and summary preview.
+        self.assertEqual(comp["component"], "pkg")
+        self.assertTrue(comp["found"])
+        self.assertTrue(comp["truncated"])
+        self.assertIn("preview", comp)
+        self.assertTrue(summary["truncated"])
+        self.assertIn("freshness", summary)
+        self.assertIn("summary", summary)
+
     def test_empty_query_with_symbols_returns_no_matches(self):
         res = discovery.retrieve_context(self.state, "", symbols=["AuthService"])
         self.assertEqual(res["results"], [])
         self.assertEqual(res["total_count"], 0)
         # Exact lookup is the documented alternative.
         self.assertTrue(discovery.get_symbol_context(self.state, "AuthService"))
+
+    def test_symbols_are_optional_case_insensitive_name_filter(self):
+        all_matches = discovery.retrieve_context(self.state, "AuthService")
+        no_filter = discovery.retrieve_context(self.state, "AuthService",
+                                               symbols=[])
+        selected = discovery.retrieve_context(self.state, "AuthService",
+                                              symbols=["authservice"])
+        excluded = discovery.retrieve_context(self.state, "AuthService",
+                                              symbols=["login"])
+        self.assertEqual(no_filter["results"], all_matches["results"])
+        self.assertTrue(selected["results"])
+        self.assertTrue(all("AuthService" in _DUMP(row)
+                            for row in selected["results"]))
+        self.assertEqual(excluded["results"], [])
+
+    def test_task_context_is_echoed_but_does_not_change_lexical_ranking(self):
+        plain = discovery.retrieve_context(self.state, "AuthService")
+        with_context = discovery.retrieve_context(
+            self.state, "AuthService", task_context="database migration")
+        self.assertEqual(with_context["task_context"], "database migration")
+        self.assertEqual(with_context["results"], plain["results"])
+        self.assertEqual(with_context["total_count"], plain["total_count"])
 
     def test_max_chars_200_is_never_exceeded(self):
         res = discovery.retrieve_context(self.state, "AuthService",
@@ -317,6 +355,38 @@ class FreshnessProvenanceTests(_Base):
         self.assertEqual(fresh["source"], "last_recorded")
         self.assertIs(fresh["live"], False)
         self.assertEqual(self.dossier_path().read_bytes(), dossier_before)
+
+    def test_freshness_provenance_survives_fresh_process_reload(self):
+        (self.root / "pkg" / "core.py").write_text(
+            "class AuthService:\n    changed = True\n", encoding="utf-8")
+        result = discovery.freshness(self.state, self.root)
+        self.assertEqual(result["status"], "STALE")
+        state_path = self.store.save_project(self.state)
+        script = r'''import json, sys
+from pathlib import Path
+from store import StateManager
+import discovery
+state = StateManager().load_project(Path(sys.argv[1]))
+result = discovery.retrieve_context(state, "AuthService")
+print(json.dumps({
+    "stored": state.extensions["understanding"]["last_freshness"],
+    "generated_at": state.extensions["understanding"]["generated_at"],
+    "retrieved": result["freshness"],
+}, ensure_ascii=False))'''
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(state_path)],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True, capture_output=True, text=True, timeout=30)
+        reloaded = json.loads(completed.stdout)
+        stored = reloaded["stored"]
+        fresh = reloaded["retrieved"]
+        self.assertEqual(stored["status"], "STALE")
+        self.assertIn("pkg/core.py", stored["changed"])
+        self.assertEqual(stored["source"], "live_assessment")
+        self.assertEqual(fresh["status"], "STALE")
+        self.assertEqual(fresh["checked_at"], stored["checked_at"])
+        self.assertEqual(fresh["assessment_source"], "live_assessment")
+        self.assertEqual(fresh["generated_at"], reloaded["generated_at"])
 
     def test_retrieval_reports_last_recorded_not_live(self):
         res = discovery.retrieve_context(self.state, "AuthService")
