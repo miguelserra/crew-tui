@@ -568,6 +568,7 @@ class RouteRequest:
     thinking: bool = False
     tools: Any = None
     response_format: Any = None
+    context_snapshot_id: str = ""
 
 
 @dataclass
@@ -861,6 +862,12 @@ class RouteChain:
         last_error: Optional[BaseException] = None
         denied_paid = False
         ledger = getattr(self.router, "call_ledger", None)
+        managed = bool(self.request.context_snapshot_id)
+        if managed:
+            guard = getattr(self.router, "context_guard", None)
+            if guard is None:
+                raise RuntimeError("managed context request requires an active context guard")
+            guard.validate_dispatch(self.result, messages)
         avoid: set[str] = set()
         fingerprint = invocation_fingerprint(messages, self.request)
         if ledger is not None and self.request.run_id:
@@ -869,7 +876,8 @@ class RouteChain:
                 self.request.tag or self.request.role)
             replay = ledger.find_replay(
                 self.request.run_id, self.request.task_id,
-                self.request.tag or self.request.role, fingerprint)
+                self.request.tag or self.request.role, fingerprint,
+                context_snapshot_id=self.request.context_snapshot_id)
             if replay is not None:
                 text = ledger.result_text(replay.call_id)
                 if text is not None:
@@ -898,7 +906,7 @@ class RouteChain:
                 raise
             for attempt in range(2):
                 record = None
-                if (ledger is not None and identity.billing == BILLING_PAYG
+                if (ledger is not None and (identity.billing == BILLING_PAYG or managed)
                         and self.request.run_id):
                     record = ledger.intent(
                         run_id=self.request.run_id,
@@ -907,6 +915,7 @@ class RouteChain:
                         task=self.request.task_id,
                         tag=self.request.tag or self.request.role,
                         request_sha256=fingerprint,
+                        context_snapshot_id=self.request.context_snapshot_id,
                     )
                     ledger.submitted(record.call_id)
                 try:

@@ -50,13 +50,45 @@ def _brief(root: str | Path, limit_files: int = 40, limit_chars: int = 24000) ->
     return ctx.text()
 
 
+ARCH_SECTIONS = ("structure", "dependencies", "components", "entry_points",
+                 "persistence", "external_interfaces")
+
+
+def _architecture_query(project: ProjectState) -> str:
+    req = project.requirements
+    parts = [req.objective, *req.scope_in, *req.constraints,
+             *req.non_negotiables, *req.acceptance_texts()]
+    return " ".join(str(p).strip() for p in parts if str(p).strip()) or project.goal or "architecture"
+
+
+def _message(role: str, content: str) -> Any:
+    from langchain_core.messages import HumanMessage, SystemMessage
+    return SystemMessage(content) if role == "system" else HumanMessage(content)
+
+
+def _apply_architecture(state: ProjectState, requirements: RequirementContract,
+                        architecture: ArchitectureContract, tasks: list[Task]) -> None:
+    state.requirements = requirements
+    state.architecture = architecture
+    state.tasks = tasks
+
+
 class ArchitectureService:
     def __init__(self, settings: Any, pool: Any, emit: Any):
         self.settings = settings
         self.pool = pool
         self.emit = emit
+        self.context_engine = None
+
+    def _core(self):
+        engine = getattr(self, "context_engine", None)
+        state = getattr(engine, "state", None)
+        if engine is None or state is None or not getattr(state, "project_root", ""):
+            return None
+        return engine.context_core()
 
     def _ask(self, project: ProjectState, system: str, user: str, tag: str) -> str:
+        """Legacy/test hook: route and return text without managed context."""
         request = RouteRequest(
             role="architecture", complexity="high", tag=tag,
             required_capabilities=frozenset({"text"}),
@@ -69,6 +101,31 @@ class ArchitectureService:
         return self.pool.complete(
             routed.chain, [SystemMessage(system), HumanMessage(user)],
             meta={"run": project.run_id or None, "tag": tag} if project.run_id else None)
+
+    def _generate(self, project: ProjectState, system: str, user: str):
+        """Return (text, handle); handle=(core, logical_id) only when managed."""
+        request = RouteRequest(
+            role="architecture", complexity="high", tag="ARCHITECT",
+            required_capabilities=frozenset({"text"}),
+            run_id=project.run_id or "",
+        )
+        routed = self.pool.router.route(request)
+        if not routed.candidates:
+            raise RuntimeError("sem candidato para architecture")
+        messages = [_message("system", system), _message("human", user)]
+        core = self._core()
+        if core is not None:
+            logical_id = f"architecture-{project.run_id or 'run'}"
+            snapshot = core.prepare(
+                logical_id, "ARCHITECTURE", routed, messages,
+                query=_architecture_query(project), sections=ARCH_SECTIONS)
+            if snapshot is not None:
+                messages = snapshot.render_messages(_message)
+                result = core.invoke(self.pool, routed, logical_id, messages)
+                return result.text, (core, logical_id)
+        return self.pool.complete(
+            routed.chain, messages,
+            meta={"run": project.run_id or None, "tag": "ARCHITECT"}), None
 
     def design(self, project: ProjectState, workspace_root: str | Path) -> dict[str, Any]:
         brief = _brief(workspace_root)
@@ -105,7 +162,11 @@ Rules:
 - Interfaces must include every cross-file call (name, inputs, outputs, errors).
 - Every task must list requirement_ids referencing acceptance_criteria ids.
 - Deletions are only explicit user/architecture operations; never infer them."""
-        raw = self._ask(project, ARCHITECT_SYSTEM, prompt, "ARCHITECT")
+        if self._core() is None:
+            raw = self._ask(project, ARCHITECT_SYSTEM, prompt, "ARCHITECT")
+            handle = None
+        else:
+            raw, handle = self._generate(project, ARCHITECT_SYSTEM, prompt)
         data = _json_or_raise(raw, "architecture")
         tasks: list[Task] = []
         errors: list[str] = []
@@ -151,8 +212,13 @@ Rules:
         except Exception as exc:
             raise ValueError(f"arquitetura inválida: {exc}") from exc
 
-        project.requirements = candidate_req
-        project.architecture = candidate_arch
-        project.tasks = candidate_tasks
+        if handle is not None:
+            core, logical_id = handle
+            core.commit(logical_id, lambda state, result: _apply_architecture(
+                state, candidate_req, candidate_arch, candidate_tasks))
+        else:
+            project.requirements = candidate_req
+            project.architecture = candidate_arch
+            project.tasks = candidate_tasks
         self.emit("ARCHITECT", f"{len(tasks)} tarefa(s)")
         return data

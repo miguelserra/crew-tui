@@ -333,12 +333,31 @@ and ends in COMMITTED, ROLLED_BACK or RECOVERY_REQUIRED, never a false
 COMMITTED after partial application. Run dirs without a journal are reported
 as orphans and cleaned only when explicitly named; journal/file replacements
 fsync the containing directory on POSIX (Windows relies on process-death
-recovery). Still pending before the gate opens: provider-declared idempotency
-headers and full differential equivalence. The runtime still uses `FactoryAdapter` and
-removal is not authorized. P7 is not
+recovery). The differential report records the gate **OPEN** (36 COVERED / 0
+PARTIAL / 0 MISSING / 12 N/A); provider-declared idempotency headers are
+deferred hardening, not a P7.1d exit criterion. `NativeAdapter` is the default
+for new projects; `FactoryAdapter` remains supported for compatibility and
+legacy execution. Removal of `FactoryAdapter` is not authorized. P7 is not
 a closed gate; legacy migration/conversion remains readable and no silent
 conversion is performed. No prompt/routing/verification policy was changed in
 this extraction.
+
+### P7.2c.3 workflow context (opt-in)
+
+The deterministic dossier-context integration is disabled by default. Explicit
+`--context-consent` is required for selected providers and phases; ordinary
+`--yes` and paid-call approval do not grant disclosure consent. Managed
+ARCHITECTURE/BUILD requests use immutable, resumable snapshots. BUILD results are
+verified before installation, installed idempotently, and never overwrite
+conflicting human edits. A confirmed BUILD result is recovered locally during
+resume rather than re-submitted; automatic FIX and re-verification remain active.
+
+Snapshots contain the **complete prompt**, including the base prompt, on local
+disk under `.crew/runs/`. They are not encrypted and have no automatic garbage
+collection. FIX itself remains on the existing legacy service path: a crash
+after a FIX response but before final application may repeat that FIX request;
+ambiguous PAYG outcomes fail closed. Retrieval is bounded lexical search with
+last-recorded freshness, not semantic search or live freshness.
 
 ## Financial circuit breaker
 
@@ -668,7 +687,7 @@ folder (excluding `.venv/`) and re-run `pip install -r requirements.txt` there.
 | `executor.py` | Native BUILD/FIX over ProjectState (P7.1b) |
 | `integration.py` / `visual.py` / `signoff.py` | Native remaining phases (P7.1c) |
 | `native_util.py` | Shared native helpers |
-| `native_adapter.py` | Native service composition (P7.1d; not runtime default) |
+| `native_adapter.py` | Native service composition (P7.1d; default for new projects) |
 | `context_reader.py` | Bounded, ignore-aware project context |
 | `profiles.py` | Workflow profiles, auto resolution and phase sets |
 | `scaffold.py` | Deterministic scaffold from the approved architecture |
